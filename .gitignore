@@ -1,0 +1,29 @@
+# ===== 秘密情報 =====
+.env
+*.key
+
+# ===== Python (backend) =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ===== Flutter / Dart (app) =====
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/build/
+app/.pub-cache/
+app/.pub/
+**/generated_plugin_registrant.*
+
+# ビルド成果物
+build/
+
+# ===== OS / editor =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
