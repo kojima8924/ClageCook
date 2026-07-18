@@ -1,33 +1,80 @@
 # -*- coding: utf-8 -*-
-"""モックプロバイダ。APIキーが無くても動くデモ用のダミー応答を返す。
+"""キーなしでも画面と会議フローを試せる明示的なモック。"""
 
-ポートフォリオの閲覧者がキー無しで会議フローを試せるようにするための最小実装。
-擬似的なストリーミング遅延を入れて、実際のAI呼び出しに近い体験にする。
-"""
+from __future__ import annotations
+
 import asyncio
+import re
+import time
 
-from .base import Provider
+from .base import CompletionRequest, CompletionResult, Provider
 
-# 各AIの「らしさ」を軽く出すための定型フレーズ(デモ用)
+
 _FLAVOR = {
-    "claude": "丁寧に前提を整理すると、",
-    "chatgpt": "要点を先に述べると、",
-    "gemini": "多角的に見ると、",
-    "grok": "率直に言えば、",
-    "synthesizer": "各AIの回答を統合すると、",
+    "claude": "前提と注意点を整理すると、",
+    "gemini": "複数の観点から見ると、",
+    "chatgpt": "結論を先にまとめると、",
+    "grok": "率直に検討すると、",
+    "synthesizer": "各回答の共通点と相違点を統合すると、",
 }
 
 
 class MockProvider(Provider):
-    def __init__(self, name: str, delay: float = 0.8):
-        self.name = name
-        self._delay = delay
+    is_mock = True
 
-    async def complete(self, prompt: str) -> str:
-        await asyncio.sleep(self._delay)  # 擬似レイテンシ
-        head = _FLAVOR.get(self.name, "")
-        excerpt = prompt.strip().replace("\n", " ")[:40]
-        return (
-            f"{head}「{excerpt}」についてのデモ回答です。"
-            f"(これは {self.name} のモック応答。APIキーを設定すると実際のAIが答えます)"
+    def __init__(self, name: str, model: str = "mock", delay: float = 0.08) -> None:
+        self.name = name
+        self.model = model
+        self._delay = max(0.0, delay)
+
+    async def complete(self, request: CompletionRequest) -> CompletionResult:
+        started = time.perf_counter()
+        await asyncio.sleep(self._delay)
+        subject = _subject(request.prompt)
+        if self.name == "synthesizer":
+            text = (
+                f"**デモ統合回答:** 「{subject}」について、各AIの視点を"
+                "比較して共通点と注意点をまとめました。\n\n"
+                "これは安全なモックです。実APIを使うには `.env` のAPIキーに加えて、"
+                "`CLAGE_LIVE_API_ENABLED=true` を明示してください。"
+            )
+        elif "相互批評ラウンド" in request.system:
+            text = (
+                f"{_FLAVOR.get(self.name, '')}他の回答と照合し、「{subject}」に関する"
+                "初回回答の注意点を補ったデモ最終回答です。\n\n"
+                "実APIキーを設定すると、ここで実際に相互批評します。"
+            )
+        else:
+            text = (
+                f"{_FLAVOR.get(self.name, '')}「{subject}」へのデモ回答です。\n\n"
+                "これは安全なモックです。実APIを使うには `.env` のAPIキーに加えて、"
+                "`CLAGE_LIVE_API_ENABLED=true` を明示してください。"
+            )
+        return CompletionResult(
+            provider=self.name,
+            model=self.model,
+            text=text,
+            elapsed_sec=round(time.perf_counter() - started, 3),
+            finish_reason="completed",
+            request_audit={
+                "http_attempts": 0,
+                "retry_count": 0,
+                "outcome": "mock",
+                "usage_may_be_incomplete": False,
+            },
+            mock=True,
         )
+
+
+def _subject(prompt: str) -> str:
+    question = re.search(r"<question>\s*(.*?)\s*</question>", prompt, re.DOTALL)
+    if question:
+        value = question.group(1)
+    elif "[今回の質問]" in prompt:
+        value = prompt.rsplit("[今回の質問]", 1)[1]
+    else:
+        quoted = re.search(r"「([^」]{1,300})」", prompt)
+        value = quoted.group(1) if quoted else prompt
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = " ".join(value.strip().split())[:120]
+    return value or "この質問"

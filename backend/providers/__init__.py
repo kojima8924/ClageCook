@@ -1,6 +1,21 @@
 # -*- coding: utf-8 -*-
-"""AIプロバイダ群。将来 anthropic/openai/gemini/xai を追加する。"""
-from .base import Provider
-from .mock import MockProvider
+"""公式REST APIとモックの共通エクスポート。"""
 
-__all__ = ["Provider", "MockProvider"]
+from .anthropic import AnthropicProvider
+from .base import CompletionRequest, CompletionResult, Provider, ProviderError
+from .gemini import GeminiProvider
+from .mock import MockProvider
+from .openai import OpenAIProvider
+from .xai import XAIProvider
+
+__all__ = [
+    "AnthropicProvider",
+    "CompletionRequest",
+    "CompletionResult",
+    "GeminiProvider",
+    "MockProvider",
+    "OpenAIProvider",
+    "Provider",
+    "ProviderError",
+    "XAIProvider",
+]

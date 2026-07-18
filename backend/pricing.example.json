@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "version": "replace-with-your-price-version",
+  "currency": "USD",
+  "models": {
+    "claude": {
+      "replace-with-exact-model-id": {
+        "input_per_million_usd": "1.00",
+        "output_per_million_usd": "1.00",
+        "cached_input_per_million_usd": "1.00",
+        "cache_write_per_million_usd": "1.00"
+      }
+    },
+    "gemini": {
+      "replace-with-exact-model-id": {
+        "input_per_million_usd": "1.00",
+        "output_per_million_usd": "1.00",
+        "cached_input_per_million_usd": "1.00"
+      }
+    },
+    "chatgpt": {
+      "replace-with-exact-model-id": {
+        "input_per_million_usd": "1.00",
+        "output_per_million_usd": "1.00",
+        "cached_input_per_million_usd": "1.00"
+      }
+    },
+    "grok": {
+      "replace-with-exact-model-id": {
+        "input_per_million_usd": "1.00",
+        "output_per_million_usd": "1.00",
+        "cached_input_per_million_usd": "1.00"
+      }
+    }
+  }
+}

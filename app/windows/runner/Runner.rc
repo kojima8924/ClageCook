@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "jp.akoji" "\0"
-            VALUE "FileDescription", "clage_cook" "\0"
+            VALUE "FileDescription", "Clage Cook" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "clage_cook" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 jp.akoji. All rights reserved." "\0"
             VALUE "OriginalFilename", "clage_cook.exe" "\0"
-            VALUE "ProductName", "clage_cook" "\0"
+            VALUE "ProductName", "Clage Cook" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

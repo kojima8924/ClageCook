@@ -8,6 +8,12 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+backend/data/
+
+# ===== Android signing secrets =====
+app/android/key.properties
+*.jks
+*.keystore
 
 # ===== Flutter / Dart (app) =====
 app/.dart_tool/
