@@ -1,5 +1,6 @@
 import asyncio
 from collections import defaultdict
+from copy import deepcopy
 
 from fastapi.testclient import TestClient
 
@@ -9,7 +10,7 @@ import planning
 from storage import ConversationStore
 
 
-def _clear_keys(monkeypatch):
+def _clear_keys(monkeypatch, *, live=True):
     for name in (
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
@@ -18,7 +19,7 @@ def _clear_keys(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(config, "INCLUDE_MOCKS_WHEN_MIXED", False)
-    monkeypatch.setattr(config, "LIVE_API_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_API_ENABLED", live)
 
 
 def _warning_codes(plan):
@@ -26,7 +27,7 @@ def _warning_codes(plan):
 
 
 def test_mock_debate_plan_is_free_and_uses_safe_upper_bound(monkeypatch):
-    _clear_keys(monkeypatch)
+    _clear_keys(monkeypatch, live=False)
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("planning must not construct a Provider")
@@ -73,7 +74,7 @@ def test_live_api_gate_keeps_configured_keys_in_free_mock_mode(monkeypatch):
 
 
 def test_blind_command_is_reflected_without_extra_calls(monkeypatch):
-    _clear_keys(monkeypatch)
+    _clear_keys(monkeypatch, live=False)
 
     regular = planning.build_run_plan(message="question", debate=True)
     blind = planning.build_run_plan(message="!blind\nquestion", debate=True)
@@ -136,6 +137,50 @@ def test_live_synthesizer_makes_mock_participant_plan_billable(monkeypatch):
     assert plan["max_output_tokens"]["live_total"] == 2400
 
 
+def test_plan_uses_one_atomic_runtime_settings_snapshot(monkeypatch):
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-only-anthropic-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-openai-key")
+    first = {
+        "models": {
+            "claude": {"balanced": "claude-worker-first"},
+            "chatgpt": {"balanced": "chatgpt-worker-first"},
+        },
+        "synthesizer_provider": "claude",
+        "synthesizer_models": {"balanced": "claude-synth-first"},
+    }
+    second = {
+        "models": {
+            "claude": {"balanced": "claude-worker-second"},
+            "chatgpt": {"balanced": "chatgpt-worker-second"},
+        },
+        "synthesizer_provider": "chatgpt",
+        "synthesizer_models": {"balanced": "chatgpt-synth-second"},
+    }
+    calls = 0
+
+    def changing_snapshot():
+        nonlocal calls
+        snapshot = first if calls == 0 else second
+        calls += 1
+        return deepcopy(snapshot)
+
+    monkeypatch.setattr(config.runtime_settings, "snapshot", changing_snapshot)
+
+    plan = planning.build_run_plan(
+        message="question",
+        providers=["claude", "chatgpt"],
+    )
+
+    assert calls == 1
+    assert {item["name"]: item["model"] for item in plan["providers"]} == {
+        "claude": "claude-worker-first",
+        "chatgpt": "chatgpt-worker-first",
+    }
+    assert plan["synthesizer"]["name"] == "claude"
+    assert plan["synthesizer"]["model"] == "claude-synth-first"
+
+
 def test_plan_endpoint_never_calls_api_and_help_is_local(monkeypatch):
     _clear_keys(monkeypatch)
 
@@ -162,7 +207,7 @@ def test_plan_endpoint_never_calls_api_and_help_is_local(monkeypatch):
 def test_chat_rejects_call_limit_before_creating_conversation(
     tmp_path, monkeypatch
 ):
-    _clear_keys(monkeypatch)
+    _clear_keys(monkeypatch, live=False)
     monkeypatch.setattr(main, "store", ConversationStore(tmp_path))
     monkeypatch.setattr(main, "_registry", main.RunRegistry())
     monkeypatch.setattr(main, "_rate_limiter", main.SlidingWindowLimiter(100))
@@ -192,7 +237,7 @@ def test_chat_rejects_call_limit_before_creating_conversation(
 
 
 def test_chat_rejects_output_token_budget(monkeypatch):
-    _clear_keys(monkeypatch)
+    _clear_keys(monkeypatch, live=False)
     monkeypatch.setattr(config, "AUTH_TOKEN", "")
     monkeypatch.setattr(config, "MAX_PROVIDER_CALLS_PER_RUN", 100)
     monkeypatch.setattr(config, "MAX_OUTPUT_TOKENS_PER_RUN", 7_199)
@@ -210,7 +255,7 @@ def test_chat_rejects_output_token_budget(monkeypatch):
 
 
 def test_plan_endpoint_uses_selected_conversation_history(tmp_path, monkeypatch):
-    _clear_keys(monkeypatch)
+    _clear_keys(monkeypatch, live=False)
     monkeypatch.setattr(main, "store", ConversationStore(tmp_path))
     monkeypatch.setattr(config, "AUTH_TOKEN", "")
     conversation = main.store.create("first")
@@ -297,7 +342,7 @@ def test_input_envelope_includes_history_debate_synthesis_and_retry(monkeypatch)
 
 
 def test_input_envelope_limit_blocks_before_execution(monkeypatch):
-    _clear_keys(monkeypatch)
+    _clear_keys(monkeypatch, live=False)
     monkeypatch.setattr(config, "MAX_PROVIDER_CALLS_PER_RUN", 100)
     monkeypatch.setattr(config, "MAX_OUTPUT_TOKENS_PER_RUN", 1_000_000)
     monkeypatch.setattr(config, "MAX_INPUT_BYTES_PER_RUN", 1_024)
@@ -311,6 +356,18 @@ def test_input_envelope_limit_blocks_before_execution(monkeypatch):
     assert plan["allowed"] is False
     assert plan["limits"]["input_bytes_exceeded"] is True
     assert "input_byte_limit_exceeded" in plan["block_reasons"]
+
+
+def test_live_without_keys_is_rejected_during_planning(monkeypatch):
+    _clear_keys(monkeypatch, live=True)
+
+    plan = planning.build_run_plan(message="question")
+
+    assert plan["mode"] == "mixed"
+    assert plan["allowed"] is False
+    assert plan["providers"] == []
+    assert "invalid_request" in plan["block_reasons"]
+    assert "no_effective_providers" in _warning_codes(plan)
 
 
 def test_web_control_is_explicit_and_plan_discloses_non_strict_limits(monkeypatch):

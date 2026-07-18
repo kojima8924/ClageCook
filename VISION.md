@@ -1,17 +1,18 @@
-# Clage Cook OSS — Visionと設計原則
+# Clage Cook — Visionと設計原則
 
 ## コンセプト
 
 「1つのAIに答えを委ねる」から、「複数AIの独立した見解を比較し、1つの使える結論へ
-まとめる」へ。Clage Cook OSSは、モデルの違いを単なる切替メニューではなく、相互検証の
+まとめる」へ。Clage Cookは、モデルの違いを単なる切替メニューではなく、相互検証の
 材料として使うAI会議アプリです。
 
-OSS版の目標は、特定の個人PCやサブスクリプションCLIへ依存せず、利用者自身の公式APIキーで
+本プロジェクトの目標は、特定の個人PCやサブスクリプションCLIへ依存せず、利用者自身の公式APIキーで
 再現できることです。同時に、キーを設定しただけでは課金APIを呼ばないこと、何を外部へ送り得るかを
 実行前に見せること、再接続や停止でも同じ会議を重複実行しないことをコア要件とします。
 
-`0.2.0` は設計を固めるための破壊的な初期OSS版です。安定版までは古いAPI・保存schema・UIとの
-互換性より、課金安全性、監査可能性、明快なデータモデルを優先します。
+`0.2.0` は設計を固めるための、公開を想定した破壊的な初期BYOK版です。repositoryは現在privateの
+公開準備中です。安定版までは古いAPI・保存schema・UIとの互換性より、課金安全性、監査可能性、
+明快なデータモデルを優先します。
 
 ## 中心となる価値
 
@@ -41,25 +42,43 @@ OSS版の目標は、特定の個人PCやサブスクリプションCLIへ依存
   公開直前に中央scrubberで再帰除去する。
 - planはProviderを生成せず、履歴を含む入力UTF-8 byte、呼出回数、最大出力token、再試行を
   安全側に算出する。Provider固有token数、思考token、金額は推定したふりをしない。
+- tokenと別課金のserver toolをtoken単価だけで「見積もり完全」としない。上限を安全側に算出できない間は
+  unknown cost policyでfail-closedまたは明示警告付き実行とする。明示許可時も既知token小計は上限判定・予約する。
 - 生成HTTPの自動再試行は既定OFFとする。有効化時は失敗試行を含む実行envelopeへ算入する。
 - Providerのpartial/incompleteとHTTP attemptを監査可能にし、usageが不明な試行を完全実測として扱わない。
-- 切断はキャンセルと同義にしない。外部呼出前のdurable claimと生成イベントごとの永続化で復旧し、
+- local usage、利用者設定単価の費用guard、Provider管理APIの期間集計を別系統として扱う。
+  管理telemetryはopt-in・read-only・別資格情報とし、課金の変更操作を実装しない。
+- 予算予約は「送信済みだがusage不明」を0円へ解放しない。settled額は会話本体と独立して当日のcommitへ保持し、
+  会話削除で消さない。手動reconciliationは請求確定ではなく、既知額または予約上限を保持したまま利用者の
+  外部確認を記録する安全側のfail-closed境界とする。
+- active予約のgross額と観測済み実績を重ねず、差額top-upだけをcommitする。branch copyと再生成original wrapperは
+  費用・local tokenの同じidentityへ正規化し、新しい外部callだけを追加実績として数える。
+- reasoningは表示fieldと課金outputを分離し、Gemini Interactionsの明示的なthought外数、Responses APIの
+  reasoning内包output、旧xAI Chat互換shapeのfallbackを区別する。
+- dispatch直前に参加Provider/modelと統合Provider/modelをsnapshotし、予算予約と同じ実行先を終端まで固定する。
+- runtime設定はplanごとにatomicに1回だけ読み、実行結果とSSE metadataにも同じsnapshotを使う。
+- 切断はキャンセルと同義にしない。外部呼出前のdurable claim、answer/synthesis checkpoint、
+  終端時までの非終端event journalと、保存turn状態から再構成する `error` / `done` で復旧し、
   client再読込後も同一runへ復帰または停止できる。server再起動後の孤立runは中断確定し、自動再実行しない。
-- 同じ `request_id` は同じpayloadにしか使えず、保存済みまたは未完了runを新規実行へ戻さない。
+- Provider結果後の保存・予算確定・結果公開は一体で完走し、先に確定したcompleted/failedを後発cancelで
+  cancelledへ戻さない。完了再生成はdurable attemptを正とし、大きなin-memory resultをretentionへ残さず、
+  保存済みterminal replayを新規実行用rate limit・conversation claimより先に返す。
+- 同じ `request_id` は添付のprompt順を含む同じpayloadにしか使えず、保存済みまたは未完了runを
+  現在設定で再計画したり新規実行へ戻したりしない。
 - 同一conversationの異なるrunは直列化し、plan・履歴・保存の競合を許さない。
 - cancelはローカルtaskへの停止要求であり、外部Providerの処理停止・課金停止を保証しない。
 - 1つの `CLAGE_DATA_DIR` は1サーバープロセスだけが所有する。起動時lockで複数processを拒否する。
 - モックと実回答を暗黙に混在させず、障害時にモックを実成功として見せない。
-- 外部公開を前提にしない。通常はlocalhost、別端末からはLAN/TailscaleとBearer認証を使う。
+- backend serviceのinternet直接公開を前提にしない。通常はlocalhost、別端末からはLAN/TailscaleとBearer認証を使う。
 - mobile releaseを共通debug keyで署名しない。配布者固有のsecret signing materialをrepositoryから分離する。
 
 ## オリジナル版との境界
 
 `C:\code\ClageCook` から継承したのは、並列会議、部分失敗、統合、DEBATE、tier、共通履歴、
-会話ロック、原子的保存、再接続という設計知見です。OSS版はその操作感を踏まえつつ、公式HTTP API、
+会話ロック、原子的保存、再接続という設計知見です。本リポジトリのClage Cookはその操作感を踏まえつつ、公式HTTP API、
 safe mock、課金前plan、BLIND、policy、offline insights、durable journalを独自の境界として持ちます。
 
-次の個人環境向け機能はOSS版へ持ち込みません。
+次の個人環境向け機能は、公開を想定するBYOK版へ持ち込みません。
 
 - Claude / Codex / Gemini / GrokのCLI起動とCLIセッション再開
 - CLIや資格情報storeからのサブスクリプション使用率取得
@@ -68,6 +87,19 @@ safe mock、課金前plan、BLIND、policy、offline insights、durable journal�
 - CLIを入れ子にした画像生成broker
 
 ## ロードマップ
+
+### Unreleased — 実装済み
+
+- chat/再生成共通のbackground run state、cancel、起動時attempt復旧、conversation claim
+- terminal outcomeの単調確定、critical終端処理、cancel結果のFlutter確定表示、完了再生成stateの即時解放
+- request ID index、BudgetGuardのrevision/day/price別actual-cost cache、durable checkpoint間引きによる
+  event-loop/I/O負荷の削減（local usage telemetryの全JSON走査は継続）
+- active予約差額top-up、Provider shape別reasoning課金、branch/original attemptの費用・local usage identity dedup
+- Provider 5xx/Retry-After、partial/refusal、tier、Web tool世代の正規化と回帰試験
+- 会話選択とlive streamのFlutter controller分離、SSE idle監視、async世代guard
+- Provider管理集計期間とlocal予算期間の分離表示、Web token保存限界の常時警告
+- 隔離・時間上限付きPDF抽出、process内抽出cacheのaccess時TTL purge、元添付の起動時/access時TTL purge、
+  downloadのnosniff強化
 
 ### 0.2.0 — 実装済み
 
@@ -93,13 +125,18 @@ safe mock、課金前plan、BLIND、policy、offline insights、durable journal�
 
 ### 次の優先順位
 
-1. 検索index、暗号化backup/import、会話・添付のretention管理UI
-2. Provider請求exportとlocal/admin usageのreconciliation差分監査
-3. 画像入力・画像生成をProvider capabilityと個別予算へ統合
-4. 会話tag、複数会話を束ねるproject、memory sourceの選択的継承
-5. 共有受信、通知、background runなどのplatform連携
-6. Mac/Linux上のnative build、全platformの実機通信、release署名検証
-7. SQLite等へのstorage移行と、単一process不変条件を保つmigration tool
+1. budget reservation ledgerのSQLite化、または過去日aggregateと最小idempotency tombstoneを残すcompaction
+2. 検索index、暗号化backup/import、会話・添付のretention管理UI
+3. Provider請求exportとlocal/admin usageのreconciliation差分監査
+4. 画像入力・画像生成をProvider capabilityと個別予算へ統合
+5. 会話tag、複数会話を束ねるproject、memory sourceの選択的継承
+6. 共有受信、通知、background runなどのplatform連携
+7. Mac/Linux上のnative build、全platformの実機通信、release署名検証
+8. conversation storageのSQLite等への移行と、単一process不変条件を保つmigration tool
+
+現行の `.control/budget-reservations.json` はsettled/releasedを含む全entryを保持し、更新ごとにJSON全体を
+atomic再書込するため、数千〜数万billable runの長期運用ではO(N)の台帳I/Oが増えます。上記1は
+公開規模へ広げる前の候補であり、今回のcorrectness対応に含まれる実装済み機能ではありません。
 
 画像入力・生成や外部共有は便利ですが、コア会議の整合性、課金制御、秘密管理を
 崩さないことを優先します。計画中の項目を実装済みとして表示しません。

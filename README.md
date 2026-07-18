@@ -1,13 +1,14 @@
-# Clage Cook OSS
+# Clage Cook
 
 Claude、Gemini、ChatGPT、Grokへ同じ質問を並列に送り、回答を比較し、必要なら相互批評を
 経て1つの結論へ統合するBYOK（Bring Your Own Key）のAI会議アプリです。
 
-オリジナルのClage Cookは各社のサブスクリプションCLIを束ねる個人環境向けアプリですが、
-このOSS版は各社の公式HTTP APIだけを使います。APIキーや有料サービスがなくても、4AI会議、
+個人環境向けの旧Clage Cook実装は各社のサブスクリプションCLIを束ねますが、本リポジトリの
+Clage Cookは各社の公式HTTP APIだけを使います。APIキーや有料サービスがなくても、4AI会議、
 DEBATE、統合、履歴、検索などを完全なモックで試せます。
 
-> `0.2.0` は後方互換性を前提としない初期OSS版です。既定値は、APIキーを設定していても
+> `0.2.0` は後方互換性を前提としない、公開を想定した初期BYOK版です。GitHub repositoryは現在
+> privateの公開準備中です。既定値は、APIキーを設定していても
 > 外部APIを呼ばない `SAFE MOCK` です。実APIはlive設定、Bearer認証、会議ごとの明示確認をすべて
 > 満たしたときだけ呼び出され、各社との契約に応じて料金が発生する可能性があります。
 
@@ -25,21 +26,28 @@ DEBATE、統合、履歴、検索などを完全なモックで試せます。
 - 共通の会話履歴、会話単位ロック、1会話1JSONの原子的保存
 - サーバー側全文検索、タイトル変更、削除、JSONエクスポートとFlutterの対応UI
 - `request_id`によるdurable claim、SSE event journal、保存済みrunning runの再接続・停止と起動時中断確定
+- chatと再生成で共有するbackground run registry、切断から独立した実行、明示停止、再生成attemptの中断復旧
+- Provider結果後の終端保存・budget settle・結果公開をcancelから保護し、先に確定した完了/失敗を維持する
+  terminal outcome契約
 - live時に必須のBearer認証、localhost限定の既定CORS、レート・同時実行・入出力上限
 - Web / Windows / macOS / Linux / Android / iOS向けのレスポンシブFlutter UI
-- Markdown表示、接続先originへ結合したBearerトークン保存、キーボードショートカット
+- Markdown表示、接続先originへ結合したBearerトークン保存、Web保存警告、キーボードショートカット
 - reverse proxy pathを保った接続URL検証、200文字上限の本文検索、終端SSEの競合防止
+- SSE commentもactivityとして扱う90秒idle watchdog、会話選択の世代guard、upload中の切替防止
 - 回答・統合のimmutable再生成attempt、active pointer、統合のstale表示、revision履歴UI
 - Provider応答headerのallowlist済みrate-limit観測と、保存済み全attemptのlocal usage集計
 - 利用者が正確なmodel単価を設定した場合だけ働くDecimal金額換算、会議・日次budget予約guard
-- 別管理資格情報を明示有効化した場合だけの読み取り専用組織telemetry（OpenAI、Anthropic、xAI）
+- 別管理資格情報を明示有効化した場合だけの読み取り専用組織telemetry（OpenAI、Anthropic、xAI）と
+  Provider別の実効集計期間
 - revision付きruntime model設定、統合Provider/model設定と、キーを返さない公開catalog
 - 完了turnの直前から親を破壊せず続ける編集分岐と、分岐元metadata
-- owner固定opaque ID、streaming upload、MIME/signature/容量/TTL検査、text/PDF抽出を備えた添付
+- owner固定opaque ID、streaming upload、MIME/signature/容量/TTL検査、隔離subprocessと時間上限付きPDF抽出を
+  備えた添付
 - 既定OFFのターン単位Web検索、4社のserver tool、構造化引用とクリック可能な出典UI
 - 会話ごとのrevision付きローカルメモ、検索・分岐・promptへの安全な継承
 - JSON/Markdown exportと、元添付を含む一時ZIPの保存・送信後自動削除
-- 照合待ちbudget予約を外部請求確認後にだけ解放する、明示確認付き手動reconciliation UI/API
+- 照合待ちbudget予約を外部請求確認後に確定状態へ移し、実測額または予約上限を日次commitへ保持する
+  明示確認付き手動reconciliation UI/API
 - GitHub ActionsでのBackend test/compileとFlutter format/analyze/test/Web release build
 
 ## 安全な既定値
@@ -63,6 +71,18 @@ DEBATE、統合、履歴、検索などを完全なモックで試せます。
 会議上限、固定UTC offsetの日次上限を適用します。usage不明の送信済みrunは0円扱いにせず、照合待ちの
 予約としてbudgetを拘束します。再起動時に未settle予約を照合待ちへ昇格し、照合待ち件数が
 `CLAGE_MAX_UNRECONCILED_RESERVATIONS` に達すると新しい課金runを停止します。
+usageを価格換算できたrunは実測額をsettled ledgerへ保存し、conversationを削除しても当日のcommitから
+差し引きません。応答modelを価格換算できない場合は予約上限を保持します。手動reconciliationも照合待ちを
+0円へ解放せず、完全に価格換算できる既知額、できなければ予約上限を
+`settled_after_manual_reconciliation` として当日のcommitへ残します。
+有効予約のgross額はtelemetryへ別表示しますが、日次commitには同じrequest IDで観測済みの実績との差額だけを
+`active_reservation_top_up` として足します。したがって、部分usageが保存された実行を「実績 + 予約総額」で
+二重拘束しません。
+送信直前に履歴・memory・添付・modelを同じsnapshotで再計画し、予算予約の金額と日付を再検証した後、
+参加Provider/modelと統合Provider/modelをrun完了まで固定します。解放済み予約は新しい予算check後だけ再利用でき、
+照合待ち・確定済み予約は保存済み結果なしに再dispatchしません。
+価格表が入力・出力など一部の単価だけを持つ場合も、既知カテゴリの小計は予算判定・予約から落とさず、
+未知カテゴリだけをunknown-cost policyへ委ねます。
 
 ## 構成
 
@@ -130,7 +150,8 @@ CLAGE_AUTH_TOKEN=
 
 Flutter設定画面からもworker modelと統合Provider/modelを変更できます。値は
 `CLAGE_DATA_DIR/.control/runtime-settings.json` へrevision付きで原子的に保存され、runtime設定がenv、
-既定値より優先されます。API keyや任意endpoint URLをruntime設定へ保存する機能はありません。
+既定値より優先されます。1つのplanはruntime設定を1回だけsnapshotし、実行中のSSE metadataも同じ
+Provider/modelを表示します。API keyや任意endpoint URLをruntime設定へ保存する機能はありません。
 
 ### 任意の価格・予算guard
 
@@ -138,6 +159,13 @@ Flutter設定画面からもworker modelと統合Provider/modelを変更でき�
 `CLAGE_PRICE_TABLE_FILE` で指定します。example内の値は実価格ではありません。`CLAGE_PER_RUN_BUDGET_USD`
 または `CLAGE_DAILY_BUDGET_USD` を設定すると、未登録modelやusage不明を既定でfail-closedに扱います。
 checkと予約は単一server process内のlock下で行い、予約ledgerを `CLAGE_DATA_DIR/.control/` へatomic保存します。
+実測費用のcache token区分はProviderごとのusage契約に従います。Anthropicの `input_tokens` はcache read/writeを
+含まない独立区分としてそのまま使い、他の正規化済みProviderでは `input_tokens` から
+`cached_input_tokens` を差し引いて二重課金を避けます。
+reasoning tokenは表示値と課金outputを分けます。Gemini Interactionsの `total_thought_tokens` だけを
+`total_output_tokens` の外数として加算し、OpenAI/xAI Responsesのoutput tokenはreasoning内包として
+二重加算しません。旧xAI Chat互換shapeのdurable Grok usageはreasoningがcompletion外数の場合があるため、
+`total_tokens - input_tokens` をoutput側の安全なfallbackとして使います。
 
 ### 任意の組織管理telemetry
 
@@ -145,7 +173,9 @@ checkと予約は単一server process内のlock下で行い、予約ledgerを `C
 読み取ります。この機能を有効にすると `CLAGE_AUTH_TOKEN` は必須です。推論キーを管理APIへ転用せず、
 `ANTHROPIC_ADMIN_KEY`、`OPENAI_ADMIN_KEY`、`XAI_MANAGEMENT_KEY` を分離してください。取得は短期cacheされ、
 top-up、支払方法、spend limitの変更endpointは実装していません。Gemini Developer APIのcredit/組織usageは
-AI Studioの管理画面で確認します。
+AI Studioの管理画面で確認します。要求期間は `CLAGE_BUDGET_UTC_OFFSET` の暦日で作りますが、Anthropicの
+Usage/CostはUTC日次bucketのため完全一致しない場合があります。API応答とFlutterはProviderごとの実効期間、
+最終完全bucket、予算期間との一致有無を分けて表示します。
 
 ### 2. Flutterクライアント
 
@@ -171,14 +201,15 @@ C:\dev\flutter\bin\flutter.bat run -d chrome
 | --- | --- |
 | `CLAGE_LIVE_API_ENABLED=false` | キーの有無に関係なく4つのモック。Bearerは任意 |
 | `true`、`CLAGE_AUTH_TOKEN` なし | 安全のためserver起動を拒否 |
-| `true`、Bearerあり、APIキー0個 | 4つのモック |
+| `true`、Bearerあり、APIキー0個 | fail-closed。参加Providerなしで実行を拒否 |
 | `true`、Bearerあり、APIキー1〜3個 | 設定済みの実APIだけ |
 | `true`、Bearerあり、4キーすべて設定 | 4つの実API |
 | `true`、Bearerあり、`INCLUDE_MOCK_PROVIDERS=true` | 実APIと未設定モックを明示的に混在 |
 
 統合役は `SYNTHESIZER_PROVIDER=auto` の場合、利用可能な実Providerから自動選択します。
-safe mockまたは全キー未設定時は専用モック統合役を使います。Provider障害をモック成功へ
-自動置換することはありません。
+safe mockでは専用モック統合役を使います。liveで全キー未設定の場合や、Provider障害時に暗黙のモックへ
+置換することはありません。liveで未設定Providerも明示的にモック参加させる場合だけ
+`INCLUDE_MOCK_PROVIDERS=true` を使います。
 
 ## 操作
 
@@ -201,6 +232,10 @@ WEBは既定OFFで、明示したターンの初回回答にだけ適用しま�
 課金される場合があります。Claudeには設定した `max_uses` を渡しますが、OpenAI/Gemini/xAIの
 1リクエスト内の検索回数をこのアプリが厳密に保証するものではありません。Providerが返したURL引用は
 構造化して保存し、Flutterでクリック可能な出典として表示します。
+現在のprice tableはtoken単価だけを扱うため、live Web検索はtool料金を含む金額上限を完全に見積もれません。
+budget有効時は費用不明とし、`CLAGE_BUDGET_UNKNOWN_POLICY=block` でfail-closedに停止します。
+`allow` では警告付きで実行できます。この場合も価格が判明しているtoken小計は会議・日次上限で検査して
+予約しますが、不明なtool料金はlocal金額上限の外側です。
 
 会話検索はサーバー側のタイトル、ローカルメモ、質問、各回答、統合を対象にします。JSONはFlutterで
 clipboardへコピーでき、ZIPはJSON、読みやすいMarkdown、保存期限内の元添付をまとめて端末へ保存します。
@@ -208,9 +243,16 @@ ZIP生成用一時fileは応答完了後に削除します。`Ctrl/Cmd+K` で検
 会話headerのメモbuttonでは目的・制約・用語をrevision付きで保存でき、秘密候補は保存時にマスクされます。
 完了済みturnの各回答と統合は再生成でき、元結果と過去attemptは削除されません。回答を再生成すると
 既存統合をstale表示し、統合を再生成すると解消します。同じ再生成IDの再送は同一要求だけを再生し、
-異なるtargetへの再利用は409で拒否します。
+異なるtargetへの再利用は409で拒否します。完了した再生成stateはdurable attemptを正としてregistryから
+直ちに除去するため、conversation全体を含む結果を共通の `RUN_RETENTION_SEC`（既定1時間）へ残しません。
+その後の同一IDは保存attemptから再生します。保存済みterminal attemptの照合はrate limiterと
+active conversation claimより前に行うため、無課金replayを新規実行向けの429/409で拒否しません。
 完了turnの本文編集は親を上書きせず、対象turn直前までをcopyした新しいbranchを作り、編集本文をcomposerへ
-戻します。添付は会話にowner固定したopaque UUIDで参照し、許可したtext/Markdown/CSV/JSON/PDFは抽出して
+戻します。copyされた過去turnの同一billing identityはlocal usage/費用集計で重複加算しません。再生成開始時に
+既存回答を包むoriginal attemptも新しいAPI呼出ではないため、financeとlocal usage telemetryの双方で元turnと
+同じidentityを使い、片側branchだけで再生成した後もcopy元回答の費用・tokenを二重計上しません。
+実際に追加送信した再生成attemptは別identityです。
+添付は会話にowner固定したopaque UUIDで参照し、許可したtext/Markdown/CSV/JSON/PDFは抽出して
 未信頼資料としてpromptへ含めます。画像は保存・exportできますが、現在のtext-only会議promptには送りません。
 
 ## API概要
@@ -224,7 +266,7 @@ ZIP生成用一時fileは応答完了後に削除します。`Ctrl/Cmd+K` で検
 | `POST` | `/api/plan` | 外部APIを呼ばず会議の最大実行量と可否を算出 |
 | `POST` | `/api/policy/scan` | 外部送信せず秘密・個人情報候補をローカル検査 |
 | `POST` | `/api/chat` | 会議を開始または同一runへ再接続（SSE） |
-| `POST` | `/api/runs/{request_id}/cancel` | 実行中会議へ停止を要求 |
+| `POST` | `/api/runs/{request_id}/cancel` | 実行中会議へ停止を要求し、判明済みの `terminal_outcome` を返す |
 | `GET` | `/api/conversations` | 会話一覧 |
 | `GET` | `/api/conversations/{id}` | 会話取得 |
 | `PATCH` | `/api/conversations/{id}` | タイトル変更 |
@@ -239,7 +281,7 @@ ZIP生成用一時fileは応答完了後に削除します。`Ctrl/Cmd+K` で検
 | `POST` | `/api/conversations/{id}/turns/{run}/fork` | 対象turn直前からimmutable分岐 |
 | `POST` | `/api/conversations/{id}/turns/{run}/regeneration-plan` | 回答・統合再生成の無課金plan |
 | `POST` | `/api/conversations/{id}/turns/{run}/regenerate` | immutable attemptとして回答・統合を再生成 |
-| `POST` | `/api/budget/reconciliation/{request_id}/release` | 外部請求確認済み予約の手動解放 |
+| `POST` | `/api/budget/reconciliation/{request_id}/release` | 外部請求確認後に照合待ちを確定し、既知額または予約上限をcommitへ保持 |
 
 SSEイベントは次の順序要素で構成されます。
 
@@ -254,15 +296,25 @@ SSEイベントは次の順序要素で構成されます。
 接続が切れても、サーバー側の生成は続きます。同じ `request_id` と `Last-Event-ID` で途中から
 再接続でき、範囲外のイベントIDは409で拒否されます。Flutterを再読込しても、保存済みrunning turnから
 同じ生payloadと確認済みflagで同一runへ再接続するか、`request_id` 指定で停止を要求できます。
-外部呼出より前にpending turnを保存し、
-各生成イベントをsanitized event journalへ永続化するため、サーバー再起動後も同じrunを再課金目的で
-再実行しません。起動時に残っている `status=running` は、前プロセスにtaskが存在しないため
+外部呼出より前にpending turnを保存し、answer/synthesisで中間checkpointを保存し、終端時に
+その時点までの非終端生成イベントをsanitized event journalへ確定します。`error` / `done` はjournalへ
+重複保存せず、再生時にdurableなturn状態から再構成します。このためサーバー再起動後も同じrunを
+再課金目的で再実行しません。起動時に残っている `status=running` は、前プロセスにtaskが存在しないため
 `interrupted` へ確定し、取得済み回答とusageを保持します。同じIDへ異なる質問を送ると409です。
+保存済みturnまたは実行中runとのfingerprint照合は新規planより先に行うため、現在の添付TTL・予算・runtime設定・
+確認flagが変わっても、外部APIを呼ばない同一結果の再生/joinは妨げません。添付はpromptへ入る順序も
+fingerprintに含み、同じIDで順序を入れ替えると409です。
 同一conversationへ異なるrunを同時送信した場合も `conversation_busy` の409で拒否し、先行runの
 完了後に安全に再試行できます。
 
-停止APIはローカルtaskをキャンセルし、取得済み回答とusageを不完全状態として保存します。ただし、
-すでに送信したHTTP要求を外部Providerが停止したことや、課金が止まったことは保証しません。
+停止APIはローカルtaskへcancelを要求します。Provider結果が確定する前にcancelされた場合は、取得済み回答と
+usageを不完全なcancelled状態として保存します。一方、Provider結果後にchat/再生成の終端保存、budget settle、
+結果公開へ入った後は、このcritical sectionを完走し、先に確定したcompleted/failedをcancelledで上書きしません。
+cancel responseの `terminal_outcome` は、判明済みなら `completed` / `failed` / `cancelled` を返します。5秒の
+永続化待機内に終端しなければ未確定のまま返る場合があります。Flutterは確定値を文言と完了・失敗・停止iconへ
+反映します。再生成Provider failure後のcleanup中にcancelされても、terminal outcomeはfailedのまま、予約台帳と
+durable attemptの中断記録（user cancelではない）を完了します。ただし、すでに送信したHTTP要求を外部Providerが
+停止したことや、課金が止まったことは保証しません。
 
 ## テストとビルド
 
@@ -301,18 +353,29 @@ keystoreのpath、alias、passwordへ置き換えてからbuildしてくださ�
 - 公開経路の再帰scrubも既知値と同じpatternに基づく多層防御であり、未知・分割・難読化された秘密を
   完全には検出できません。
 - 画像生成は未実装です。画像添付は保存・download・ZIP exportのみで、会議modelへ画像入力しません。
-- 添付のPDF抽出は先頭の設定page数・文字数までです。TTL経過後は削除対象になり、ZIPに含まれる元添付byteは
-  利用者が明示的に取得する原本のためsecret scrubを行いません。
+- 添付のPDF抽出は隔離したPython subprocessで10秒、先頭の設定page数・文字数までです。同一内容・設定の
+  成功結果はprocess内だけの5分/64件LRU cacheで再利用し、PDF subprocessは同時に最大2本までです。期限切れの
+  抽出cacheは次のcache access時に除去され、process再起動ではcache全体が消えます。これとは別に、元添付の
+  保存TTLはserver起動時または添付access時にpurgeされます。ZIPに含まれる元添付byteは利用者が明示的に
+  取得する原本のためsecret scrubを行いません。
 - Web検索は各社のserver tool仕様・model対応・料金に依存します。Claude以外の内部検索回数を厳密制限せず、
-  URL引用が返らない回答へ出典を捏造しません。
+  URL引用が返らない回答へ出典を捏造しません。token用price tableは別課金のtool料金を
+  覆わないため、unknown costの扱いは上記policyに従います。
 - ターン編集はin-place変更ではなくimmutable branchです。親と以降のturnを自動削除しません。
 - OpenAI/Anthropicの組織credit残高、Gemini Developer APIの管理telemetryは公式APIから取得できません。
-  xAI残高はProvider報告の符号を保持します。管理telemetryは反映遅延や権限により部分取得になり得ます。
+  xAI残高はProvider報告の符号を保持します。管理telemetryは反映遅延や権限により部分取得になり得て、
+  Anthropicの日次UTC bucketはローカル予算期間の境界外を含む場合があります。
 - budget ledgerは現在の単一process JSON設計に合わせたlocal guardで、Provider側spend capや分散transactionでは
   ありません。送信後切断のexactly-once課金や最終請求額は保証しません。
-- 手動reconciliation解放は「外部請求に未観測chargeがない」と利用者が確認した事実だけを記録し、
-  Providerの請求額・credit残高を自動確定する機能ではありません。
+- `.control/budget-reservations.json` はidempotencyと日次commitのためsettled・reconciliation済み・
+  `released_before_dispatch` も保持し、各状態更新で台帳JSON全体をatomic再書込します。個人ローカル利用を超えて
+  数千〜数万のbillable runを長期保存すると、台帳件数に比例するI/Oとlock保持時間が増えます。SQLite化、または
+  過去日aggregateと最小idempotency tombstoneへのcompactionは公開規模へ広げる前の候補で、まだ未実装です。
+- 手動reconciliationは「外部請求に未観測chargeがない」と利用者が確認した事実だけを記録します。照合時点の
+  既知額または予約上限はsettled ledgerへ残し、Providerの請求額・credit残高を自動確定する機能ではありません。
 - 全文検索は保存JSONを走査する単純な部分一致です。大規模データ向けindexはありません。
+- BudgetGuardのactual-cost集計は `ConversationStore` revision、予算日、price versionをkeyにcacheしますが、
+  `/api/telemetry` のlocal usage集計は現在もrequestごとに全conversation JSONを走査します。
 - 保存先は既定で `backend/data/` です。1つのdata dirを複数processや複数ホストで共有できません。
 - 保存JSONには質問、回答、実測usage、SSE journalが含まれます。機密データとして管理してください。
 - repositoryはAndroid配布用keystoreを同梱しません。配布者が自分のkeyを安全に管理する必要があります。

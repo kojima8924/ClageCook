@@ -218,6 +218,7 @@ void main() {
         'limits': {'per_run_usd': '1.000000', 'daily_usd': '5.000000'},
         'today': {
           'day': '2026-07-18',
+          'active_reservation_top_up_usd': '0.075000',
           'remaining_usd': '4.000000',
           'unpriced_requests': 0,
         },
@@ -238,6 +239,7 @@ void main() {
     expect(plan.inputEnvelope.tokenCountEstimated, isFalse);
     expect(plan.costEstimate.totalUsd, '0.125000');
     expect(plan.budget.configured, isTrue);
+    expect(plan.budget.todayActiveReservationTopUpUsd, '0.075000');
     expect(plan.budget.todayRemainingUsd, '4.000000');
   });
 

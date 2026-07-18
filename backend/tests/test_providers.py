@@ -1,10 +1,12 @@
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
+import config
 from providers import CompletionRequest, ProviderError
-from providers.base import normalized_quota_snapshot, normalized_usage
+from providers.base import HttpProvider, normalized_quota_snapshot, normalized_usage
 from providers.anthropic import AnthropicProvider
 from providers.gemini import GeminiProvider
 from providers.mock import MockProvider
@@ -78,18 +80,20 @@ def test_unknown_or_invalid_quota_headers_do_not_become_zero():
     }
 
 
-def test_xai_legacy_usage_fallback_adds_external_reasoning_tokens():
+def test_openai_compatible_completion_usage_does_not_double_count_reasoning():
     usage = normalized_usage(
         {
             "prompt_tokens": 32,
             "completion_tokens": 9,
             "completion_tokens_details": {"reasoning_tokens": 110},
+            "total_tokens": 151,
         }
     )
 
     assert usage["input_tokens"] == 32
     assert usage["output_tokens"] == 9
     assert usage["reasoning_tokens"] == 110
+    assert "billable_output_tokens" not in usage
     assert usage["total_tokens"] == 151
 
 
@@ -131,6 +135,103 @@ async def test_anthropic_messages_contract():
         "cached_input_tokens": 5,
         "total_tokens": 14,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "tier", "effort"),
+    [
+        ("claude-sonnet-5", "balanced", "medium"),
+        ("claude-opus-4-8", "high", "high"),
+    ],
+)
+async def test_anthropic_current_models_use_adaptive_thinking(
+    model,
+    tier,
+    effort,
+):
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        assert body["thinking"] == {"type": "adaptive"}
+        assert body["output_config"] == {"effort": effort}
+        assert "budget_tokens" not in json.dumps(body)
+        return httpx.Response(
+            200,
+            json={
+                "model": model,
+                "content": [{"type": "text", "text": "answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await AnthropicProvider(
+            name="claude", model=model, api_key="secret", client=client
+        ).complete(CompletionRequest(prompt="hello", tier=tier))
+
+    assert result.text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_always_on_thinking_model_uses_effort_without_field():
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        assert body["output_config"] == {"effort": "high"}
+        assert "thinking" not in body
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await AnthropicProvider(
+            name="claude",
+            model="claude-fable-5",
+            api_key="secret",
+            client=client,
+        ).complete(CompletionRequest(prompt="hello", tier="high"))
+
+    assert result.text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_haiku_uses_basic_search_without_unsupported_thinking():
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        assert "thinking" not in body
+        assert "output_config" not in body
+        assert body["tools"] == [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 3,
+            }
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "content": [{"type": "text", "text": "answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await AnthropicProvider(
+            name="claude",
+            model="claude-haiku-4-5-20251001",
+            api_key="secret",
+            client=client,
+        ).complete(CompletionRequest(prompt="hello", tier="low", web_search=True))
+
+    assert result.text == "answer"
 
 
 @pytest.mark.asyncio
@@ -226,6 +327,7 @@ async def test_gemini_interactions_contract():
         "output_tokens": 4,
         "cached_input_tokens": 2,
         "reasoning_tokens": 3,
+        "billable_output_tokens": 7,
         "tool_tokens": 1,
         "total_tokens": 14,
     }
@@ -279,9 +381,12 @@ async def test_xai_responses_contract():
     [
         (
             lambda client: AnthropicProvider(
-                name="claude", model="claude-test", api_key="secret", client=client
+                name="claude",
+                model="claude-opus-4-8",
+                api_key="secret",
+                client=client,
             ),
-            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+            {"type": "web_search_20260318", "name": "web_search", "max_uses": 3},
         ),
         (
             lambda client: OpenAIProvider(
@@ -458,6 +563,95 @@ async def test_retry_audit_marks_prior_attempt_usage_unknown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_http_529_is_retried_and_honors_retry_after(monkeypatch):
+    calls = 0
+    delays: list[float] = []
+
+    def handler(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                529,
+                headers={"retry-after": "30"},
+                json={"error": {"type": "overloaded_error"}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-test",
+                "content": [{"type": "text", "text": "answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    async def capture_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("providers.base.asyncio.sleep", capture_sleep)
+    async with _client(handler) as client:
+        result = await AnthropicProvider(
+            name="claude",
+            model="claude-test",
+            api_key="secret",
+            retries=1,
+            client=client,
+        ).complete(CompletionRequest(prompt="hello"))
+
+    assert result.text == "answer"
+    assert calls == 2
+    assert delays == [30.0]
+
+
+def test_retry_after_http_date_uses_fixed_clock():
+    fixed_now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+
+    delay = HttpProvider._retry_delay(
+        httpx.Headers({"retry-after": "Sat, 18 Jul 2026 12:00:30 GMT"}),
+        0,
+        now=fixed_now,
+    )
+
+    assert delay == 30.0
+
+
+@pytest.mark.asyncio
+async def test_retry_after_above_local_wait_cap_gives_up_without_early_retry(
+    monkeypatch,
+):
+    calls = 0
+
+    def handler(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            headers={"retry-after": "120"},
+            json={"error": {"message": "do not reflect"}},
+        )
+
+    async def forbidden_sleep(_delay):
+        raise AssertionError("上限超過のRetry-Afterでsleepしてはいけない")
+
+    monkeypatch.setattr("providers.base.asyncio.sleep", forbidden_sleep)
+    async with _client(handler) as client:
+        provider = OpenAIProvider(
+            name="chatgpt",
+            model="gpt-test",
+            api_key="secret",
+            retries=1,
+            client=client,
+        )
+        with pytest.raises(ProviderError) as captured:
+            await provider.complete(CompletionRequest(prompt="hello"))
+
+    assert calls == 1
+    assert captured.value.retryable is True
+    assert captured.value.status_code == 429
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error_type", "outcome"),
     [
@@ -524,6 +718,126 @@ async def test_gemini_incomplete_text_is_explicitly_partial():
     assert result.completion_status == "incomplete"
     assert result.partial is True
     assert result.incomplete_reason is None
+
+
+@pytest.mark.asyncio
+async def test_gemini_budget_exceeded_is_preserved_as_incomplete_reason():
+    def handler(_request: httpx.Request):
+        return httpx.Response(
+            200,
+            json={
+                "model": "gemini-test",
+                "status": "budget_exceeded",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "partial answer"}],
+                    }
+                ],
+                "usage": {"total_input_tokens": 3, "total_output_tokens": 2},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await GeminiProvider(
+            name="gemini",
+            model="gemini-test",
+            api_key="secret",
+            client=client,
+        ).complete(CompletionRequest(prompt="hello"))
+
+    assert result.completion_status == "budget_exceeded"
+    assert result.partial is True
+    assert result.incomplete_reason == "budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_pause_turn_is_explicitly_incomplete():
+    def handler(_request: httpx.Request):
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "partial answer"}],
+                "stop_reason": "pause_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await AnthropicProvider(
+            name="claude",
+            model="claude-opus-4-8",
+            api_key="secret",
+            client=client,
+        ).complete(CompletionRequest(prompt="hello", web_search=True))
+
+    assert result.text == "partial answer"
+    assert result.finish_reason == "pause_turn"
+    assert result.completion_status == "incomplete"
+    assert result.partial is True
+    assert result.incomplete_reason == "pause_turn"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_refusal_uses_fixed_error_and_discards_partial_output():
+    def handler(_request: httpx.Request):
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "must-not-surface"}],
+                "stop_reason": "refusal",
+                "stop_details": {
+                    "category": "unstable-vendor-value",
+                    "explanation": "must-not-surface-either",
+                },
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            },
+        )
+
+    async with _client(handler) as client:
+        provider = AnthropicProvider(
+            name="claude",
+            model="claude-opus-4-8",
+            api_key="secret",
+            client=client,
+        )
+        with pytest.raises(ProviderError) as captured:
+            await provider.complete(CompletionRequest(prompt="hello"))
+
+    assert str(captured.value) == (
+        "claude: モデルのポリシー判定により回答を拒否しました"
+    )
+    assert captured.value.error_code == "model_refusal"
+    assert "must-not-surface" not in str(captured.value)
+
+
+def test_live_gate_without_any_key_is_fail_closed(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_API_ENABLED", True)
+    monkeypatch.setattr(config, "INCLUDE_MOCKS_WHEN_MIXED", False)
+    for key_name in config._ENV_KEYS.values():
+        monkeypatch.delenv(key_name, raising=False)
+
+    assert config.mode() == "mixed"
+    assert config.active_workers() == []
+    assert {item["mode"] for item in config.statuses()} == {"disabled"}
+    with pytest.raises(RuntimeError, match="APIキーが未設定"):
+        config.get_provider("claude")
+    with pytest.raises(RuntimeError, match="APIキーが未設定"):
+        config.get_synthesizer()
+
+
+def test_live_gate_allows_mock_only_with_explicit_opt_in(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_API_ENABLED", True)
+    monkeypatch.setattr(config, "INCLUDE_MOCKS_WHEN_MIXED", True)
+    for key_name in config._ENV_KEYS.values():
+        monkeypatch.delenv(key_name, raising=False)
+
+    assert config.mode() == "mixed"
+    assert config.active_workers() == list(config.WORKERS)
+    assert isinstance(config.get_provider("claude"), MockProvider)
+    assert isinstance(config.get_synthesizer(), MockProvider)
 
 
 @pytest.mark.asyncio

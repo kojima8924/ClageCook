@@ -3,19 +3,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import config
-from storage import utc_now
 
 
 _TEXT_MIMES = {
@@ -34,6 +38,107 @@ _TEXT_EXTENSIONS = {
     ".json": "application/json",
 }
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PDF_EXTRACT_TIMEOUT_SEC = 10.0
+_PDF_EXTRACT_MAX_CONCURRENCY = 2
+_PDF_CACHE_MAX_ENTRIES = 64
+_PDF_CACHE_TTL_SEC = 300.0
+_PDF_EXTRACT_SEMAPHORE = threading.BoundedSemaphore(_PDF_EXTRACT_MAX_CONCURRENCY)
+_PDF_EXTRACT_SCRIPT = r"""
+import sys
+from pypdf import PdfReader
+
+path, raw_pages, raw_chars = sys.argv[1:]
+remaining = max(0, int(raw_chars))
+parts = []
+reader = PdfReader(path)
+for page in reader.pages[:max(0, int(raw_pages))]:
+    if remaining <= 0:
+        break
+    text = page.extract_text() or ""
+    part = text[:remaining]
+    parts.append(part)
+    remaining -= len(part)
+sys.stdout.buffer.write("\n\n".join(parts).encode("utf-8"))
+"""
+
+
+class _PdfExtractionFlight:
+    """同一keyの同時抽出を1本へまとめるsingle-flight状態。"""
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.result: str | None = None
+        self.error: BaseException | None = None
+
+
+class _PdfTextCache:
+    """TTLとLRU上限を持つthread-safeなPDF抽出結果cache。"""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int,
+        ttl_sec: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._ttl_sec = max(0.001, float(ttl_sec))
+        self._clock = clock
+        self._entries: OrderedDict[tuple[str, int, int], tuple[float, str]] = (
+            OrderedDict()
+        )
+        self._flights: dict[tuple[str, int, int], _PdfExtractionFlight] = {}
+        self._lock = threading.Lock()
+
+    def get_or_compute(
+        self,
+        key: tuple[str, int, int],
+        loader: Callable[[], str],
+    ) -> str:
+        with self._lock:
+            self._purge_expired_locked(self._clock())
+            cached = self._entries.get(key)
+            if cached is not None:
+                self._entries.move_to_end(key)
+                return cached[1]
+            flight = self._flights.get(key)
+            owner = flight is None
+            if flight is None:
+                flight = _PdfExtractionFlight()
+                self._flights[key] = flight
+
+        if not owner:
+            flight.ready.wait()
+            if flight.error is not None:
+                raise flight.error
+            if flight.result is None:
+                raise RuntimeError("PDF extraction completed without a result")
+            return flight.result
+
+        try:
+            result = loader()
+        except BaseException as exc:
+            with self._lock:
+                flight.error = exc
+                self._flights.pop(key, None)
+                flight.ready.set()
+            raise
+
+        with self._lock:
+            flight.result = result
+            self._purge_expired_locked(self._clock())
+            self._entries[key] = (self._clock() + self._ttl_sec, result)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+            self._flights.pop(key, None)
+            flight.ready.set()
+        return result
+
+    def _purge_expired_locked(self, now: float) -> None:
+        for key, (expires_at, _result) in tuple(self._entries.items()):
+            if expires_at <= now:
+                self._entries.pop(key, None)
 
 
 class AttachmentError(ValueError):
@@ -42,10 +147,44 @@ class AttachmentError(ValueError):
         self.code = code
 
 
+async def _blocking_io(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """file I/Oをloop外へ出し、cancel時も進行中のworkerを回収する。"""
+    work = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        try:
+            await work
+        except Exception:
+            pass
+        raise
+
+
+def _flush_and_fsync(handle: Any) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 class AttachmentStore:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        pdf_cache_max_entries: int = _PDF_CACHE_MAX_ENTRIES,
+        pdf_cache_ttl_sec: float = _PDF_CACHE_TTL_SEC,
+        pdf_cache_clock: Callable[[], float] = time.monotonic,
+        pdf_extract_semaphore: threading.BoundedSemaphore | None = None,
+    ) -> None:
         self.root = Path(data_dir).resolve() / ".attachments"
         self._lock = threading.RLock()
+        self._pdf_cache = _PdfTextCache(
+            max_entries=pdf_cache_max_entries,
+            ttl_sec=pdf_cache_ttl_sec,
+            clock=pdf_cache_clock,
+        )
+        self._pdf_extract_semaphore = (
+            pdf_extract_semaphore or _PDF_EXTRACT_SEMAPHORE
+        )
 
     async def save_upload(self, conversation_id: str, upload: Any) -> dict[str, Any]:
         conversation_id = _canonical_uuid(conversation_id, "conversation")
@@ -53,14 +192,16 @@ class AttachmentStore:
         declared = str(getattr(upload, "content_type", "") or "").split(";", 1)[0].lower()
         attachment_id = str(uuid.uuid4())
         directory = self.root / conversation_id
-        directory.mkdir(parents=True, exist_ok=True)
+        await _blocking_io(directory.mkdir, parents=True, exist_ok=True)
         temp = directory / f".{attachment_id}.upload"
         content_path = directory / f"{attachment_id}.blob"
         digest = hashlib.sha256()
         size = 0
         first = bytearray()
+        handle = None
         try:
-            with temp.open("xb") as handle:
+            handle = await _blocking_io(temp.open, "xb")
+            try:
                 while True:
                     chunk = await upload.read(64 * 1024)
                     if not chunk:
@@ -76,60 +217,102 @@ class AttachmentStore:
                     if len(first) < 4096:
                         first.extend(chunk[: 4096 - len(first)])
                     digest.update(chunk)
-                    handle.write(chunk)
-                handle.flush()
-                os.fsync(handle.fileno())
+                    await _blocking_io(handle.write, chunk)
+                await _blocking_io(_flush_and_fsync, handle)
+            finally:
+                await _blocking_io(handle.close)
+                handle = None
             if size == 0:
                 raise AttachmentError("attachment_empty", "空の添付は保存できません")
-            mime, kind = _detect_mime(name, declared, bytes(first), temp)
-            with self._lock:
-                current = self.list(conversation_id, purge_expired=True)
-                if len(current) >= config.ATTACHMENT_MAX_COUNT_PER_CONVERSATION:
-                    raise AttachmentError(
-                        "attachment_count_exceeded",
-                        "この会話の添付数上限に達しました",
-                    )
-                total = sum(int(item.get("size_bytes") or 0) for item in current)
-                if total + size > config.ATTACHMENT_MAX_TOTAL_BYTES_PER_CONVERSATION:
-                    raise AttachmentError(
-                        "attachment_total_exceeded",
-                        "この会話の添付総容量上限を超えます",
-                    )
-                created = datetime.now(timezone.utc)
-                expires = created + timedelta(seconds=config.ATTACHMENT_TTL_SEC)
-                metadata = {
-                    "schema_version": 1,
-                    "id": attachment_id,
-                    "conversation_id": conversation_id,
-                    "name": name,
-                    "mime_type": mime,
-                    "kind": kind,
-                    "size_bytes": size,
-                    "sha256": digest.hexdigest(),
-                    "created_at": created.isoformat(timespec="milliseconds").replace(
-                        "+00:00", "Z"
-                    ),
-                    "expires_at": expires.isoformat(timespec="milliseconds").replace(
-                        "+00:00", "Z"
-                    ),
-                    "text_extractable": kind in {"text", "pdf"},
-                }
-                os.replace(temp, content_path)
-                try:
-                    self._write_metadata(directory, attachment_id, metadata)
-                except Exception:
-                    content_path.unlink(missing_ok=True)
-                    raise
-                return _public_metadata(metadata)
+            mime, kind = await _blocking_io(
+                _detect_mime,
+                name,
+                declared,
+                bytes(first),
+                temp,
+            )
+            return await _blocking_io(
+                self._commit_upload,
+                conversation_id=conversation_id,
+                attachment_id=attachment_id,
+                directory=directory,
+                temp=temp,
+                content_path=content_path,
+                name=name,
+                mime=mime,
+                kind=kind,
+                size=size,
+                sha256=digest.hexdigest(),
+            )
         finally:
+            if handle is not None:
+                try:
+                    await _blocking_io(handle.close)
+                except OSError:
+                    pass
             try:
-                temp.unlink(missing_ok=True)
+                await _blocking_io(temp.unlink, missing_ok=True)
             except OSError:
                 pass
             try:
                 await upload.close()
             except Exception:
                 pass
+
+    def _commit_upload(
+        self,
+        *,
+        conversation_id: str,
+        attachment_id: str,
+        directory: Path,
+        temp: Path,
+        content_path: Path,
+        name: str,
+        mime: str,
+        kind: str,
+        size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        """quota確認とblob/metadata公開を同じstore lock内で確定する。"""
+        with self._lock:
+            current = self.list(conversation_id, purge_expired=True)
+            if len(current) >= config.ATTACHMENT_MAX_COUNT_PER_CONVERSATION:
+                raise AttachmentError(
+                    "attachment_count_exceeded",
+                    "この会話の添付数上限に達しました",
+                )
+            total = sum(int(item.get("size_bytes") or 0) for item in current)
+            if total + size > config.ATTACHMENT_MAX_TOTAL_BYTES_PER_CONVERSATION:
+                raise AttachmentError(
+                    "attachment_total_exceeded",
+                    "この会話の添付総容量上限を超えます",
+                )
+            created = datetime.now(timezone.utc)
+            expires = created + timedelta(seconds=config.ATTACHMENT_TTL_SEC)
+            metadata = {
+                "schema_version": 1,
+                "id": attachment_id,
+                "conversation_id": conversation_id,
+                "name": name,
+                "mime_type": mime,
+                "kind": kind,
+                "size_bytes": size,
+                "sha256": sha256,
+                "created_at": created.isoformat(timespec="milliseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "expires_at": expires.isoformat(timespec="milliseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "text_extractable": kind in {"text", "pdf"},
+            }
+            os.replace(temp, content_path)
+            try:
+                self._write_metadata(directory, attachment_id, metadata)
+            except Exception:
+                content_path.unlink(missing_ok=True)
+                raise
+            return _public_metadata(metadata)
 
     def list(self, conversation_id: str, *, purge_expired: bool = True) -> list[dict[str, Any]]:
         conversation_id = _canonical_uuid(conversation_id, "conversation")
@@ -186,8 +369,44 @@ class AttachmentStore:
     def delete_conversation(self, conversation_id: str) -> None:
         conversation_id = _canonical_uuid(conversation_id, "conversation")
         directory = self.root / conversation_id
-        if directory.exists():
-            shutil.rmtree(directory)
+        with self._lock:
+            if directory.exists():
+                shutil.rmtree(directory)
+
+    def purge_expired(self) -> int:
+        """全owner directoryを走査し、期限切れ添付を起動時にも削除する。"""
+        if not self.root.is_dir():
+            return 0
+        purged = 0
+        with self._lock:
+            for directory in self.root.iterdir():
+                if not directory.is_dir():
+                    continue
+                try:
+                    conversation_id = _canonical_uuid(directory.name, "conversation")
+                except AttachmentError:
+                    continue
+                for path in directory.glob("*.json"):
+                    try:
+                        raw = json.loads(path.read_text(encoding="utf-8"))
+                        metadata = self._validate_metadata(raw, conversation_id)
+                    except (
+                        OSError,
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        AttachmentError,
+                    ):
+                        continue
+                    if not _expired(metadata):
+                        continue
+                    self._delete_files(directory, str(metadata["id"]))
+                    purged += 1
+                try:
+                    if not any(directory.iterdir()):
+                        directory.rmdir()
+                except OSError:
+                    pass
+        return purged
 
     def build_context(
         self,
@@ -250,18 +469,64 @@ class AttachmentStore:
                 ) from exc
         if kind == "pdf":
             try:
-                from pypdf import PdfReader
-
-                reader = PdfReader(str(path))
-                parts = []
-                for page in reader.pages[: config.ATTACHMENT_PDF_MAX_PAGES]:
-                    parts.append(page.extract_text() or "")
-                return "\n\n".join(parts)
+                pages = int(config.ATTACHMENT_PDF_MAX_PAGES)
+                max_chars = int(config.ATTACHMENT_TEXT_MAX_CHARS)
+                cache_key = (_sha256_file(path), pages, max_chars)
+                return self._pdf_cache.get_or_compute(
+                    cache_key,
+                    lambda: self._extract_pdf(path, pages, max_chars),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise AttachmentError(
+                    "attachment_pdf_timeout",
+                    "PDFのテキスト抽出が時間上限を超えました",
+                ) from exc
+            except AttachmentError:
+                raise
             except Exception as exc:
                 raise AttachmentError(
                     "attachment_pdf_invalid", "PDFから安全にテキストを抽出できません"
                 ) from exc
         return None
+
+    def _extract_pdf(self, path: Path, pages: int, max_chars: int) -> str:
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper()
+            in {
+                "SYSTEMROOT",
+                "WINDIR",
+                "PATH",
+                "PATHEXT",
+                "TEMP",
+                "TMP",
+            }
+        }
+        with self._pdf_extract_semaphore:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    _PDF_EXTRACT_SCRIPT,
+                    str(path),
+                    str(pages),
+                    str(max_chars),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=_PDF_EXTRACT_TIMEOUT_SEC,
+                env=environment,
+            )
+        if completed.returncode != 0:
+            raise AttachmentError(
+                "attachment_pdf_invalid",
+                "PDFから安全にテキストを抽出できません",
+            )
+        return completed.stdout.decode("utf-8", errors="strict")
 
     def _validate_metadata(
         self, raw: Any, expected_conversation_id: str
@@ -296,6 +561,14 @@ class AttachmentStore:
     def _delete_files(directory: Path, attachment_id: str) -> None:
         (directory / f"{attachment_id}.json").unlink(missing_ok=True)
         (directory / f"{attachment_id}.blob").unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _detect_mime(

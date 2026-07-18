@@ -41,4 +41,33 @@ void main() {
     expect(events.single.event, 'notice');
     expect(events.single.data, {'raw': 'plain text'});
   });
+
+  test('idは後続eventへ引き継ぎ、空idでリセットする', () async {
+    final events = await SseDecoder.decode(
+      Stream.value(
+        utf8.encode(
+          'id: 42\ndata: {"index":1}\n\n'
+          'data: {"index":2}\n\n'
+          'id:\ndata: {"index":3}\n\n'
+          'data: {"index":4}\n\n',
+        ),
+      ),
+    ).toList();
+
+    expect(events.map((event) => event.id), ['42', '42', '', '']);
+  });
+
+  test('NULを含むidは無視し、空のevent名はmessageとして扱う', () async {
+    final events = await SseDecoder.decode(
+      Stream.value(
+        utf8.encode(
+          'id: safe\ndata: {"index":1}\n\n'
+          'id: bad\u0000id\nevent:\ndata: {"index":2}\n\n',
+        ),
+      ),
+    ).toList();
+
+    expect(events.last.id, 'safe');
+    expect(events.last.event, 'message');
+  });
 }

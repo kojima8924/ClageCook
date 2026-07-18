@@ -56,7 +56,8 @@ void main() {
                 'today': {
                   'day': '2026-07-18',
                   'actual_estimated_usd': '0.100000',
-                  'active_reservations_usd': '0.200000',
+                  'active_reservations_usd': '0.250000',
+                  'active_reservation_top_up_usd': '0.200000',
                   'committed_usd': '0.300000',
                   'remaining_usd': '4.700000',
                   'unpriced_requests': 0,
@@ -77,6 +78,16 @@ void main() {
                     'supported': true,
                     'configured': true,
                     'status': 'partial',
+                    'window': {
+                      'starting_at': '2026-07-11T00:00:00Z',
+                      'ending_at': '2026-07-18T12:00:00Z',
+                      'requested_starting_at': '2026-07-11T15:00:00Z',
+                      'requested_ending_at': '2026-07-18T12:00:00Z',
+                      'alignment': 'provider_utc_day_buckets',
+                      'bucket_width': '1d',
+                      'exact_budget_window': false,
+                      'complete_through': '2026-07-18T00:00:00Z',
+                    },
                     'usage': {
                       'status': 'ok',
                       'usage': {'input_tokens': 100, 'output_tokens': 25},
@@ -89,6 +100,15 @@ void main() {
                     'supported': true,
                     'configured': true,
                     'status': 'ok',
+                    'window': {
+                      'starting_at': '2026-07-11T15:00:00Z',
+                      'ending_at': '2026-07-18T12:00:00Z',
+                      'requested_starting_at': '2026-07-11T15:00:00Z',
+                      'requested_ending_at': '2026-07-18T12:00:00Z',
+                      'alignment': 'requested_budget_window',
+                      'bucket_width': '1d',
+                      'exact_budget_window': true,
+                    },
                     'usage': {'status': 'ok', 'amount_usd': '1.25'},
                     'credit_balance': {
                       'status': 'ok',
@@ -117,7 +137,26 @@ void main() {
     expect(find.text(r'$1.25'), findsOneWidget);
     expect(find.text(r'$-10'), findsOneWidget);
     expect(find.textContaining('権限不足'), findsOneWidget);
+    expect(
+      find.textContaining('UTC日次bucketで集計され、ローカル予算期間とは一致しません'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('実効期間: 2026/07/11 00:00 UTC → 2026/07/18 12:00 UTC'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('完全集計済み境界（complete-through）: 2026/07/18 00:00 UTC'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('集計期間（予算期間と一致）'), findsOneWidget);
     expect(find.text(r'$4.700000'), findsOneWidget);
+    expect(find.text('有効予約（総額）'), findsOneWidget);
+    expect(find.text('実績未反映の追加拘束'), findsOneWidget);
+    expect(find.text(r'$0.250000'), findsOneWidget);
+    expect(find.text(r'$0.200000'), findsOneWidget);
+    expect(find.textContaining('観測済み実績と重複せず'), findsOneWidget);
+    expect(find.textContaining('請求書'), findsOneWidget);
     await tester.scrollUntilVisible(
       find.text('Claude'),
       300,
@@ -125,7 +164,59 @@ void main() {
     );
     expect(find.text('Claude'), findsOneWidget);
     expect(find.textContaining('残り 49 / 上限 50'), findsOneWidget);
-    expect(find.textContaining('請求書'), findsOneWidget);
     client.close();
+  });
+
+  test('Provider別windowは未知fieldを無視して型付き復元する', () {
+    final provider = AdminProviderTelemetry.fromJson({
+      'name': 'claude',
+      'label': 'Claude',
+      'status': 'ok',
+      'window': {
+        'starting_at': '2026-07-11T00:00:00Z',
+        'ending_at': '2026-07-18T12:00:00Z',
+        'requested_starting_at': '2026-07-11T15:00:00Z',
+        'requested_ending_at': '2026-07-18T12:00:00Z',
+        'alignment': 'provider_utc_day_buckets',
+        'bucket_width': '1d',
+        'exact_budget_window': false,
+        'complete_through': '2026-07-18T00:00:00Z',
+        'future_metadata': {'schema': 2},
+      },
+      'future_provider_field': true,
+    });
+
+    expect(provider.window.startingAt, '2026-07-11T00:00:00Z');
+    expect(provider.window.endingAt, '2026-07-18T12:00:00Z');
+    expect(provider.window.requestedStartingAt, '2026-07-11T15:00:00Z');
+    expect(provider.window.requestedEndingAt, '2026-07-18T12:00:00Z');
+    expect(provider.window.alignment, 'provider_utc_day_buckets');
+    expect(provider.window.bucketWidth, '1d');
+    expect(provider.window.exactBudgetWindow, isFalse);
+    expect(provider.window.completeThrough, '2026-07-18T00:00:00Z');
+    expect(provider.window.hasData, isTrue);
+  });
+
+  test('Provider別windowはMapやListを表示文字列へ変換しない', () {
+    final window = AdminProviderWindow.fromJson({
+      'starting_at': {'unexpected': 'value'},
+      'ending_at': ['2026-07-18T12:00:00Z'],
+      'requested_starting_at': 123,
+      'requested_ending_at': true,
+      'alignment': {'unexpected': 'alignment'},
+      'bucket_width': ['1d'],
+      'exact_budget_window': 'false',
+      'complete_through': {'unexpected': 'boundary'},
+    });
+
+    expect(window.startingAt, isNull);
+    expect(window.endingAt, isNull);
+    expect(window.requestedStartingAt, isNull);
+    expect(window.requestedEndingAt, isNull);
+    expect(window.alignment, isNull);
+    expect(window.bucketWidth, isNull);
+    expect(window.exactBudgetWindow, isNull);
+    expect(window.completeThrough, isNull);
+    expect(window.hasData, isFalse);
   });
 }

@@ -2,7 +2,7 @@ import pytest
 
 import storage
 from scrubbing import scrub_public_data
-from storage import ConversationStore
+from storage import AmbiguousRequestId, ConversationStore
 
 
 def test_conversation_crud_search_and_atomic_save(tmp_path):
@@ -153,7 +153,11 @@ def test_recover_interrupted_turns_marks_only_running_without_reexecution(tmp_pa
     assert store.recover_interrupted_turns() == 0
 
 
-def test_recover_interrupted_regeneration_attempt_without_restarting_it(tmp_path):
+@pytest.mark.parametrize("active_status", ["reserved", "running", "dispatching"])
+def test_recover_interrupted_regeneration_attempt_without_restarting_it(
+    tmp_path,
+    active_status,
+):
     store = ConversationStore(tmp_path)
     conversation = store.create("attempt")
     conversation["turns"] = [
@@ -163,7 +167,7 @@ def test_recover_interrupted_regeneration_attempt_without_restarting_it(tmp_path
             "attempts": [
                 {
                     "attempt_id": "pending-attempt",
-                    "status": "dispatching",
+                    "status": active_status,
                     "usage_may_be_incomplete": False,
                 }
             ],
@@ -175,3 +179,47 @@ def test_recover_interrupted_regeneration_attempt_without_restarting_it(tmp_path
     assert recovered["status"] == "completed"
     assert recovered["attempts"][0]["status"] == "interrupted"
     assert recovered["attempts"][0]["usage_may_be_incomplete"] is True
+
+
+def test_request_index_is_built_at_startup_and_updated_on_save_and_delete(tmp_path):
+    first = ConversationStore(tmp_path)
+    conversation = first.create("index")
+    conversation["turns"] = [{"request_id": "indexed-request"}]
+    first.save(conversation)
+
+    restarted = ConversationStore(tmp_path)
+    found = restarted.find_conversation_by_request_id("indexed-request")
+    assert found is not None
+    assert found[0]["id"] == conversation["id"]
+
+    restarted.delete(conversation["id"])
+    assert restarted.find_conversation_by_request_id("indexed-request") is None
+
+
+def test_request_index_prefers_explicit_conversation_and_rejects_ambiguity(tmp_path):
+    store = ConversationStore(tmp_path)
+    parent = store.create("parent")
+    parent["turns"] = [
+        {"request_id": "shared-request", "status": "completed"},
+        {"request_id": "fork-point", "status": "completed"},
+    ]
+    store.save(parent)
+    branch = store.create_branch(
+        parent,
+        before_turn_index=1,
+        parent_turn_request_id="fork-point",
+    )
+
+    with pytest.raises(AmbiguousRequestId):
+        store.find_conversation_by_request_id("shared-request")
+
+    parent_match = store.find_conversation_by_request_id(
+        "shared-request",
+        preferred_conversation_id=parent["id"],
+    )
+    branch_match = store.find_conversation_by_request_id(
+        "shared-request",
+        preferred_conversation_id=branch["id"],
+    )
+    assert parent_match is not None and parent_match[0]["id"] == parent["id"]
+    assert branch_match is not None and branch_match[0]["id"] == branch["id"]

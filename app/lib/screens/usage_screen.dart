@@ -248,6 +248,10 @@ class _AdminProviderRow extends StatelessWidget {
             ),
           ],
         ),
+        if (provider.window.hasData) ...[
+          const SizedBox(height: 6),
+          _AdminProviderWindowSummary(provider: provider),
+        ],
         if (provider.status == 'unsupported')
           Text(
             'Developer APIキーからの集計取得には未対応です。AI Studioで確認します。',
@@ -308,6 +312,76 @@ class _AdminProviderRow extends StatelessWidget {
           ],
         ],
       ],
+    );
+  }
+}
+
+class _AdminProviderWindowSummary extends StatelessWidget {
+  const _AdminProviderWindowSummary({required this.provider});
+
+  final AdminProviderTelemetry provider;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final window = provider.window;
+    final exact = window.exactBudgetWindow;
+    final utcDailyBucket =
+        provider.name == 'claude' && window.exactBudgetWindow == false;
+    final effectiveRange = _utcRange(window.startingAt, window.endingAt);
+    final requestedRange = _utcRange(
+      window.requestedStartingAt,
+      window.requestedEndingAt,
+    );
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: exact == false
+            ? theme.colorScheme.tertiaryContainer
+            : theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (exact == false) ...[
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.info_outline, size: 18),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      utcDailyBucket
+                          ? 'UTC日次bucketで集計され、ローカル予算期間とは一致しません。'
+                          : 'Providerのbucketで集計され、ローカル予算期間とは一致しません。',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+            ],
+            Text(
+              exact == true
+                  ? '集計期間（予算期間と一致）: $effectiveRange'
+                  : '実効期間: $effectiveRange',
+              style: theme.textTheme.bodySmall,
+            ),
+            if (exact == false) ...[
+              Text('要求予算期間: $requestedRange', style: theme.textTheme.bodySmall),
+              Text(
+                '完全集計済み境界（complete-through）: '
+                '${_utcTime(window.completeThrough)}',
+                style: theme.textTheme.bodySmall,
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }
@@ -394,7 +468,14 @@ class _BudgetCard extends StatelessWidget {
                 runSpacing: 8,
                 children: [
                   _MoneyMetric(label: '本日確定推定', value: finance.todayActualUsd),
-                  _MoneyMetric(label: '有効予約', value: finance.todayReservedUsd),
+                  _MoneyMetric(
+                    label: '有効予約（総額）',
+                    value: finance.todayReservedUsd,
+                  ),
+                  _MoneyMetric(
+                    label: '実績未反映の追加拘束',
+                    value: finance.todayActiveReservationTopUpUsd,
+                  ),
                   _MoneyMetric(
                     label: '本日拘束済み',
                     value: finance.todayCommittedUsd,
@@ -411,6 +492,13 @@ class _BudgetCard extends StatelessWidget {
                 '${finance.maxUnreconciledCount > 0 ? '/${finance.maxUnreconciledCount}' : ''}件 · '
                 '金額不明 ${finance.unpricedRequests}件 · '
                 '不明時 ${finance.unknownCostPolicy == 'block' ? '停止' : '許可'}',
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '有効予約（総額）は実行開始時の予約額です。'
+                '実績未反映の追加拘束は、観測済み実績と重複せず'
+                '日次上限に追加算入されている差額です。',
+                style: theme.textTheme.bodySmall,
               ),
             ],
             if (finance.priceVersion != null) ...[
@@ -727,4 +815,16 @@ String _localTime(String value) {
   String two(int number) => number.toString().padLeft(2, '0');
   return '${parsed.year}/${two(parsed.month)}/${two(parsed.day)} '
       '${two(parsed.hour)}:${two(parsed.minute)}';
+}
+
+String _utcRange(String? startingAt, String? endingAt) =>
+    '${_utcTime(startingAt)} → ${_utcTime(endingAt)}';
+
+String _utcTime(String? value) {
+  if (value == null || value.isEmpty) return '不明';
+  final parsed = DateTime.tryParse(value)?.toUtc();
+  if (parsed == null) return value;
+  String two(int number) => number.toString().padLeft(2, '0');
+  return '${parsed.year}/${two(parsed.month)}/${two(parsed.day)} '
+      '${two(parsed.hour)}:${two(parsed.minute)} UTC';
 }

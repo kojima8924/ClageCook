@@ -14,29 +14,47 @@ def _warning(code: str, message: str) -> dict[str, str]:
     return {"code": code, "message": message}
 
 
-def _provider_descriptor(name: str, tier: str, *, calls: int) -> dict[str, Any]:
-    status = config.provider_status(name)
+def _provider_descriptor(
+    name: str,
+    tier: str,
+    *,
+    calls: int,
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    status = config.provider_status(name, runtime=runtime)
     mode = status.mode
     return {
         "name": name,
         "label": status.label,
         "mode": mode,
-        "model": config.model_for(name, tier) if mode == "live" else "mock",
+        "model": (
+            config.model_for(name, tier, runtime=runtime)
+            if mode == "live"
+            else "mock"
+        ),
         "billable": mode == "live" and calls > 0,
         "max_calls": calls,
     }
 
 
 def _synthesizer_descriptor(
-    tier: str, *, enabled: bool, calls: int
+    tier: str,
+    *,
+    enabled: bool,
+    calls: int,
+    runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    name = config.synthesizer_name()
+    name = config.synthesizer_name(runtime=runtime)
     mode = "mock" if name == "synthesizer" else "live"
     return {
         "name": name,
         "label": config.LABELS.get(name, "Local mock synthesizer"),
         "mode": mode,
-        "model": config.synthesizer_model_for(tier),
+        "model": config.synthesizer_model_for(
+            tier,
+            runtime=runtime,
+            synthesizer=name,
+        ),
         "enabled": enabled,
         "billable": mode == "live" and calls > 0,
         "max_calls": calls,
@@ -56,6 +74,8 @@ def build_run_plan(
     memory_text: str = "",
 ) -> dict[str, Any]:
     """実行上限を安全側に算出する。Provider生成やHTTP通信は一切行わない。"""
+    # runtime設定は1回だけ読み、同じplan内でProvider/modelが混在しないようにする。
+    runtime = config.runtime_settings.snapshot()
     requested = tuple(dict.fromkeys(providers or ()))
     clean_message, options, help_requested = orchestrator.parse_controls(
         message,
@@ -138,13 +158,19 @@ def build_run_plan(
     total_calls = answer_calls + debate_calls + synthesis_calls
     calls_per_participant = 1 + (1 if debate_effective else 0)
     provider_plans = [
-        _provider_descriptor(name, options.tier, calls=calls_per_participant)
+        _provider_descriptor(
+            name,
+            options.tier,
+            calls=calls_per_participant,
+            runtime=runtime,
+        )
         for name in effective_names
     ]
     synthesizer_plan = _synthesizer_descriptor(
         options.tier,
         enabled=synthesis_effective,
         calls=synthesis_calls,
+        runtime=runtime,
     )
 
     per_call_tokens = config.MAX_OUTPUT_TOKENS[options.tier]

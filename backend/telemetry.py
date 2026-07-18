@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import config
-from storage import ConversationNotFound, ConversationStore, utc_now
+from storage import ConversationStore, utc_now
 
 
 _USAGE_KEYS = (
@@ -47,22 +47,23 @@ def local_snapshot(
     }
     conversation_count = 0
     turn_count = 0
+    represented_entries: set[tuple[str, ...]] = set()
 
-    for summary in store.list():
-        try:
-            conversation = store.load(str(summary.get("id") or ""))
-        except ConversationNotFound:
-            continue
+    for conversation in store.load_all():
         conversation_count += 1
         for turn in conversation.get("turns") or []:
             if not isinstance(turn, dict):
                 continue
             turn_count += 1
-            created = _parse_timestamp(turn.get("created_at"))
-            is_today = created is not None and created.date() == today
-            for source, entry, phase in _turn_entries(turn):
+            for source, entry, phase, identity, occurred_at in _turn_entries(turn):
                 if source not in accumulators:
                     continue
+                if identity is not None:
+                    if identity in represented_entries:
+                        continue
+                    represented_entries.add(identity)
+                created = _parse_timestamp(occurred_at)
+                is_today = created is not None and created.date() == today
                 _add_entry(accumulators[source], entry, phase, is_today)
 
     providers = []
@@ -133,7 +134,15 @@ def _empty_provider(name: str) -> dict[str, Any]:
 
 def _turn_entries(
     turn: dict[str, Any],
-) -> Iterable[tuple[str, dict[str, Any], str]]:
+) -> Iterable[
+    tuple[
+        str,
+        dict[str, Any],
+        str,
+        tuple[str, ...] | None,
+        Any,
+    ]
+]:
     represented: set[str] = set()
     attempts = turn.get("attempts")
     if isinstance(attempts, list):
@@ -154,7 +163,18 @@ def _turn_entries(
                     represented.add(f"answer:{source}")
             if isinstance(source, str):
                 phase = "original" if attempt.get("original") is True else "regeneration"
-                yield source, result, phase
+                yield (
+                    source,
+                    result,
+                    phase,
+                    _entry_identity(
+                        turn,
+                        attempt,
+                        target=str(target),
+                        provider=source,
+                    ),
+                    attempt.get("created_at") or turn.get("created_at"),
+                )
 
     answers = turn.get("answers")
     if isinstance(answers, dict):
@@ -164,12 +184,79 @@ def _turn_entries(
                 and isinstance(entry, dict)
                 and f"answer:{source}" not in represented
             ):
-                yield source, entry, "answer"
+                yield (
+                    source,
+                    entry,
+                    "answer",
+                    _entry_identity(
+                        turn,
+                        None,
+                        target="answer",
+                        provider=source,
+                    ),
+                    turn.get("created_at"),
+                )
     synthesis = turn.get("synthesis")
     if isinstance(synthesis, dict) and "synthesis" not in represented:
         source = synthesis.get("source")
         if isinstance(source, str) and source in config.WORKERS:
-            yield source, synthesis, "synthesis"
+            yield (
+                source,
+                synthesis,
+                "synthesis",
+                _entry_identity(
+                    turn,
+                    None,
+                    target="synthesis",
+                    provider=source,
+                ),
+                turn.get("created_at"),
+            )
+
+
+def _entry_identity(
+    turn: dict[str, Any],
+    attempt: dict[str, Any] | None,
+    *,
+    target: str,
+    provider: str,
+) -> tuple[str, ...] | None:
+    if isinstance(attempt, dict):
+        request_id = turn.get("request_id")
+        if attempt.get("original") is True:
+            # 既存回答を再生成履歴へ包んだだけのoriginal attemptは新規callではない。
+            # branch先の未包装turnと同じidentityへ揃えてtoken集計を重複させない。
+            if isinstance(request_id, str) and request_id:
+                return ("turn", request_id, target, provider)
+            return None
+        attempt_id = attempt.get("attempt_id")
+        if isinstance(attempt_id, str) and attempt_id:
+            return (
+                "attempt",
+                request_id if isinstance(request_id, str) else "",
+                attempt_id,
+                target,
+                provider,
+            )
+        fingerprint = attempt.get("request_fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            return (
+                "attempt_fingerprint",
+                request_id if isinstance(request_id, str) else "",
+                fingerprint,
+                target,
+                provider,
+            )
+        created_at = attempt.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            request_id = turn.get("request_id")
+            if isinstance(request_id, str) and request_id:
+                return ("attempt_time", request_id, created_at, target, provider)
+        return None
+    request_id = turn.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        return ("turn", request_id, target, provider)
+    return None
 
 
 def _add_entry(

@@ -341,11 +341,16 @@ class _LiveStatus extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final failed = error.isNotEmpty;
+    final completed = phase == '完了が先に確定しました';
+    final stopped = phase == 'ローカル停止処理が完了しました' || phase == 'すでに停止しています';
+    final terminalFailure = phase == '停止前に処理失敗が確定しました';
+    final failed = error.isNotEmpty || terminalFailure;
+    final settled = completed || stopped || terminalFailure;
+    final message = error.isNotEmpty ? error : phase;
     final colors = theme.colorScheme;
     return Semantics(
       liveRegion: true,
-      label: failed ? error : phase,
+      label: message,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
@@ -356,6 +361,8 @@ class _LiveStatus extends StatelessWidget {
           children: [
             if (failed)
               Icon(Icons.error_outline, color: colors.onErrorContainer)
+            else if (settled)
+              Icon(completed ? Icons.check_circle_outline : Icons.stop_circle)
             else
               const SizedBox.square(
                 dimension: 18,
@@ -364,7 +371,7 @@ class _LiveStatus extends StatelessWidget {
             const SizedBox(width: 10),
             Expanded(
               child: SelectableText(
-                failed ? error : phase,
+                message,
                 style: theme.textTheme.bodyMedium?.copyWith(
                   color: failed ? colors.onErrorContainer : null,
                 ),

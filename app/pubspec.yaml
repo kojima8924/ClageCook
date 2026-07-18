@@ -1,5 +1,5 @@
 name: clage_cook
-description: "BYOK multi-model AI conference client for Clage Cook OSS."
+description: "BYOK multi-model AI conference client for Clage Cook."
 publish_to: "none"
 version: 0.2.0+2
 

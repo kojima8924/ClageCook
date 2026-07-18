@@ -287,6 +287,116 @@ async def test_provider_error_audit_is_saved_without_raw_exception(monkeypatch):
     assert "raw-secret-exception" not in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_execution_model_snapshot_overrides_later_runtime_configuration(
+    monkeypatch,
+):
+    calls = []
+    selected_synthesizers = []
+    monkeypatch.setattr(
+        config,
+        "get_provider",
+        lambda name, _tier: FakeProvider(name, calls),
+    )
+
+    def get_synthesizer(_tier, *, provider_name=None):
+        selected_synthesizers.append(provider_name)
+        return FakeProvider(provider_name or "runtime-synth", calls)
+
+    monkeypatch.setattr(config, "get_synthesizer", get_synthesizer)
+
+    with orchestrator.freeze_execution_models(
+        {"chatgpt": "planned-worker-model"},
+        "planned-synth-model",
+        "claude",
+    ):
+        answer = await orchestrator._run_provider(
+            "chatgpt",
+            "question",
+            system="system",
+            tier="balanced",
+            round_number=1,
+        )
+        synthesis = await orchestrator._run_synthesis(
+            "question",
+            {"chatgpt": answer},
+            "balanced",
+        )
+
+    assert answer["model"] == "planned-worker-model"
+    assert synthesis["model"] == "planned-synth-model"
+    assert selected_synthesizers == ["claude"]
+
+
+@pytest.mark.asyncio
+async def test_frozen_synthesizer_provider_is_preserved_on_failure(monkeypatch):
+    calls = []
+
+    def get_synthesizer(_tier, *, provider_name=None):
+        return FakeProvider(provider_name or "runtime-synth", calls, fail=True)
+
+    monkeypatch.setattr(config, "get_synthesizer", get_synthesizer)
+    monkeypatch.setattr(config, "synthesizer_name", lambda: "grok")
+
+    with orchestrator.freeze_execution_models({}, "planned-model", "claude"):
+        result = await orchestrator._run_synthesis(
+            "question",
+            {"chatgpt": {"ok": True, "text": "answer"}},
+            "balanced",
+        )
+
+    assert result["ok"] is False
+    assert result["source"] == "claude"
+
+
+@pytest.mark.asyncio
+async def test_run_meta_and_all_failed_synthesis_use_frozen_plan(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        config,
+        "get_provider",
+        lambda name, _tier: FakeProvider(name, calls, fail=True),
+    )
+
+    def forbidden_runtime_read():
+        raise AssertionError("frozen run must not reread runtime metadata")
+
+    monkeypatch.setattr(config, "synthesizer_name", forbidden_runtime_read)
+    monkeypatch.setattr(config, "statuses", forbidden_runtime_read)
+    events = []
+
+    async def emit(event, data):
+        events.append((event, data))
+
+    with orchestrator.freeze_execution_models(
+        {
+            "claude": "planned-claude-model",
+            "chatgpt": "planned-chatgpt-model",
+        },
+        "planned-synth-model",
+        "claude",
+    ):
+        turn = await orchestrator.run_turn(
+            conversation(),
+            "question",
+            orchestrator.TurnOptions(providers=("claude", "chatgpt")),
+            "frozen-meta-request",
+            emit,
+        )
+
+    meta = events[0][1]
+    assert meta["synthesizer"] == "claude"
+    assert {
+        item["name"]: item["models"]["balanced"]
+        for item in meta["provider_status"]
+    } == {
+        "claude": "planned-claude-model",
+        "chatgpt": "planned-chatgpt-model",
+    }
+    assert turn["synthesis"]["ok"] is False
+    assert turn["synthesis"]["source"] == "claude"
+
+
 def test_billing_or_credit_error_uses_fixed_public_message():
     raw_vendor_message = "vendor credit detail with raw-secret"
     error = ProviderError(
@@ -312,6 +422,31 @@ def test_billing_or_credit_error_uses_fixed_public_message():
     assert result["error"] == (
         "プロバイダの請求設定またはクレジット残高を確認してください"
     )
+    assert raw_vendor_message not in result["error"]
+
+
+def test_model_refusal_uses_allowlisted_public_message():
+    raw_vendor_message = "unstable refusal detail with raw-secret"
+    error = ProviderError(
+        raw_vendor_message,
+        error_code="model_refusal",
+        request_audit={
+            "http_attempts": 1,
+            "retry_count": 0,
+            "outcome": "response_received",
+            "final_http_status": 200,
+            "usage_may_be_incomplete": True,
+        },
+    )
+
+    result = orchestrator._failure_result(
+        error,
+        source="claude",
+        round_number=1,
+    )
+
+    assert result["error_code"] == "model_refusal"
+    assert result["error"] == "モデルのポリシー判定により回答が拒否されました"
     assert raw_vendor_message not in result["error"]
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import threading
 import time
 from copy import deepcopy
@@ -50,7 +51,7 @@ async def snapshot(
 ) -> dict[str, Any]:
     """設定済みの管理APIだけを並列取得する。未設定時は外部通信しない。"""
     current = _utc_datetime(now)
-    fingerprint = _configuration_fingerprint()
+    fingerprint = _configuration_fingerprint(current)
     use_cache = client is None and not force
     if use_cache:
         with _cache_guard:
@@ -67,28 +68,28 @@ async def snapshot(
         result = _disabled_snapshot(current)
         return _remember(result, fingerprint) if use_cache else result
 
-    start = current - timedelta(days=config.ADMIN_TELEMETRY_LOOKBACK_DAYS)
+    start, end = _calendar_window(current)
     own_client = client is None
     http = client or httpx.AsyncClient(
         timeout=httpx.Timeout(config.ADMIN_TELEMETRY_TIMEOUT_SEC),
         follow_redirects=False,
-        headers={"User-Agent": "ClageCookOSS/0.2 admin-telemetry"},
+        headers={"User-Agent": "ClageCook/0.2 admin-telemetry"},
     )
     try:
         claude_task = _configured_task(
             "claude",
             config.ANTHROPIC_ADMIN_KEY,
-            _anthropic_snapshot(http, start, current),
+            _anthropic_snapshot(http, start, end),
         )
         openai_task = _configured_task(
             "chatgpt",
             config.OPENAI_ADMIN_KEY,
-            _openai_snapshot(http, start, current),
+            _openai_snapshot(http, start, end),
         )
         grok_task = _configured_task(
             "grok",
             config.XAI_MANAGEMENT_KEY,
-            _xai_snapshot(http, start, current),
+            _xai_snapshot(http, start, end),
         )
         claude, chatgpt, grok = await asyncio.gather(
             claude_task, openai_task, grok_task
@@ -103,8 +104,9 @@ async def snapshot(
         "generated_at": utc_now(),
         "window": {
             "starting_at": _iso(start),
-            "ending_at": _iso(current),
+            "ending_at": _iso(end),
             "lookback_days": config.ADMIN_TELEMETRY_LOOKBACK_DAYS,
+            "utc_offset": config.BUDGET_UTC_OFFSET,
         },
         "cache": {"hit": False, "ttl_seconds": config.ADMIN_TELEMETRY_CACHE_SEC},
         "providers": [
@@ -116,6 +118,11 @@ async def snapshot(
         "limitations": [
             "管理telemetryは明示有効化され、別管理資格情報があるProviderだけ取得します。",
             "Provider側の反映遅延、権限、plan、pagination上限により値が部分的な場合があります。",
+            (
+                "ClaudeのUsage/CostはProvider契約上UTC日次bucketです。"
+                "開始境界は予算窓を包含するUTC日へ広げ、終了境界は現在時刻を超えません。"
+                "完全なbucketの最終境界はProvider別window.complete_throughに示します。"
+            ),
             "取得処理は読み取り専用で、top-up・支払方法・spend limitを変更しません。",
             "Gemini Developer APIのcredit残高と集計usageはAI Studioで確認してください。",
         ],
@@ -144,15 +151,21 @@ async def _anthropic_snapshot(
     start: datetime,
     end: datetime,
 ) -> dict[str, Any]:
+    query_start, query_end, complete_through = _anthropic_utc_day_window(start, end)
     headers = {
         "x-api-key": config.ANTHROPIC_ADMIN_KEY,
         "anthropic-version": "2023-06-01",
     }
+    query_days = max(
+        1,
+        (complete_through - query_start).days
+        + int(query_end > complete_through),
+    )
     params = {
-        "starting_at": _iso(start),
-        "ending_at": _iso(end),
+        "starting_at": _iso(query_start),
+        "ending_at": _iso(query_end),
         "bucket_width": "1d",
-        "limit": min(config.ADMIN_TELEMETRY_LOOKBACK_DAYS + 1, 31),
+        "limit": min(query_days, 31),
     }
     usage_task = _capture(
         _paged_get(
@@ -168,9 +181,10 @@ async def _anthropic_snapshot(
             f"{_ANTHROPIC_BASE}/organizations/cost_report",
             headers=headers,
             params={
-                "starting_at": _iso(start),
-                "ending_at": _iso(end),
-                "limit": min(config.ADMIN_TELEMETRY_LOOKBACK_DAYS + 1, 31),
+                "starting_at": _iso(query_start),
+                "ending_at": _iso(query_end),
+                "bucket_width": "1d",
+                "limit": min(query_days, 31),
             },
         )
     )
@@ -182,7 +196,23 @@ async def _anthropic_snapshot(
         configured=True,
         status=_combined_status(usage, cost),
     )
-    result.update({"source": "organization_admin_api", "usage": usage, "cost": cost})
+    result.update(
+        {
+            "source": "organization_admin_api",
+            "window": _provider_window(
+                query_start,
+                query_end,
+                requested_start=start,
+                requested_end=end,
+                alignment="provider_utc_day_buckets",
+                bucket_width="1d",
+                exact_budget_window=False,
+                complete_through=complete_through,
+            ),
+            "usage": usage,
+            "cost": cost,
+        }
+    )
     return result
 
 
@@ -222,7 +252,22 @@ async def _openai_snapshot(
         configured=True,
         status=_combined_status(usage, cost),
     )
-    result.update({"source": "organization_admin_api", "usage": usage, "cost": cost})
+    result.update(
+        {
+            "source": "organization_admin_api",
+            "window": _provider_window(
+                start,
+                end,
+                requested_start=start,
+                requested_end=end,
+                alignment="requested_budget_window",
+                bucket_width="1d",
+                exact_budget_window=True,
+            ),
+            "usage": usage,
+            "cost": cost,
+        }
+    )
     return result
 
 
@@ -322,6 +367,15 @@ async def _xai_snapshot(
     result.update(
         {
             "source": "team_management_api",
+            "window": _provider_window(
+                start,
+                end,
+                requested_start=start,
+                requested_end=end,
+                alignment="requested_budget_window",
+                bucket_width="1d",
+                exact_budget_window=True,
+            ),
             "team_lookup": team_lookup,
             "usage": usage,
             "credit_balance": balance,
@@ -604,7 +658,10 @@ def _disabled_snapshot(now: datetime) -> dict[str, Any]:
         "schema_version": 1,
         "enabled": False,
         "generated_at": _iso(now),
-        "window": {"lookback_days": config.ADMIN_TELEMETRY_LOOKBACK_DAYS},
+        "window": {
+            "lookback_days": config.ADMIN_TELEMETRY_LOOKBACK_DAYS,
+            "utc_offset": config.BUDGET_UTC_OFFSET,
+        },
         "cache": {"hit": False, "ttl_seconds": config.ADMIN_TELEMETRY_CACHE_SEC},
         "providers": providers,
         "limitations": [
@@ -638,7 +695,9 @@ def _error_code(exc: Exception) -> str:
     return "unexpected_error"
 
 
-def _configuration_fingerprint() -> tuple[Any, ...]:
+def _configuration_fingerprint(now: datetime | None = None) -> tuple[Any, ...]:
+    current = _utc_datetime(now)
+    budget_window_start, _ = _calendar_window(current)
     return (
         config.ADMIN_TELEMETRY_ENABLED,
         _secret_fingerprint(config.ANTHROPIC_ADMIN_KEY),
@@ -647,6 +706,8 @@ def _configuration_fingerprint() -> tuple[Any, ...]:
         config.XAI_TEAM_ID,
         config.ADMIN_TELEMETRY_LOOKBACK_DAYS,
         config.ADMIN_TELEMETRY_CACHE_SEC,
+        config.BUDGET_UTC_OFFSET,
+        _iso(budget_window_start),
     )
 
 
@@ -671,6 +732,80 @@ def _utc_datetime(value: datetime | None) -> datetime:
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     return current.astimezone(timezone.utc)
+
+
+def _calendar_window(current: datetime) -> tuple[datetime, datetime]:
+    """予算日と同じ固定offsetで、今日を含むcalendar-day窓を作る。"""
+    budget_timezone = _budget_timezone()
+    local = current.astimezone(budget_timezone)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local -= timedelta(days=max(0, config.ADMIN_TELEMETRY_LOOKBACK_DAYS - 1))
+    return start_local.astimezone(timezone.utc), current.astimezone(timezone.utc)
+
+
+def _anthropic_utc_day_window(
+    requested_start: datetime,
+    requested_end: datetime,
+) -> tuple[datetime, datetime, datetime]:
+    """Anthropicの1d bucket契約へ合わせ、開始だけをUTC日境界へ広げる。
+
+    Usageの日次bucketはUTC日境界へsnapされ、Costは日次のみである。任意offsetの
+    予算日と一致するように見せず、問い合わせ終了は現在時刻のまま未来へ広げない。
+    併せて、完全に閉じた最後のUTC bucket境界を返す。
+    """
+    start = requested_start.astimezone(timezone.utc).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    end = requested_end.astimezone(timezone.utc)
+    complete_through = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    if end <= start:
+        start = complete_through - timedelta(days=1)
+    return start, end, complete_through
+
+
+def _provider_window(
+    start: datetime,
+    end: datetime,
+    *,
+    requested_start: datetime,
+    requested_end: datetime,
+    alignment: str,
+    bucket_width: str,
+    exact_budget_window: bool,
+    complete_through: datetime | None = None,
+) -> dict[str, Any]:
+    result = {
+        "starting_at": _iso(start),
+        "ending_at": _iso(end),
+        "requested_starting_at": _iso(requested_start),
+        "requested_ending_at": _iso(requested_end),
+        "query_utc_offset": "+00:00",
+        "budget_utc_offset": config.BUDGET_UTC_OFFSET,
+        "alignment": alignment,
+        "bucket_width": bucket_width,
+        "exact_budget_window": exact_budget_window,
+    }
+    if complete_through is not None:
+        result["complete_through"] = _iso(complete_through)
+    return result
+
+
+def _budget_timezone() -> timezone:
+    raw = config.BUDGET_UTC_OFFSET
+    matched = re.fullmatch(r"([+-])(\d{2}):(\d{2})", raw)
+    if not matched:
+        raise ValueError("invalid_budget_utc_offset")
+    hours = int(matched.group(2))
+    minutes = int(matched.group(3))
+    if hours > 14 or minutes > 59 or (hours == 14 and minutes != 0):
+        raise ValueError("invalid_budget_utc_offset")
+    total = hours * 60 + minutes
+    if matched.group(1) == "-":
+        total = -total
+    return timezone(timedelta(minutes=total))
 
 
 def _iso(value: datetime) -> str:

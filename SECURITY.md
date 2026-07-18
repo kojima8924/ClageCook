@@ -1,6 +1,6 @@
 # セキュリティポリシー
 
-Clage Cook OSSは、利用者自身が管理するbackendをlocalhost、自宅LAN、またはTailscale経由で使う
+Clage Cookは、利用者自身が管理するbackendをlocalhost、自宅LAN、またはTailscale経由で使う
 ことを前提としています。インターネットへ直接公開する用途や、相互に信頼しない複数tenantでの
 共有運用は想定していません。
 
@@ -32,11 +32,34 @@ retryの安全側envelopeを返します。price table未設定時は金額を�
 場合だけ、Decimal計算した安全側の最大金額と会議・日次budgetを適用します。生成requestは応答を失った場合に
 同じ処理が課金され得るため、`HTTP_RETRIES=0` が既定です。
 retryを増やす場合は、失敗した試行も課金され得る前提でrun limitと契約を確認してください。
+各社のWeb検索toolはmodel tokenと別課金になる場合があり、現行price tableはtool単価・検索回数を
+安全側に算出できません。budget有効時のlive Web検索はunknown costとし、既定の
+`CLAGE_BUDGET_UNKNOWN_POLICY=block` で停止します。`allow` でも価格判明済みのtoken小計は会議・日次上限で
+検査・予約しますが、不明なtool料金はlocal上限の外側です。この残余riskを理解した場合だけ使ってください。
 
 budgetのcheckと予約は単一backend process内のlock下で行い、ledgerをatomic保存しますが、Provider請求と同じ
 transactionではありません。外部送信後にusageが確定しないrunは0円へ解放せず照合待ちとして拘束します。
 再起動時の未settle予約も照合待ちへ昇格し、設定件数へ達したbacklogは新しい課金runをfail-closedで止めます。
+照合待ち・確定済みの同一request IDを、保存済み結果のreplayなしに外部へ再dispatchしません。
+usageを価格換算できたrunは実測額をsettled ledgerへ保存し、conversationを削除しても当日のcommitから
+除外しません。応答modelを価格換算できない場合は予約上限を保持します。手動reconciliationは照合待ち件数を
+解消しますが、既知実測額、または予約上限を `settled_after_manual_reconciliation` としてcommitへ残します。
+active予約はgross額を監査表示へ残しつつ、同じrequest IDで観測済みの実績との差額だけを
+`active_reservation_top_up` としてcommitへ足します。actual実績とgross予約を同時に全額加算しません。
+branch片側の再生成で既存結果をoriginal attemptへ包んでも、元turnと同じidentityへ正規化し、費用とlocal tokenを
+新しい外部callとして二重計上しません。実際に追加送信した非original attemptだけを独立して数えます。
+送信直前に実行snapshotと予算日を再検証し、参加Provider/modelと統合Provider/modelの両方を固定して、
+予約と実行先の分離を防ぎます。
+runtime設定はplan内で1回だけsnapshotし、SSE metaと失敗結果のsourceもそのProvider/modelへ固定します。
+price tableがカテゴリ単位で不完全でも、判明済みrateの小計は予算拘束し、未知部分だけをunknownとして扱います。
 これはProvider側spend cap、複数hostの分散lock、exactly-once課金、最終請求額を保証する機能ではありません。
+実測費用のcache tokenはProvider別に正規化します。Anthropicの `input_tokens` はcache read/writeと独立した
+uncached区分として使い、他Providerでは正規化済みinput totalからcached inputを差し引きますが、いずれも
+利用者が設定したprice tableによるlocal推定であり請求書ではありません。
+reasoning課金もresponse shapeに依存します。Gemini Interactionsの `total_thought_tokens` はoutput外数、
+OpenAI/xAI Responsesのreasoningはoutput内数として扱います。旧xAI Chat互換shapeのdurable Grok usageだけは
+completion外数を保持するため `total_tokens - input_tokens` をfallbackにします。これも請求仕様の将来変更を
+自動検出するものではありません。
 
 ## API keyと認証情報
 
@@ -52,6 +75,9 @@ transactionではありません。外部送信後にusageが確定しないrun�
   途中失敗や別originとの組合せではfail-closedにtokenを空にします。実行中は接続先を変更できません。
   URLのpathはreverse proxy用に許可しますが、userinfo、query、fragmentは秘密の平文保存やAPI path破損を
   避けるため、画面と保存層の両方で拒否します。認証必須serverでは空tokenを保存できません。
+- Web版の `flutter_secure_storage` はbrowser側storageとWebCryptoに依存します。XSS、悪性拡張機能、
+  共有browser profileや共有端末からBearer tokenを完全に保護できるsecret managerではありません。
+  設定画面の常時警告を確認し、共有端末ではtokenを保存しないでください。
 - `backend/.env` をcommitしないでください。log、screen share、test fixture、bug reportにもreal keyや
   完全なBearer tokenを含めないでください。
 - keyまたはtokenが漏えいした可能性がある場合は、該当service側で直ちに無効化・再発行してください。
@@ -63,7 +89,8 @@ transactionではありません。外部送信後にusageが確定しないrun�
 `CLAGE_ADMIN_TELEMETRY_ENABLED=false` が既定で、この状態では管理APIへ外部通信しません。有効時も
 organization usage/cost、xAI balance/invoice preview/spending limitの読み取りだけを実装し、top-up、支払方法、
 spend limit変更を呼びません。結果は短期cacheされ、API error本文、team ID、key ID、個別workspace情報は
-公開せず集計値と固定error分類だけを返します。Geminiの残高は通常API keyから推測しません。
+公開せず集計値と固定error分類だけを返します。Provider実効期間とlocal予算期間も分離し、
+不完全なUTC bucketを完全な当日値として表示しません。Geminiの残高は通常API keyから推測しません。
 
 ## ローカルpolicy scan
 
@@ -98,10 +125,27 @@ scannerは公開された正規表現による決定論的heuristicです。次�
 maskされなかった個人情報、sanitized SSE event journalが含まれる可能性があります。保存先をshare folder、
 cloud同期の公開directory、公開repositoryに置かず、backupにも同等のaccess controlを適用してください。
 
-runは外部呼出前にpending claimを保存し、生成eventごとにjournalを更新します。これにより再起動後の
-二重実行を避けます。server起動時に前process由来の `status=running` は `interrupted` へ確定し、
+runは外部呼出前にpending claimを保存し、answer/synthesisを中間checkpointとして更新し、
+終端時にその時点までの非終端生成eventをjournalへ確定します。`error` / `done` はjournalへ重複保存せず、
+再生時にdurableなturn終端状態から再構成します。各小eventで会話全体をfsyncしないため、最後checkpoint後から
+process強制終了までの非checkpoint eventは失われ得ます。ただし外部呼出前claimにより二重実行は避けます。
+server起動時に前process由来の `status=running` は `interrupted` へ確定し、
 外部APIを自動再実行しませんが、disk暗号化やbackup暗号化は提供しません。OS account、full-disk encryption、
 backup policyは利用者が管理してください。不要なconversationはappまたはAPIで削除してください。
+保存済みturnまたはin-memory runへの同一fingerprint replay/joinは新規planより先に解決します。現在の予算や
+確認flagを迂回して新しい外部送信を行うものではなく、保存済みeventを返すだけです。添付の並び順はpromptを
+変えるためfingerprintに含め、順序違いを同じrequest IDとして再利用しません。
+完了した再生成はdurable attemptを正としてregistryから直ちに除去し、conversation全体を含む一時resultを
+既定1時間のrun retentionへ残しません。後続の同一IDは保存attemptから再生します。認証とfingerprint照合は維持し、
+保存済みterminal replayだけをrate limiterとactive conversation claimより先に返すため、無関係な429/409を避けても
+新しい外部送信や課金は行いません。
+
+添付PDFは10秒上限の隔離Python processで先頭page/文字数だけを抽出します。これは
+pypdfのparser失敗やCPU占有を主processと分離するための境界で、悪意あるPDFの安全性や完全な
+sandboxを保証しません。同時subprocessは2本まで、成功結果はSHA-256と抽出上限をkeyにした
+process内5分/64件TTL/LRU cacheで再利用します。期限切れの抽出cacheは次のcache access時に除去され、
+再起動時にはcache全体が消えます。これとは別に、元添付の保存TTLはserver起動時または添付access時に
+purgeします。元PDF byteは利用者が取得するdownload/ZIPではscrubされません。
 
 同じ `CLAGE_DATA_DIR` を複数processまたは複数hostで共有してはいけません。serverは起動時に
 `.server.lock` を排他的に取得し、同じdata dirを使う2つ目のprocessを拒否します。Uvicornは必ず
@@ -113,10 +157,15 @@ access logへ載せないためです。search本文や結果も機密データ�
 
 ## 停止と課金の限界
 
-cancel endpointはClage Cook内のlocal taskへcancelを要求し、取得済みanswerとusageを不完全なturnとして
-保存します。すでに送信したHTTP requestが外部Providerで停止したこと、responseが生成されなかったこと、
-quota・課金が止まったことは保証しません。UIやAPI clientはcancel成功を外部課金停止として扱わないで
-ください。cancelled/failed turnのusageは `usage_may_be_incomplete=true` です。
+cancel endpointはchatと再生成で共通のClage Cook local taskへcancelを要求します。Provider結果が未確定なら、
+取得済みanswerとusageを不完全なcancelled turn/attemptとして保存します。Provider結果後に終端保存、budget
+settle、結果公開へ入った場合はその処理をcancelから保護し、先に確定したcompleted/failedをcancelledへ
+変更しません。再生成Provider failure後のcleanup中にcancelされても、failed outcome、台帳settle、
+`cancelled=false` のinterrupted attemptを保存します。cancel APIの `terminal_outcome` は判明済みの
+completed/failed/cancelledを区別し、未確定ならnullになり得ます。
+すでに送信したHTTP requestが外部Providerで停止したこと、responseが生成されなかったこと、quota・課金が
+止まったことは保証しません。UIやAPI clientはcancel要求の受理を外部課金停止として扱わないでください。
+cancelled/failed turnのusageは `usage_may_be_incomplete=true` です。
 timeout、network error、retry後の成功も、外部Provider側で処理済みか確認できない場合があります。
 各answer/synthesisの `request_audit` は試行数と固定分類だけを残し、課金額やusage完全性を保証しません。
 

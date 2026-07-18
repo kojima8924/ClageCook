@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 from datetime import datetime, timezone
 
 import httpx
@@ -17,6 +18,7 @@ def _configure(monkeypatch, *, enabled=True):
     monkeypatch.setattr(config, "OPENAI_ADMIN_KEY", "openai-admin-secret")
     monkeypatch.setattr(config, "XAI_MANAGEMENT_KEY", "xai-management-secret")
     monkeypatch.setattr(config, "XAI_TEAM_ID", "")
+    monkeypatch.setattr(config, "BUDGET_UTC_OFFSET", "+09:00")
     admin_telemetry.reset_cache()
 
 
@@ -51,6 +53,10 @@ async def test_admin_telemetry_normalizes_three_provider_management_apis(monkeyp
         path = request.url.path
         if path == "/v1/organizations/usage_report/messages":
             assert request.headers["x-api-key"] == "anthropic-admin-secret"
+            assert request.url.params["starting_at"] == "2026-07-11T00:00:00Z"
+            assert request.url.params["ending_at"] == "2026-07-18T12:00:00Z"
+            assert request.url.params["bucket_width"] == "1d"
+            assert request.url.params["limit"] == "8"
             return httpx.Response(
                 200,
                 json={
@@ -74,6 +80,10 @@ async def test_admin_telemetry_normalizes_three_provider_management_apis(monkeyp
                 },
             )
         if path == "/v1/organizations/cost_report":
+            assert request.url.params["starting_at"] == "2026-07-11T00:00:00Z"
+            assert request.url.params["ending_at"] == "2026-07-18T12:00:00Z"
+            assert request.url.params["bucket_width"] == "1d"
+            assert request.url.params["limit"] == "8"
             return httpx.Response(
                 200,
                 json={
@@ -83,6 +93,9 @@ async def test_admin_telemetry_normalizes_three_provider_management_apis(monkeyp
             )
         if path == "/v1/organization/usage/completions":
             assert request.headers["authorization"] == "Bearer openai-admin-secret"
+            assert int(request.url.params["start_time"]) == int(
+                datetime(2026, 7, 11, 15, tzinfo=timezone.utc).timestamp()
+            )
             return httpx.Response(
                 200,
                 json={
@@ -123,6 +136,10 @@ async def test_admin_telemetry_normalizes_three_provider_management_apis(monkeyp
             )
         if path.endswith("/usage"):
             assert request.method == "POST"
+            body = json.loads(request.content)
+            time_range = body["analyticsRequest"]["timeRange"]
+            assert time_range["startTime"] == "2026-07-11 15:00:00"
+            assert time_range["endTime"] == "2026-07-18 12:00:00"
             return httpx.Response(
                 200,
                 json={
@@ -165,16 +182,56 @@ async def test_admin_telemetry_normalizes_three_provider_management_apis(monkeyp
     assert providers["claude"]["status"] == "ok"
     assert providers["claude"]["usage"]["usage"]["input_tokens"] == 135
     assert providers["claude"]["cost"]["amount_usd"] == "1.2345"
+    assert providers["claude"]["window"] == {
+        "starting_at": "2026-07-11T00:00:00Z",
+        "ending_at": "2026-07-18T12:00:00Z",
+        "requested_starting_at": "2026-07-11T15:00:00Z",
+        "requested_ending_at": "2026-07-18T12:00:00Z",
+        "query_utc_offset": "+00:00",
+        "budget_utc_offset": "+09:00",
+        "alignment": "provider_utc_day_buckets",
+        "bucket_width": "1d",
+        "exact_budget_window": False,
+        "complete_through": "2026-07-18T00:00:00Z",
+    }
     assert providers["chatgpt"]["usage"]["usage"]["requests"] == 3
     assert providers["chatgpt"]["cost"]["amount_usd"] == "2.75"
+    assert providers["chatgpt"]["window"]["exact_budget_window"] is True
+    assert providers["chatgpt"]["window"]["alignment"] == (
+        "requested_budget_window"
+    )
     assert providers["gemini"]["status"] == "unsupported"
     assert providers["grok"]["usage"]["amount_usd"] == "1"
+    assert providers["grok"]["window"]["exact_budget_window"] is True
     assert providers["grok"]["credit_balance"]["provider_reported_usd"] == "-10"
     assert providers["grok"]["spending_limits"]["effective_soft_usd"] == "200"
+    assert result["window"] == {
+        "starting_at": "2026-07-11T15:00:00Z",
+        "ending_at": "2026-07-18T12:00:00Z",
+        "lookback_days": 7,
+        "utc_offset": "+09:00",
+    }
+    assert any("complete_through" in item for item in result["limitations"])
     assert ("GET", "/v1/billing/teams/team-from-validation/prepaid/balance") in seen
     assert "anthropic-admin-secret" not in str(result)
     assert "openai-admin-secret" not in str(result)
     assert "xai-management-secret" not in str(result)
+
+
+def test_anthropic_daily_window_never_moves_end_into_future():
+    requested_start = datetime(2026, 7, 11, 15, tzinfo=timezone.utc)
+    requested_end = datetime(2026, 7, 18, 12, 34, tzinfo=timezone.utc)
+
+    query_start, query_end, complete_through = (
+        admin_telemetry._anthropic_utc_day_window(
+            requested_start,
+            requested_end,
+        )
+    )
+
+    assert query_start == datetime(2026, 7, 11, tzinfo=timezone.utc)
+    assert query_end == requested_end
+    assert complete_through == datetime(2026, 7, 18, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -217,3 +274,43 @@ def test_admin_cache_fingerprint_changes_when_a_key_rotates(monkeypatch):
     second = admin_telemetry._configuration_fingerprint()
     assert first != second
     assert "different-openai-admin-secret" not in repr(second)
+
+
+def test_admin_cache_fingerprint_changes_with_budget_day_offset(monkeypatch):
+    _configure(monkeypatch)
+    first = admin_telemetry._configuration_fingerprint()
+    monkeypatch.setattr(config, "BUDGET_UTC_OFFSET", "+00:00")
+    second = admin_telemetry._configuration_fingerprint()
+
+    assert first != second
+
+
+def test_admin_cache_fingerprint_changes_at_budget_midnight(monkeypatch):
+    _configure(monkeypatch)
+    before = admin_telemetry._configuration_fingerprint(
+        datetime(2026, 7, 18, 14, 59, tzinfo=timezone.utc)
+    )
+    after = admin_telemetry._configuration_fingerprint(
+        datetime(2026, 7, 18, 15, 1, tzinfo=timezone.utc)
+    )
+
+    assert before != after
+
+
+@pytest.mark.asyncio
+async def test_admin_cache_does_not_cross_budget_midnight(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(config, "ANTHROPIC_ADMIN_KEY", "")
+    monkeypatch.setattr(config, "OPENAI_ADMIN_KEY", "")
+    monkeypatch.setattr(config, "XAI_MANAGEMENT_KEY", "")
+
+    before = await admin_telemetry.snapshot(
+        now=datetime(2026, 7, 18, 14, 59, tzinfo=timezone.utc)
+    )
+    after = await admin_telemetry.snapshot(
+        now=datetime(2026, 7, 18, 15, 1, tzinfo=timezone.utc)
+    )
+
+    assert before["window"]["starting_at"] == "2026-07-11T15:00:00Z"
+    assert after["window"]["starting_at"] == "2026-07-12T15:00:00Z"
+    assert after["cache"]["hit"] is False

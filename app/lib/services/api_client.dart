@@ -30,20 +30,33 @@ class ChatStream {
     required this.conversationId,
     required this.requestId,
     required this.events,
+    required this.idleTimeout,
   });
 
   final String conversationId;
   final String requestId;
   final Stream<SseEvent> events;
+  final Duration idleTimeout;
 }
 
 class ApiClient {
-  ApiClient(ConnectionSettings settings, {http.Client? client})
-    : _settings = settings,
-      _client = client ?? http.Client();
+  ApiClient(
+    ConnectionSettings settings, {
+    http.Client? client,
+    this.sseIdleTimeout = const Duration(seconds: 90),
+    this.errorBodyTimeout = const Duration(seconds: 10),
+    this.errorBodyMaxBytes = 64 * 1024,
+  }) : assert(sseIdleTimeout > Duration.zero),
+       assert(errorBodyTimeout > Duration.zero),
+       assert(errorBodyMaxBytes > 0),
+       _settings = settings,
+       _client = client ?? http.Client();
 
   final ConnectionSettings _settings;
   final http.Client _client;
+  final Duration sseIdleTimeout;
+  final Duration errorBodyTimeout;
+  final int errorBodyMaxBytes;
 
   String get baseUrl {
     var value = _settings.baseUrl.trim();
@@ -353,9 +366,28 @@ class ApiClient {
         .send(request)
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      final body = await response.stream.bytesToString();
+      final errorBody = await _readBoundedErrorBody(response.stream);
+      var message = _errorMessage(errorBody.body, response.statusCode);
+      if (errorBody.timedOut) {
+        message = '$message（エラー応答本文の読込がタイムアウトしました）';
+      }
+      if (errorBody.truncated) {
+        message = '$message（エラー応答本文は$errorBodyMaxBytes bytesで打ち切りました）';
+      }
+      if (errorBody.readError != null) {
+        message = '$message（エラー応答本文を最後まで読み込めませんでした）';
+      }
+      throw ApiException(message, statusCode: response.statusCode);
+    }
+    final contentType = response.headers['content-type'];
+    if (!_isEventStreamContentType(contentType)) {
+      final subscription = response.stream.listen(null);
+      await subscription.cancel();
+      final received = contentType == null || contentType.trim().isEmpty
+          ? '未指定'
+          : _truncateRunes(contentType.trim(), 120);
       throw ApiException(
-        _errorMessage(body, response.statusCode),
+        'SSE応答のContent-Typeがtext/event-streamではありません: $received',
         statusCode: response.statusCode,
       );
     }
@@ -363,7 +395,75 @@ class ApiClient {
       conversationId:
           response.headers['x-conversation-id'] ?? conversationId ?? '',
       requestId: response.headers['x-request-id'] ?? resolvedRequestId,
-      events: SseDecoder.decode(response.stream),
+      events: SseDecoder.decode(response.stream, emitKeepAlive: true),
+      idleTimeout: sseIdleTimeout,
+    );
+  }
+
+  Future<_BoundedErrorBody> _readBoundedErrorBody(
+    Stream<List<int>> stream,
+  ) async {
+    final bytes = BytesBuilder(copy: false);
+    final completed = Completer<void>();
+    Object? readError;
+    var timedOut = false;
+    var truncated = false;
+
+    void complete() {
+      if (!completed.isCompleted) completed.complete();
+    }
+
+    final timer = Timer(errorBodyTimeout, () {
+      timedOut = true;
+      complete();
+    });
+    late final StreamSubscription<List<int>> subscription;
+    subscription = stream.listen(
+      (chunk) {
+        if (completed.isCompleted) return;
+        final remaining = errorBodyMaxBytes - bytes.length;
+        if (remaining <= 0) {
+          truncated = true;
+          complete();
+          return;
+        }
+        if (chunk.length >= remaining) {
+          bytes.add(
+            chunk.length == remaining ? chunk : chunk.sublist(0, remaining),
+          );
+          // Stop at the byte limit even when the current chunk happens to end
+          // exactly on it: waiting for another chunk would make the bound
+          // ineffective against a server that leaves the stream open.
+          truncated = true;
+          complete();
+          return;
+        }
+        bytes.add(chunk);
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        readError = error;
+        complete();
+      },
+      onDone: complete,
+      cancelOnError: false,
+    );
+
+    try {
+      await completed.future;
+    } finally {
+      timer.cancel();
+      try {
+        await subscription.cancel().timeout(errorBodyTimeout);
+      } catch (_) {
+        // Error reporting must not be held hostage by a broken body stream.
+      }
+    }
+
+    return _BoundedErrorBody(
+      body: utf8.decode(bytes.takeBytes(), allowMalformed: true),
+      timedOut: timedOut,
+      truncated: truncated,
+      readError: readError,
     );
   }
 
@@ -451,8 +551,14 @@ class ApiClient {
     final clean = body.replaceAll(RegExp(r'\s+'), ' ').trim();
     return clean.isEmpty
         ? 'HTTP $statusCode'
-        : 'HTTP $statusCode: ${clean.substring(0, min(clean.length, 300))}';
+        : 'HTTP $statusCode: ${_truncateRunes(clean, 300)}';
   }
+
+  static bool _isEventStreamContentType(String? value) =>
+      value?.split(';').first.trim().toLowerCase() == 'text/event-stream';
+
+  static String _truncateRunes(String value, int maxLength) =>
+      String.fromCharCodes(value.runes.take(maxLength));
 
   static String _newRequestId() {
     final random = Random.secure();
@@ -487,24 +593,47 @@ class ApiClient {
   void close() => _client.close();
 }
 
+class _BoundedErrorBody {
+  const _BoundedErrorBody({
+    required this.body,
+    required this.timedOut,
+    required this.truncated,
+    required this.readError,
+  });
+
+  final String body;
+  final bool timedOut;
+  final bool truncated;
+  final Object? readError;
+}
+
 class SseDecoder {
-  static Stream<SseEvent> decode(Stream<List<int>> input) async* {
+  static const keepAliveEvent = '_keepalive';
+
+  static Stream<SseEvent> decode(
+    Stream<List<int>> input, {
+    bool emitKeepAlive = false,
+  }) async* {
     var event = 'message';
-    var id = '';
+    var lastEventId = '';
     var dataLines = <String>[];
 
     await for (final line
         in input.transform(utf8.decoder).transform(const LineSplitter())) {
       if (line.isEmpty) {
         if (dataLines.isNotEmpty) {
-          yield _event(event, id, dataLines);
-          event = 'message';
-          id = '';
-          dataLines = <String>[];
+          yield _event(event, lastEventId, dataLines);
+        }
+        event = 'message';
+        dataLines = <String>[];
+        continue;
+      }
+      if (line.startsWith(':')) {
+        if (emitKeepAlive) {
+          yield const SseEvent(event: keepAliveEvent, data: {});
         }
         continue;
       }
-      if (line.startsWith(':')) continue;
       final separator = line.indexOf(':');
       final field = separator < 0 ? line : line.substring(0, separator);
       var value = separator < 0 ? '' : line.substring(separator + 1);
@@ -514,14 +643,17 @@ class SseDecoder {
           event = value;
           break;
         case 'id':
-          id = value;
+          // Per the SSE specification the last event ID persists across
+          // events, an empty id resets it, and values containing NUL are
+          // ignored.
+          if (!value.contains('\u0000')) lastEventId = value;
           break;
         case 'data':
           dataLines.add(value);
           break;
       }
     }
-    if (dataLines.isNotEmpty) yield _event(event, id, dataLines);
+    if (dataLines.isNotEmpty) yield _event(event, lastEventId, dataLines);
   }
 
   static SseEvent _event(String event, String id, List<String> lines) {
@@ -529,14 +661,18 @@ class SseDecoder {
     try {
       final decoded = jsonDecode(raw);
       return SseEvent(
-        event: event,
+        event: event.isEmpty ? 'message' : event,
         id: id,
         data: decoded is Map
             ? Map<String, dynamic>.from(decoded)
             : {'value': decoded},
       );
     } on FormatException {
-      return SseEvent(event: event, id: id, data: {'raw': raw});
+      return SseEvent(
+        event: event.isEmpty ? 'message' : event,
+        id: id,
+        data: {'raw': raw},
+      );
     }
   }
 }

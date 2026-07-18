@@ -33,3 +33,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.iml
+.codex-remote-attachments/

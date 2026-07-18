@@ -4,6 +4,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../controllers/conversation_selection_controller.dart';
+import '../controllers/live_run_controller.dart';
 import '../models.dart';
 import '../services/api_client.dart';
 import '../services/settings_store.dart';
@@ -20,9 +22,30 @@ const _providerLabels = {
 };
 
 typedef ApiClientFactory = ApiClient Function(ConnectionSettings settings);
+typedef AttachmentPicker = Future<FilePickerResult?> Function();
 
 ApiClient _defaultApiClientFactory(ConnectionSettings settings) =>
     ApiClient(settings);
+
+Future<FilePickerResult?> _defaultAttachmentPicker() =>
+    FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      withData: true,
+      type: FileType.custom,
+      allowedExtensions: const [
+        'txt',
+        'md',
+        'markdown',
+        'csv',
+        'json',
+        'pdf',
+        'png',
+        'jpg',
+        'jpeg',
+        'gif',
+        'webp',
+      ],
+    );
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
@@ -30,11 +53,13 @@ class HomeScreen extends StatefulWidget {
     required this.repository,
     this.autoload = true,
     this.clientFactory = _defaultApiClientFactory,
+    this.attachmentPicker = _defaultAttachmentPicker,
   });
 
   final SettingsRepository repository;
   final bool autoload;
   final ApiClientFactory clientFactory;
+  final AttachmentPicker attachmentPicker;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -52,34 +77,37 @@ class _HomeScreenState extends State<HomeScreen> {
   final _savedRunActionIds = <String>{};
   final _regenerationActionIds = <String>{};
   final _pendingAttachments = <AttachmentRecord>[];
+  final _selection = ConversationSelectionController();
+  final _run = LiveRunController();
 
   ApiClient? _client;
   ConnectionSettings? _connection;
   ServerSettings? _server;
   List<ConversationSummary> _summaries = const [];
   List<ConversationSummary>? _searchResults;
-  ConversationRecord? _conversation;
-  LiveTurn? _liveTurn;
-  String? _selectedId;
   String _tier = 'balanced';
   bool _debate = false;
   bool _synthesize = true;
   bool _blind = false;
   bool _webSearch = false;
   bool _loading = false;
-  bool _loadingConversation = false;
-  bool _sending = false;
   bool _uploadingAttachment = false;
-  bool _streamDisconnected = false;
   bool _searching = false;
-  String? _terminalReloadConversationId;
   String _error = '';
   String _searchError = '';
   int _bootstrapEpoch = 0;
-  int _conversationEpoch = 0;
   int _searchEpoch = 0;
   Timer? _scrollTimer;
   Timer? _searchTimer;
+
+  ConversationRecord? get _conversation => _selection.conversation;
+  LiveTurn? get _liveTurn => _run.turn;
+  String? get _selectedId => _selection.selectedId;
+  bool get _loadingConversation => _selection.loading;
+  bool get _sending => _run.sending;
+  bool get _streamDisconnected => _run.disconnected;
+  String? get _terminalReloadConversationId =>
+      _run.terminalReloadConversationId;
 
   @override
   void initState() {
@@ -91,7 +119,8 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _bootstrapEpoch++;
-    _conversationEpoch++;
+    _selection.invalidate();
+    unawaited(_run.dispose());
     _searchEpoch++;
     _client?.close();
     _scrollTimer?.cancel();
@@ -213,8 +242,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _connection = connection;
         _server = server;
         _summaries = summaries;
-        _selectedId = selectedId;
-        _conversation = selected;
+        _selection.restore(selectedId: selectedId, conversation: selected);
         _selectedProviders
           ..clear()
           ..addAll(selectedProviders);
@@ -230,7 +258,8 @@ class _HomeScreenState extends State<HomeScreen> {
       // 現在の接続を明示的に破棄し、次の操作をすべてfail-closedにする。
       _client?.close();
       _client = null;
-      _conversationEpoch++;
+      _selection.clear();
+      _run.reset();
       _searchEpoch++;
       _searchTimer?.cancel();
       setState(() {
@@ -238,13 +267,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _server = null;
         _summaries = const [];
         _searchResults = null;
-        _selectedId = null;
-        _conversation = null;
         _selectedProviders.clear();
         _loading = false;
-        _loadingConversation = false;
         _searching = false;
-        _terminalReloadConversationId = null;
         _error = 'バックエンドに接続できないため接続を無効化しました: $error';
       });
     }
@@ -256,19 +281,25 @@ class _HomeScreenState extends State<HomeScreen> {
       await _bootstrap();
       return;
     }
+    if (_loading) return;
+    final token = _selection.beginOperation();
+    final selectedId = token.selectedId;
     setState(() => _loading = true);
     try {
       final summaries = await client.conversations();
-      ConversationRecord? conversation = _conversation;
-      if (_selectedId != null) {
-        conversation = await client.conversation(_selectedId!);
-      }
+      final conversation = selectedId == null
+          ? null
+          : await client.conversation(selectedId);
       if (!mounted) return;
+      if (!_selection.isCurrent(token)) {
+        setState(() => _loading = false);
+        return;
+      }
       setState(() {
         _summaries = summaries;
-        _conversation = conversation;
-        if (_terminalReloadConversationId == _selectedId) {
-          _terminalReloadConversationId = null;
+        _selection.commit(token, conversation: conversation);
+        if (_terminalReloadConversationId == selectedId) {
+          _run.clearTerminalReload();
         }
         _loading = false;
         _error = '';
@@ -278,7 +309,12 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     } catch (error) {
       if (!mounted) return;
+      if (!_selection.isCurrent(token)) {
+        setState(() => _loading = false);
+        return;
+      }
       setState(() {
+        _selection.finish(token);
         _loading = false;
         _error = '更新に失敗しました: $error';
       });
@@ -286,38 +322,42 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _selectConversation(String id) async {
+    if (_uploadingAttachment) {
+      setState(() => _error = '添付のアップロード完了後に会話を切り替えてください。');
+      return;
+    }
     if (_selectedId == id && _conversation != null) return;
     final client = _client;
     if (client == null) return;
-    final epoch = ++_conversationEpoch;
+    late final ConversationSelectionToken token;
     setState(() {
-      _selectedId = id;
+      token = _selection.beginSelection(id);
       _pendingAttachments.clear();
-      _loadingConversation = true;
       _error = '';
     });
     try {
       final conversation = await client.conversation(id);
-      if (!mounted || epoch != _conversationEpoch || _selectedId != id) return;
+      if (!mounted || !_selection.isCurrent(token)) return;
       setState(() {
-        _conversation = conversation;
-        _loadingConversation = false;
+        _selection.commit(token, conversation: conversation);
       });
       _scrollToEnd();
     } catch (error) {
-      if (!mounted || epoch != _conversationEpoch) return;
+      if (!mounted || !_selection.isCurrent(token)) return;
       setState(() {
-        _loadingConversation = false;
+        _selection.finish(token);
         _error = '会話の読み込みに失敗しました: $error';
       });
     }
   }
 
   void _newConversation() {
-    _conversationEpoch++;
+    if (_uploadingAttachment) {
+      setState(() => _error = '添付のアップロード完了後に新しい会話を開いてください。');
+      return;
+    }
     setState(() {
-      _selectedId = null;
-      _conversation = null;
+      _selection.clear();
       _pendingAttachments.clear();
       _error = '';
     });
@@ -416,47 +456,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final client = _client;
     final conversation = _conversation;
     if (client == null || conversation == null || _sending) return;
-    final controller = TextEditingController(text: conversation.memory.text);
     final value = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('ローカルメモ'),
-        content: SizedBox(
-          width: 620,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('会話の目的・制約・用語などを保存します。各ターンの初回回答へ参考データとして渡されます。'),
-              const SizedBox(height: 10),
-              TextField(
-                controller: controller,
-                minLines: 6,
-                maxLines: 14,
-                maxLength: 20000,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  hintText: '例: 対象読者、採用済み方針、避けるべき案…',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const Text('APIキーなどの秘密候補は保存時にマスクされます。'),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('キャンセル'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: Text(controller.text.trim().isEmpty ? 'クリア' : '保存'),
-          ),
-        ],
-      ),
+      builder: (context) =>
+          _MemoryEditorDialog(initialText: conversation.memory.text),
     );
-    controller.dispose();
     if (value == null || !mounted) return;
     try {
       final updated = await client.updateConversationMemory(
@@ -466,7 +470,7 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       if (!mounted || _selectedId != updated.id) return;
       setState(() {
-        _conversation = updated;
+        _selection.replaceConversationIfSelected(updated);
         _error = '';
       });
     } catch (error) {
@@ -540,9 +544,11 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openSettings() async {
-    if (_sending || _liveTurn != null) {
+    if (_sending || _uploadingAttachment || _liveTurn != null) {
       setState(() {
-        _error = '会議の実行中は接続先を変更できません。先に停止または完了してください。';
+        _error = _uploadingAttachment
+            ? '添付のアップロード完了後に接続先を変更してください。'
+            : '会議の実行中は接続先を変更できません。先に停止または完了してください。';
       });
       return;
     }
@@ -773,6 +779,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final client = _client;
     final message = _messageController.text.trim();
     if (_sending ||
+        _loadingConversation ||
         _uploadingAttachment ||
         _liveTurn != null ||
         message.isEmpty) {
@@ -799,8 +806,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     setState(() {
-      _sending = true;
-      _streamDisconnected = false;
+      _run.beginRequest();
       _error = '';
     });
     var startingChat = false;
@@ -829,7 +835,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ? scan
           : (plan.policy.blocked ? plan.policy : null);
       if (blockedPolicy != null) {
-        setState(() => _sending = false);
+        setState(_run.endRequest);
         await _showPolicyBlocked(blockedPolicy);
         return;
       }
@@ -840,7 +846,7 @@ class _HomeScreenState extends State<HomeScreen> {
             .toSet()
             .join(' ');
         setState(() {
-          _sending = false;
+          _run.endRequest();
           _error = reasons.isEmpty ? '現在の設定ではこの会議を開始できません。' : reasons;
         });
         return;
@@ -849,7 +855,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final confirmed = await _confirmBillableRun(plan, effectivePolicy);
         if (!mounted) return;
         if (!confirmed) {
-          setState(() => _sending = false);
+          setState(_run.endRequest);
           return;
         }
         confirmedLiveApi = true;
@@ -889,18 +895,23 @@ class _HomeScreenState extends State<HomeScreen> {
       _messageController.clear();
       setState(() {
         _pendingAttachments.clear();
-        _liveTurn = live;
-        _selectedId = stream.conversationId;
+        _run.attach(live);
+        _selection.selectId(stream.conversationId);
       });
       _scrollToEnd();
       await _consumeStream(stream, live);
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _sending = false;
+        final current = _run.turn;
+        if (current != null && startingChat) {
+          _run.disconnect(current, '会議を開始できません: $error');
+        } else {
+          _run.endRequest();
+        }
         _error = startingChat
             ? '会議を開始できませんでした: $error'
-            : '送信前の安全確認に失敗しました。サーバー接続と設定を確認してください。';
+            : '送信前の安全確認に失敗しました: $error';
       });
     }
   }
@@ -922,31 +933,20 @@ class _HomeScreenState extends State<HomeScreen> {
         _liveTurn != null) {
       return;
     }
-    final picked = await FilePicker.platform.pickFiles(
-      allowMultiple: true,
-      withData: true,
-      type: FileType.custom,
-      allowedExtensions: const [
-        'txt',
-        'md',
-        'markdown',
-        'csv',
-        'json',
-        'pdf',
-        'png',
-        'jpg',
-        'jpeg',
-        'gif',
-        'webp',
-      ],
-    );
+    final picked = await widget.attachmentPicker();
     if (picked == null || picked.files.isEmpty || !mounted) return;
+    final token = _selection.beginOperation();
+    final selectedId = token.selectedId;
+    final startingConversation = _conversation;
     setState(() {
       _uploadingAttachment = true;
       _error = '';
     });
     try {
-      var conversation = _conversation;
+      var conversation = startingConversation;
+      if (selectedId != null && conversation?.id != selectedId) {
+        conversation = await client.conversation(selectedId);
+      }
       conversation ??= await client.createDraftConversation();
       final uploaded = <AttachmentRecord>[];
       for (final file in picked.files) {
@@ -964,15 +964,27 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       final summaries = await client.conversations();
       if (!mounted) return;
+      if (!identical(_client, client) || !_selection.isCurrent(token)) {
+        setState(() {
+          _error = '会話または接続先が変更されたため、アップロード済み添付を現在の会話には追加しませんでした。';
+        });
+        return;
+      }
       setState(() {
-        _conversation = conversation;
-        _selectedId = conversation!.id;
+        _selection.commit(
+          token,
+          conversation: conversation,
+          selectConversation: true,
+        );
         _summaries = summaries;
         _pendingAttachments.addAll(uploaded);
       });
     } catch (error) {
       if (!mounted) return;
-      setState(() => _error = '添付をアップロードできませんでした: $error');
+      setState(() {
+        _selection.finish(token);
+        _error = '添付をアップロードできませんでした: $error';
+      });
     } finally {
       if (mounted) setState(() => _uploadingAttachment = false);
     }
@@ -1008,10 +1020,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final client = _client;
     if (live == null || client == null || _sending) return;
     setState(() {
-      _sending = true;
-      _streamDisconnected = false;
-      live.phase = 'ストリームへ再接続しています';
-      live.error = '';
+      _run.beginReconnect(live);
     });
     try {
       final stream = await client.startChat(
@@ -1033,9 +1042,7 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _sending = false;
-        _streamDisconnected = true;
-        live.error = '再接続に失敗しました: $error';
+        _run.disconnect(live, '再接続に失敗しました: $error');
       });
     }
   }
@@ -1049,16 +1056,12 @@ class _HomeScreenState extends State<HomeScreen> {
       final result = await client.cancelRun(live.requestId);
       if (!mounted || _liveTurn?.requestId != live.requestId) return;
       setState(() {
-        live.phase = result.alreadyDone
-            ? 'すでに完了しています'
-            : (result.cancelled ? 'ローカル停止処理が完了しました' : '停止要求済み');
+        if (result.terminalOutcome.isNotEmpty) live.error = '';
+        live.phase = _cancelRunStatus(result);
       });
-      final warning = result.warning.isNotEmpty
-          ? result.warning
-          : '停止要求後も、外部Provider側の処理や課金が続く可能性があります。';
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(warning)));
+        ..showSnackBar(SnackBar(content: Text(_cancelRunNotice(result))));
     } catch (error) {
       if (!mounted || _liveTurn?.requestId != live.requestId) return;
       setState(() {
@@ -1108,8 +1111,7 @@ class _HomeScreenState extends State<HomeScreen> {
         : requestTier;
     setState(() {
       _savedRunActionIds.add(turn.requestId);
-      _sending = true;
-      _streamDisconnected = false;
+      _run.beginRequest();
       _error = '';
     });
     try {
@@ -1146,8 +1148,8 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       setState(() {
         _savedRunActionIds.remove(turn.requestId);
-        _liveTurn = live;
-        _selectedId = live.conversationId;
+        _run.attach(live);
+        _selection.selectId(live.conversationId);
       });
       _scrollToEnd();
       await _consumeStream(stream, live);
@@ -1155,9 +1157,14 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() {
         _savedRunActionIds.remove(turn.requestId);
-        _sending = false;
-        _streamDisconnected = false;
-        _error = '保存された実行へ再接続できませんでした: $error';
+        final current = _run.turn;
+        final message = '保存された実行へ再接続できませんでした: $error';
+        if (current?.requestId == turn.requestId) {
+          _run.disconnect(current!, message);
+        } else {
+          _run.endRequest();
+        }
+        _error = message;
       });
     }
   }
@@ -1178,12 +1185,9 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       await _refresh();
       if (!mounted) return;
-      final warning = result.warning.isNotEmpty
-          ? result.warning
-          : '停止要求後も、外部Provider側の処理や課金が続く可能性があります。';
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(warning)));
+        ..showSnackBar(SnackBar(content: Text(_cancelRunNotice(result))));
     } catch (error) {
       if (!mounted) return;
       await _refresh();
@@ -1250,8 +1254,8 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     controller.dispose();
     if (edited == null || !mounted) return;
+    final token = _selection.beginOperation(loading: true);
     setState(() {
-      _loadingConversation = true;
       _error = '';
     });
     try {
@@ -1260,17 +1264,19 @@ class _HomeScreenState extends State<HomeScreen> {
         turnRequestId: turn.requestId,
       );
       final summaries = await client.conversations();
-      if (!mounted) return;
+      if (!mounted || !_selection.isCurrent(token)) return;
       _messageController.text = edited;
       _messageController.selection = TextSelection.collapsed(
         offset: _messageController.text.length,
       );
       setState(() {
-        _conversation = branch;
-        _selectedId = branch.id;
+        _selection.commit(
+          token,
+          conversation: branch,
+          selectConversation: true,
+        );
         _summaries = summaries;
         _pendingAttachments.clear();
-        _loadingConversation = false;
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _messageFocusNode.requestFocus();
@@ -1279,9 +1285,9 @@ class _HomeScreenState extends State<HomeScreen> {
         const SnackBar(content: Text('元の履歴を保った編集分岐を作成しました。内容を確認して送信してください。')),
       );
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || !_selection.isCurrent(token)) return;
       setState(() {
-        _loadingConversation = false;
+        _selection.finish(token);
         _error = '編集分岐を作成できませんでした: $error';
       });
     }
@@ -1334,7 +1340,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final summaries = await client.conversations();
       if (!mounted || _conversation?.id != conversationId) return;
       setState(() {
-        _conversation = conversation;
+        _selection.replaceConversationIfSelected(conversation);
         _summaries = summaries;
         _error = '';
       });
@@ -1350,67 +1356,60 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _consumeStream(ChatStream stream, LiveTurn live) async {
-    var sawDone = false;
-    var failed = false;
-    var cancelled = false;
-    Object? streamFailure;
-    var detached = false;
-    final terminal = Completer<void>();
-    void completeOnce() {
-      if (!terminal.isCompleted) terminal.complete();
+    final session = LiveStreamSession(idleTimeout: stream.idleTimeout);
+    StreamSubscription<SseEvent>? subscription;
+    try {
+      subscription = stream.events.listen(
+        (event) {
+          if (session.sawDone) return;
+          session.recordActivity();
+          if (!mounted || !_run.isCurrent(live.requestId)) {
+            session.markDetached();
+            return;
+          }
+          if (event.event == SseDecoder.keepAliveEvent) return;
+          if (event.id.isNotEmpty) live.lastEventId = event.id;
+          if (event.event == 'done') {
+            session.markDone(event.data);
+            return;
+          }
+          _handleEvent(event, live);
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          session.markError(error);
+        },
+        onDone: session.markEof,
+        cancelOnError: false,
+      );
+      _run.ownStream(live, session, subscription);
+      await session.completed;
+    } finally {
+      if (subscription == null) {
+        session.dispose();
+      } else {
+        await _run.releaseStream(session);
+      }
     }
-
-    late final StreamSubscription<SseEvent> subscription;
-    subscription = stream.events.listen(
-      (event) {
-        if (sawDone) return;
-        if (!mounted || _liveTurn?.requestId != live.requestId) {
-          detached = true;
-          completeOnce();
-          return;
-        }
-        if (event.id.isNotEmpty) live.lastEventId = event.id;
-        if (event.event == 'done') {
-          sawDone = true;
-          failed = event.data['failed'] == true;
-          cancelled = event.data['cancelled'] == true;
-          completeOnce();
-          return;
-        }
-        _handleEvent(event, live);
-      },
-      onError: (Object error, StackTrace stackTrace) {
-        if (sawDone) return;
-        streamFailure = error;
-        completeOnce();
-      },
-      onDone: completeOnce,
-      cancelOnError: false,
-    );
-    await terminal.future;
-    // done受信後はHTTP EOFを待たない。cancel完了自体もUI終端を阻塞させない。
-    unawaited(subscription.cancel());
-    if (detached) return;
-    if (streamFailure != null) {
-      if (!mounted || _liveTurn?.requestId != live.requestId) return;
+    if (session.detached) return;
+    if (session.failure != null) {
+      if (!mounted || !_run.isCurrent(live.requestId)) return;
       setState(() {
-        _sending = false;
-        _streamDisconnected = true;
-        live.error = '通信が切断されました。サーバー側の会議は継続中の可能性があります。 ($streamFailure)';
+        _run.disconnect(
+          live,
+          '通信が切断されました。サーバー側の会議は継続中の可能性があります。 (${session.failure})',
+        );
       });
       return;
     }
-    if (!mounted || _liveTurn?.requestId != live.requestId) return;
-    if (!sawDone) {
+    if (!mounted || !_run.isCurrent(live.requestId)) return;
+    if (!session.sawDone) {
       setState(() {
-        _sending = false;
-        _streamDisconnected = true;
-        live.error = 'ストリームが完了通知なしで終了しました。';
+        _run.disconnect(live, 'ストリームが完了通知なしで終了しました。');
       });
       return;
     }
-    if (failed) {
-      final message = cancelled
+    if (session.failed) {
+      final message = session.cancelled
           ? '会議をキャンセルしました。外部Provider側の停止・課金停止は保証されません。'
           : (live.error.isEmpty ? '会議の実行に失敗しました。' : live.error);
       await _finishLiveTurn(live);
@@ -1431,7 +1430,7 @@ class _HomeScreenState extends State<HomeScreen> {
           live.conversationId =
               event.data['conversation_id']?.toString() ?? live.conversationId;
           if (_selectedId == null || _selectedId!.isEmpty) {
-            _selectedId = live.conversationId;
+            _selection.selectId(live.conversationId);
           }
           final backends = event.data['backends'];
           if (backends is List) {
@@ -1480,27 +1479,20 @@ class _HomeScreenState extends State<HomeScreen> {
         client.conversations(),
         client.conversation(live.conversationId),
       ]);
-      if (!mounted || _liveTurn?.requestId != live.requestId) return;
+      if (!mounted || !_run.isCurrent(live.requestId)) return;
       final summaries = results[0] as List<ConversationSummary>;
       final conversation = results[1] as ConversationRecord;
       setState(() {
         _summaries = summaries;
-        if (_selectedId == live.conversationId) _conversation = conversation;
-        _terminalReloadConversationId = null;
-        _liveTurn = null;
-        _sending = false;
-        _streamDisconnected = false;
+        _selection.replaceConversationIfSelected(conversation);
+        _run.finish();
       });
       _scrollToEnd();
     } catch (error) {
-      if (!mounted || _liveTurn?.requestId != live.requestId) return;
+      if (!mounted || !_run.isCurrent(live.requestId)) return;
       setState(() {
-        _selectedId = live.conversationId;
-        _conversation = null;
-        _terminalReloadConversationId = live.conversationId;
-        _liveTurn = null;
-        _sending = false;
-        _streamDisconnected = false;
+        _selection.restore(selectedId: live.conversationId);
+        _run.requireTerminalReload(live.conversationId);
         _error = '会議は終了しましたが、保存済み会話の取得に失敗しました: $error';
       });
     }
@@ -1510,9 +1502,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final id = _terminalReloadConversationId;
     final client = _client;
     if (id == null || client == null || _loadingConversation) return;
+    late final ConversationSelectionToken token;
     setState(() {
-      _selectedId = id;
-      _loadingConversation = true;
+      token = _selection.beginSelection(id);
       _error = '';
     });
     try {
@@ -1520,18 +1512,28 @@ class _HomeScreenState extends State<HomeScreen> {
         client.conversations(),
         client.conversation(id),
       ]);
-      if (!mounted || _terminalReloadConversationId != id) return;
+      if (!mounted ||
+          !_run.isTerminalReloadCurrent(id) ||
+          !_selection.isCurrent(token)) {
+        return;
+      }
       setState(() {
         _summaries = results[0] as List<ConversationSummary>;
-        _conversation = results[1] as ConversationRecord;
-        _terminalReloadConversationId = null;
-        _loadingConversation = false;
+        _selection.commit(
+          token,
+          conversation: results[1] as ConversationRecord,
+        );
+        _run.clearTerminalReload();
       });
       _scrollToEnd();
     } catch (error) {
-      if (!mounted || _terminalReloadConversationId != id) return;
+      if (!mounted ||
+          !_run.isTerminalReloadCurrent(id) ||
+          !_selection.isCurrent(token)) {
+        return;
+      }
       setState(() {
-        _loadingConversation = false;
+        _selection.finish(token);
         _error = '保存済み会話の再読み込みに失敗しました: $error';
       });
     }
@@ -1595,7 +1597,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   PreferredSizeWidget _appBar(bool wide, bool compact) {
     final safeMock = _server != null && !_server!.liveApiEnabled;
-    final settingsLocked = _sending || _liveTurn != null;
+    final settingsLocked =
+        _sending || _uploadingAttachment || _liveTurn != null;
     return AppBar(
       titleSpacing: wide ? 20 : null,
       title: safeMock && compact
@@ -1646,7 +1649,7 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         IconButton(
           tooltip: '更新',
-          onPressed: _loading ? null : _refresh,
+          onPressed: _loading || _uploadingAttachment ? null : _refresh,
           icon: const Icon(Icons.refresh),
         ),
         IconButton(
@@ -1673,10 +1676,12 @@ class _HomeScreenState extends State<HomeScreen> {
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
-                  onPressed: () {
-                    if (inDrawer) Navigator.of(context).pop();
-                    _newConversation();
-                  },
+                  onPressed: _uploadingAttachment
+                      ? null
+                      : () {
+                          if (inDrawer) Navigator.of(context).pop();
+                          _newConversation();
+                        },
                   icon: const Icon(Icons.add_comment_outlined),
                   label: const Text('新しい会話'),
                 ),
@@ -1775,12 +1780,15 @@ class _HomeScreenState extends State<HomeScreen> {
                         overflow: TextOverflow.ellipsis,
                       ),
                       isThreeLine: true,
-                      onTap: () {
-                        if (inDrawer) Navigator.of(context).pop();
-                        unawaited(_selectConversation(item.id));
-                      },
+                      onTap: _uploadingAttachment
+                          ? null
+                          : () {
+                              if (inDrawer) Navigator.of(context).pop();
+                              unawaited(_selectConversation(item.id));
+                            },
                       trailing: PopupMenuButton<String>(
                         tooltip: '会話メニュー',
+                        enabled: !_uploadingAttachment,
                         onSelected: (action) {
                           if (inDrawer) Navigator.of(context).pop();
                           if (action == 'rename') {
@@ -2041,7 +2049,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final theme = Theme.of(context);
     final active = _server?.activeWorkers ?? const <String>[];
     final runActive = _liveTurn != null;
-    final controlsDisabled = _sending || _uploadingAttachment || runActive;
+    final controlsDisabled =
+        _sending || _loadingConversation || _uploadingAttachment || runActive;
     return Material(
       elevation: 8,
       color: theme.colorScheme.surfaceContainer,
@@ -2226,7 +2235,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       tooltip: runActive ? '会議を停止' : '会議を開始',
                       onPressed: runActive
                           ? _cancelLiveTurn
-                          : (_sending ? null : _send),
+                          : (controlsDisabled ? null : _send),
                       icon: runActive
                           ? const Icon(Icons.stop)
                           : _sending
@@ -2270,6 +2279,93 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
+
+class _MemoryEditorDialog extends StatefulWidget {
+  const _MemoryEditorDialog({required this.initialText});
+
+  final String initialText;
+
+  @override
+  State<_MemoryEditorDialog> createState() => _MemoryEditorDialogState();
+}
+
+class _MemoryEditorDialogState extends State<_MemoryEditorDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialText);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('ローカルメモ'),
+    content: SizedBox(
+      width: 620,
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('会話の目的・制約・用語などを保存します。各ターンの初回回答へ参考データとして渡されます。'),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _controller,
+              minLines: 6,
+              maxLines: 14,
+              maxLength: 20000,
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: '例: 対象読者、採用済み方針、避けるべき案…',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const Text('APIキーなどの秘密候補は保存時にマスクされます。'),
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('キャンセル'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _controller.text),
+        child: Text(_controller.text.trim().isEmpty ? 'クリア' : '保存'),
+      ),
+    ],
+  );
+}
+
+String _cancelRunStatus(CancelRunResult result) =>
+    switch (result.terminalOutcome) {
+      'completed' => '完了が先に確定しました',
+      'failed' => '停止前に処理失敗が確定しました',
+      'cancelled' => result.alreadyDone ? 'すでに停止しています' : 'ローカル停止処理が完了しました',
+      _ =>
+        result.alreadyDone
+            ? 'すでに処理は終了しています'
+            : (result.cancelled ? 'ローカル停止処理が完了しました' : '停止要求済み'),
+    };
+
+String _cancelRunNotice(CancelRunResult result) =>
+    switch (result.terminalOutcome) {
+      'completed' => '停止要求より先に会議の完了が確定しました。保存済み結果を確認できます。',
+      'failed' => '停止要求より先に処理失敗が確定しました。保存済みの実行状態を確認してください。',
+      _ =>
+        result.warning.isNotEmpty
+            ? result.warning
+            : '停止要求後も、外部Provider側の処理や課金が続く可能性があります。',
+    };
 
 String _formatDate(String value) {
   final parsed = DateTime.tryParse(value)?.toLocal();

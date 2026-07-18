@@ -1,8 +1,23 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../models.dart';
 import '../services/api_client.dart';
 import '../services/settings_store.dart';
+
+typedef SettingsApiClientFactory =
+    ApiClient Function(ConnectionSettings settings);
+
+ApiClient _defaultSettingsApiClientFactory(ConnectionSettings settings) =>
+    ApiClient(settings);
+
+const _webTokenStorageWarning =
+    'Web版ではBearerトークンはブラウザ内ストレージへ保存されます。'
+    '共有端末、悪意ある拡張機能、XSSからは保護されません。';
+
+@visibleForTesting
+String webTokenStorageWarning({bool? isWeb}) =>
+    (isWeb ?? kIsWeb) ? _webTokenStorageWarning : '';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({
@@ -10,11 +25,13 @@ class SettingsScreen extends StatefulWidget {
     required this.repository,
     required this.initial,
     this.initialServerSettings,
+    this.clientFactory = _defaultSettingsApiClientFactory,
   });
 
   final SettingsRepository repository;
   final ConnectionSettings initial;
   final ServerSettings? initialServerSettings;
+  final SettingsApiClientFactory clientFactory;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -24,6 +41,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _urlController;
   late final TextEditingController _tokenController;
   ServerSettings? _serverSettings;
+  ConnectionSettings? _serverSettingsConnection;
   bool _testing = false;
   bool _saving = false;
   bool _editingRuntime = false;
@@ -37,6 +55,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _urlController = TextEditingController(text: widget.initial.baseUrl);
     _tokenController = TextEditingController(text: widget.initial.token);
     _serverSettings = widget.initialServerSettings;
+    if (widget.initialServerSettings != null) {
+      _serverSettingsConnection = _normalizedConnection(widget.initial);
+    }
   }
 
   @override
@@ -51,6 +72,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
     token: _tokenController.text.trim(),
   );
 
+  static ConnectionSettings _normalizedConnection(
+    ConnectionSettings connection,
+  ) => ConnectionSettings(
+    baseUrl: normalizeServerBaseUrl(connection.baseUrl),
+    token: connection.token.trim(),
+  );
+
+  static bool _sameConnection(
+    ConnectionSettings left,
+    ConnectionSettings right,
+  ) => _sameBaseUrl(left, right) && left.token.trim() == right.token.trim();
+
+  static bool _sameBaseUrl(ConnectionSettings left, ConnectionSettings right) =>
+      normalizeServerBaseUrl(left.baseUrl) ==
+      normalizeServerBaseUrl(right.baseUrl);
+
   Future<void> _test() async {
     final error = validateServerBaseUrl(_current.baseUrl);
     if (error != null) {
@@ -60,17 +97,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
       return;
     }
+    final testedConnection = _normalizedConnection(_current);
     setState(() {
       _testing = true;
       _result = '';
     });
-    final client = ApiClient(_current);
+    final client = widget.clientFactory(testedConnection);
     try {
       final health = await client.health();
       final settings = await client.serverSettings();
       if (!mounted) return;
+      if (!_sameConnection(_current, testedConnection)) {
+        setState(() {
+          _resultOk = false;
+          _result = '接続テスト中にURLまたはトークンが変更されました。もう1度接続テストしてください。';
+        });
+        return;
+      }
       setState(() {
         _serverSettings = settings;
+        _serverSettingsConnection = testedConnection;
         _resultOk = true;
         _result =
             '接続成功: ${settings.liveApiEnabled ? 'LIVE API有効' : 'SAFE MOCK'} / '
@@ -97,7 +143,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
       return;
     }
-    if (_serverSettings?.authRequired == true && _current.token.isEmpty) {
+    final serverSettingsCurrent =
+        _serverSettingsConnection != null &&
+        _sameBaseUrl(_current, _serverSettingsConnection!);
+    if (serverSettingsCurrent &&
+        _serverSettings?.authRequired == true &&
+        _current.token.isEmpty) {
       setState(() {
         _result = 'このサーバーではBearerトークンが必須です。';
         _resultOk = false;
@@ -122,7 +173,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _editRuntimeSettings() async {
     final settings = _serverSettings;
-    if (settings == null || !settings.runtimeSettings.writable) return;
+    final settingsConnection = _serverSettingsConnection;
+    if (settings == null ||
+        settingsConnection == null ||
+        !settings.runtimeSettings.writable) {
+      return;
+    }
+    if (!_sameConnection(_current, settingsConnection)) {
+      setState(() {
+        _resultOk = false;
+        _result = 'runtimeモデル設定は、現在のURLで接続テストしてから編集してください。';
+      });
+      return;
+    }
     final tiers = const ['low', 'balanced', 'high'];
     final controllers = <String, TextEditingController>{};
     for (final provider in settings.providers) {
@@ -267,7 +330,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _editingRuntime = true;
       _result = '';
     });
-    final client = ApiClient(_current);
+    // PATCH must go to the exact connection that produced `settings`.
+    final client = widget.clientFactory(settingsConnection);
     try {
       final updated = await client.updateRuntimeSettings(
         expectedRevision: settings.runtimeSettings.revision,
@@ -307,7 +371,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final warning = _securityWarning(_current);
-    final authRequired = _serverSettings?.authRequired == true;
+    final webStorageWarning = webTokenStorageWarning();
+    final runtimeConnectionCurrent =
+        _serverSettingsConnection != null &&
+        _sameConnection(_current, _serverSettingsConnection!);
+    final displayedServerSettings = runtimeConnectionCurrent
+        ? _serverSettings
+        : null;
+    final serverSettingsStale =
+        _serverSettings != null && !runtimeConnectionCurrent;
+    final authRequired =
+        _serverSettingsConnection != null &&
+        _sameBaseUrl(_current, _serverSettingsConnection!) &&
+        _serverSettings?.authRequired == true;
     return Scaffold(
       appBar: AppBar(title: const Text('接続とBYOK状態')),
       body: ListView(
@@ -350,6 +426,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             onChanged: (_) => setState(() {}),
           ),
+          if (webStorageWarning.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            _Notice(
+              icon: Icons.warning_amber_rounded,
+              color: theme.colorScheme.errorContainer,
+              text: webStorageWarning,
+            ),
+          ],
           if (warning.isNotEmpty) ...[
             const SizedBox(height: 12),
             _Notice(
@@ -405,8 +489,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               if (_serverSettings?.runtimeSettings.writable == true)
                 IconButton(
-                  tooltip: 'runtimeモデル設定を編集',
-                  onPressed: _editingRuntime ? null : _editRuntimeSettings,
+                  tooltip: runtimeConnectionCurrent
+                      ? 'runtimeモデル設定を編集'
+                      : '現在のURLで接続テストすると編集できます',
+                  onPressed: _editingRuntime || !runtimeConnectionCurrent
+                      ? null
+                      : _editRuntimeSettings,
                   icon: _editingRuntime
                       ? const SizedBox.square(
                           dimension: 18,
@@ -414,17 +502,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         )
                       : const Icon(Icons.tune),
                 ),
-              if (_serverSettings != null)
+              if (displayedServerSettings != null)
                 Chip(
                   avatar: Icon(
-                    _serverSettings!.liveApiEnabled
+                    displayedServerSettings.liveApiEnabled
                         ? Icons.cloud_outlined
                         : Icons.lock_outline,
                     size: 17,
                   ),
                   label: Text(
-                    _serverSettings!.liveApiEnabled
-                        ? 'mode: ${_serverSettings!.mode}'
+                    displayedServerSettings.liveApiEnabled
+                        ? 'mode: ${displayedServerSettings.mode}'
                         : 'SAFE MOCK',
                   ),
                 ),
@@ -436,31 +524,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
             'モデル名だけが返り、キーそのものは返りません。',
           ),
           const SizedBox(height: 12),
-          if (_serverSettings != null)
+          if (serverSettingsStale)
             _Notice(
-              icon: _serverSettings!.liveApiEnabled
+              icon: Icons.sync_problem_outlined,
+              color: theme.colorScheme.errorContainer,
+              text:
+                  '入力中のURLまたはトークンは、表示済み状態の取得元と一致しません。'
+                  '接続テストを行うまでAPIキー状態は表示しません。',
+            )
+          else if (displayedServerSettings != null)
+            _Notice(
+              icon: displayedServerSettings.liveApiEnabled
                   ? Icons.warning_amber_rounded
                   : Icons.lock_outline,
-              color: _serverSettings!.liveApiEnabled
+              color: displayedServerSettings.liveApiEnabled
                   ? theme.colorScheme.errorContainer
                   : theme.colorScheme.secondaryContainer,
-              text: _serverSettings!.liveApiEnabled
+              text: displayedServerSettings.liveApiEnabled
                   ? 'LIVE API ENABLED: 送信前に実行プランを確認し、課金の可能性がある会議は確認を求めます。'
                   : 'SAFE MOCK: live_api_enabled=false。APIキーが設定済みでも外部AI APIは呼び出しません。',
             ),
-          if (_serverSettings != null) const SizedBox(height: 12),
-          if (_serverSettings == null)
+          if (serverSettingsStale || displayedServerSettings != null)
+            const SizedBox(height: 12),
+          if (!serverSettingsStale && displayedServerSettings == null)
             const _Notice(
               icon: Icons.info_outline,
               color: Color(0x222196F3),
               text: '接続テストを行うとプロバイダ状態を表示します。',
             )
-          else
-            for (final provider in _serverSettings!.providers)
+          else if (displayedServerSettings != null)
+            for (final provider in displayedServerSettings.providers)
               Card(
                 child: ExpansionTile(
                   leading: Icon(
-                    !_serverSettings!.liveApiEnabled
+                    !displayedServerSettings.liveApiEnabled
                         ? Icons.lock_outline
                         : provider.configured
                         ? Icons.cloud_done_outlined
@@ -468,7 +565,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   title: Text(provider.label),
                   subtitle: Text(
-                    !_serverSettings!.liveApiEnabled && provider.configured
+                    !displayedServerSettings.liveApiEnabled &&
+                            provider.configured
                         ? 'キー検出済み · SAFE MOCKで未使用'
                         : provider.configured
                         ? '実API設定済み'

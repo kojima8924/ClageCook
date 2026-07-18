@@ -1,5 +1,7 @@
 import pytest
 
+import insights
+
 from insights import analyze_insights
 
 
@@ -117,6 +119,26 @@ def test_empty_and_single_answer_explicitly_report_not_comparable():
     assert single["is_comparable"] is False
     assert single["agreement_score"] == 0.0
     assert single["provider_similarities"] == {"solo": 0.0}
+
+
+def test_agreement_score_averages_unrounded_pairwise_values(monkeypatch):
+    values = iter((0.00004, 0.00004, 0.00014))
+    monkeypatch.setattr(insights, "_text_similarity", lambda *_args: next(values))
+
+    result = analyze_insights(
+        [
+            answer("a", "alpha"),
+            answer("b", "bravo"),
+            answer("c", "charlie"),
+        ]
+    )
+
+    assert [item["similarity"] for item in result["pairwise_similarities"]] == [
+        0.0,
+        0.0,
+        0.0001,
+    ]
+    assert result["agreement_score"] == 0.0001
 
 
 def test_blank_answers_are_ignored_transparently():

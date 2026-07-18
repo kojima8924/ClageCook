@@ -320,7 +320,7 @@ void main() {
     expect(paths, isNot(contains('/api/chat')));
   });
 
-  testWidgets('SSE切断中は新しい会議を開始せず再接続と停止を維持する', (tester) async {
+  testWidgets('SSE切断中の停止競合で完了を停止済みと誤表示しない', (tester) async {
     var chatCalls = 0;
     var cancelCalls = 0;
     final client = ApiClient(
@@ -344,7 +344,8 @@ void main() {
             'ok': true,
             'request_id': 'request-id',
             'cancellation_requested': true,
-            'cancelled': true,
+            'cancelled': false,
+            'terminal_outcome': 'completed',
             'provider_stop_guaranteed': false,
             'warning': '外部Provider側の課金停止は保証されません',
           });
@@ -368,16 +369,47 @@ void main() {
     await tester.enterText(messageField, '切断テスト');
     await tester.tap(find.byIcon(Icons.send));
     await tester.pumpAndSettle();
-
     expect(chatCalls, 1);
     expect(find.textContaining('再接続または停止'), findsOneWidget);
     expect(find.byIcon(Icons.stop), findsOneWidget);
     expect(tester.widget<TextField>(messageField).enabled, isFalse);
 
     await tester.tap(find.byIcon(Icons.stop));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
     expect(cancelCalls, 1);
     expect(chatCalls, 1);
+    expect(find.text('完了が先に確定しました'), findsOneWidget);
+    expect(find.textContaining('保存済み結果を確認できます'), findsOneWidget);
+  });
+
+  testWidgets('SSEが無通信のままならidle timeoutで再接続状態へ移る', (tester) async {
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      sseIdleTimeout: const Duration(milliseconds: 100),
+      client: _SilentSseClient(),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final messageField = find.byWidgetPredicate(
+      (widget) =>
+          widget is TextField && widget.decoration?.hintText == '質問を入力…',
+    );
+
+    await tester.enterText(messageField, '無通信テスト');
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('再接続または停止'), findsOneWidget);
+    expect(find.textContaining('無通信'), findsWidgets);
+    expect(find.byIcon(Icons.stop), findsOneWidget);
   });
 
   testWidgets('done後に届いた遅延stream errorは終端結果を上書きしない', (tester) async {
@@ -543,7 +575,7 @@ void main() {
     expect(find.textContaining('サーバー停止で中断'), findsOneWidget);
   });
 
-  testWidgets('再読込したrunningターンからrequest_id指定で停止できる', (tester) async {
+  testWidgets('再読込したrunningターンの停止競合で失敗終端を通知する', (tester) async {
     tester.view.physicalSize = const Size(1200, 800);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -576,7 +608,8 @@ void main() {
             'ok': true,
             'request_id': 'saved-running-request',
             'cancellation_requested': true,
-            'cancelled': true,
+            'cancelled': false,
+            'terminal_outcome': 'failed',
             'provider_stop_guaranteed': false,
             'warning': '外部Provider側の課金停止は保証されません',
           });
@@ -602,6 +635,7 @@ void main() {
     expect(cancelCalls, 1);
     expect(find.textContaining('サーバー停止で中断'), findsOneWidget);
     expect(find.text('停止を要求'), findsNothing);
+    expect(find.textContaining('処理失敗が確定しました'), findsOneWidget);
   });
 }
 
@@ -796,5 +830,36 @@ class _LateErrorAfterDoneClient extends http.BaseClient {
       response.statusCode,
       headers: response.headers,
     );
+  }
+}
+
+class _SilentSseClient extends http.BaseClient {
+  final _chat = StreamController<List<int>>();
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final typed = request as http.Request;
+    if (request.url.path == '/api/chat') {
+      return http.StreamedResponse(
+        _chat.stream,
+        200,
+        headers: {
+          'content-type': 'text/event-stream',
+          'x-conversation-id': 'conversation-id',
+          'x-request-id': 'silent-request',
+        },
+      );
+    }
+    final response = _preflightResponse(typed, billable: false);
+    return http.StreamedResponse(
+      Stream.value(response.bodyBytes),
+      response.statusCode,
+      headers: response.headers,
+    );
+  }
+
+  @override
+  void close() {
+    unawaited(_chat.close());
   }
 }

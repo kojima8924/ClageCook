@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Clage Cook OSS FastAPIサーバー。"""
+"""Clage Cook FastAPIサーバー。"""
 
 from __future__ import annotations
 
@@ -10,15 +10,11 @@ import logging
 import os
 import secrets
 import threading
-import time
 import uuid
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, Awaitable, BinaryIO, Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
@@ -40,9 +36,18 @@ import exporting
 import orchestrator
 import planning
 import policy
+import regeneration
+import runs
 import scrubbing
 import telemetry
-from storage import ConversationNotFound, ConversationStore, utc_now
+from runs import ConversationLockPool, RunRegistry, RunState, SlidingWindowLimiter
+from runs import run_blocking as _blocking_call
+from storage import (
+    AmbiguousRequestId,
+    ConversationNotFound,
+    ConversationStore,
+    utc_now,
+)
 from runtime_settings import RuntimeSettingsConflict, RuntimeSettingsError
 
 
@@ -142,13 +147,24 @@ async def _lifespan(_app: FastAPI):
                 "recovered %s orphaned running turn(s) as interrupted",
                 recovered,
             )
+        purged_attachments = await asyncio.to_thread(attachment_store.purge_expired)
+        if purged_attachments:
+            logger.info(
+                "purged %s expired attachment(s) during startup",
+                purged_attachments,
+            )
         yield
     finally:
+        drained = await _registry.shutdown()
+        if drained:
+            logger.info("drained %s background run(s) during shutdown", drained)
+        async with _active_conversation_guard:
+            _active_conversation_runs.clear()
         _single_process_guard.release()
 
 
 app = FastAPI(
-    title="Clage Cook OSS",
+    title="Clage Cook",
     version="0.2.0",
     description="BYOK multi-model AI conference API",
     lifespan=_lifespan,
@@ -200,9 +216,19 @@ store = ConversationStore(config.DATA_DIR, sanitizer=_scrub_public)
 attachment_store = attachments.AttachmentStore(config.DATA_DIR)
 budget_guard = finance.BudgetGuard(config.DATA_DIR)
 _run_slots = asyncio.Semaphore(config.MAX_CONCURRENT_RUNS)
-_conversation_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_conversation_locks: Any = ConversationLockPool()
 _active_conversation_runs: dict[str, str] = {}
 _active_conversation_guard = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _hold_conversation_lock(conversation_id: str):
+    """旧test fixtureのmapping lockとも互換な内部adapter。"""
+    async with runs.hold_conversation_lock(
+        _conversation_locks,
+        conversation_id,
+    ):
+        yield
 
 
 def check_auth(request: Request) -> None:
@@ -350,38 +376,23 @@ class RegenerationRequest(RegenerationPlanRequest):
         return value
 
 
-class SlidingWindowLimiter:
-    def __init__(self, limit: int, window_sec: float = 60.0) -> None:
-        self.limit = limit
-        self.window_sec = window_sec
-        self._entries: dict[str, deque[tuple[float, str]]] = defaultdict(deque)
-        self._lock = asyncio.Lock()
-
-    async def check(self, key: str, request_id: str) -> None:
-        now = time.monotonic()
-        async with self._lock:
-            entries = self._entries[key]
-            while entries and now - entries[0][0] >= self.window_sec:
-                entries.popleft()
-            if any(existing == request_id for _, existing in entries):
-                return
-            if len(entries) >= self.limit:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="1分あたりの会議開始上限を超えました",
-                    headers={"Retry-After": "60"},
-                )
-            entries.append((now, request_id))
+def _rate_limit_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="1分あたりの会議開始上限を超えました",
+        headers={"Retry-After": "60"},
+    )
 
 
-_rate_limiter = SlidingWindowLimiter(config.RATE_LIMIT_PER_MINUTE)
+_rate_limiter = SlidingWindowLimiter(
+    config.RATE_LIMIT_PER_MINUTE,
+    error_factory=_rate_limit_error,
+)
 
 
 def _plan_from_request(req: PlanRequest) -> dict[str, Any]:
-    history_text = ""
-    memory_text = ""
-    attachment_context = ""
-    attachment_refs: list[dict[str, Any]] = []
+    conversation: dict[str, Any] | None = None
+    attachment_bundle: tuple[str, list[dict[str, Any]]] | None = None
     if req.conversation_id is not None:
         canonical_id = _canonical_conversation_id(req.conversation_id)
         assert canonical_id is not None
@@ -392,14 +403,9 @@ def _plan_from_request(req: PlanRequest) -> dict[str, Any]:
                 status_code=404,
                 detail="会話が見つかりません",
             ) from exc
-        history_text = orchestrator._history_text(conversation)
-        memory = conversation.get("memory")
-        if isinstance(memory, dict):
-            memory_text = str(memory.get("text") or "")
         try:
-            attachment_context, attachment_refs = attachment_store.build_context(
-                canonical_id,
-                req.attachment_ids,
+            attachment_bundle = attachment_store.build_context(
+                canonical_id, req.attachment_ids
             )
         except attachments.AttachmentError as exc:
             raise _attachment_http_exception(exc) from exc
@@ -411,6 +417,28 @@ def _plan_from_request(req: PlanRequest) -> dict[str, Any]:
                 "message": "添付には保存先の会話が必要です",
             },
         )
+    return _plan_from_snapshot(
+        req,
+        conversation,
+        attachment_bundle=attachment_bundle,
+        decorate_budget=True,
+    )
+
+
+def _plan_from_snapshot(
+    req: PlanRequest,
+    conversation: dict[str, Any] | None,
+    *,
+    attachment_bundle: tuple[str, list[dict[str, Any]]] | None,
+    decorate_budget: bool,
+) -> dict[str, Any]:
+    """実行に使う会話・添付snapshotから、再読込なしでplanを構築する。"""
+    history_text = (
+        orchestrator._history_text(conversation) if conversation is not None else ""
+    )
+    memory = conversation.get("memory") if conversation is not None else None
+    memory_text = str(memory.get("text") or "") if isinstance(memory, dict) else ""
+    attachment_context, attachment_refs = attachment_bundle or ("", [])
     plan = planning.build_run_plan(
         message=req.message + attachment_context,
         tier=req.tier,
@@ -442,7 +470,7 @@ def _plan_from_request(req: PlanRequest) -> dict[str, Any]:
                 ),
             }
         )
-    return budget_guard.decorate_plan(plan, store)
+    return budget_guard.decorate_plan(plan, store) if decorate_budget else plan
 
 
 def _turn_index_by_request_id(
@@ -502,290 +530,46 @@ def _regeneration_target(
     turn: dict[str, Any],
     req: RegenerationPlanRequest,
 ) -> tuple[str, str, dict[str, Any]]:
-    if turn.get("status") != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail="完了済みターンだけを再生成できます",
+    try:
+        return regeneration.resolve_target(
+            turn,
+            target=req.target,
+            provider=req.provider,
+            workers=config.WORKERS,
+            synthesizer=config.synthesizer_name(),
         )
-    if req.target == "answer":
-        source = req.provider or ""
-        current = (turn.get("answers") or {}).get(source)
-        if source not in config.WORKERS or not isinstance(current, dict):
-            raise HTTPException(status_code=404, detail="対象回答が見つかりません")
-        return f"answer:{source}", source, current
-    current = turn.get("synthesis")
-    if not isinstance(current, dict) or current.get("skipped") is True:
-        raise HTTPException(status_code=404, detail="対象の統合回答がありません")
-    return "synthesis", config.synthesizer_name(), current
+    except regeneration.TargetError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 def _regeneration_plan(
     conversation: dict[str, Any],
     turn_index: int,
     req: RegenerationPlanRequest,
-) -> dict[str, Any]:
-    turn = conversation["turns"][turn_index]
-    _key, source, _current = _regeneration_target(turn, req)
-    tier = str((turn.get("options") or {}).get("tier") or "balanced")
-    if tier not in {"low", "balanced", "high"}:
-        tier = "balanced"
-    message = str(turn.get("clean_message") or turn.get("message") or "")
-    attachment_context, attachment_refs = _attachment_context_for_turn(
-        conversation,
-        turn,
-    )
-    model_message = message + attachment_context
-    policy_result = policy.scan_text(model_message)
-    context = deepcopy(conversation)
-    context["turns"] = deepcopy(conversation.get("turns", [])[:turn_index])
-    if req.target == "answer":
-        prompt = orchestrator._worker_prompt(context, model_message)
-        system = orchestrator.WORKER_SYSTEM
-        status_snapshot = config.provider_status(source)
-        mode = status_snapshot.mode
-        model = config.model_for(source, tier) if mode == "live" else "mock"
-        providers = [
-            {
-                "name": source,
-                "label": status_snapshot.label,
-                "mode": mode,
-                "model": model,
-                "billable": mode == "live",
-                "max_calls": 1,
-            }
-        ]
-        synthesizer = {
-            "name": "synthesizer",
-            "label": "Synthesizer",
-            "mode": "mock",
-            "model": "mock",
-            "enabled": False,
-            "billable": False,
-            "max_calls": 0,
-        }
-        answer_input = len((prompt + system).encode("utf-8"))
-        synthesis_input = 0
-        unavailable = mode == "disabled"
-    else:
-        answers = turn.get("answers") or {}
-        successful = {
-            name: value
-            for name, value in answers.items()
-            if name in config.WORKERS
-            and isinstance(value, dict)
-            and value.get("ok")
-        }
-        if not successful:
-            raise HTTPException(
-                status_code=409,
-                detail="成功回答がないため統合を再生成できません",
-            )
-        aliases = (
-            orchestrator._blind_aliases(
-                list(successful),
-                str(turn.get("request_id") or "regeneration"),
-            )
-            if (turn.get("options") or {}).get("blind") is True
-            else None
-        )
-        prompt = orchestrator._synthesis_prompt(model_message, successful, aliases)
-        system = orchestrator.SYNTH_SYSTEM
-        synth_name = config.synthesizer_name()
-        mode = "mock" if synth_name == "synthesizer" else "live"
-        model = config.synthesizer_model_for(tier)
-        providers = []
-        synthesizer = {
-            "name": synth_name,
-            "label": config.LABELS.get(synth_name, "Local mock synthesizer"),
-            "mode": mode,
-            "model": model,
-            "enabled": True,
-            "billable": mode == "live",
-            "max_calls": 1,
-        }
-        source = synth_name
-        answer_input = 0
-        synthesis_input = len((prompt + system).encode("utf-8"))
-        unavailable = False
-
-    billable = mode == "live"
-    attempts = config.HTTP_RETRIES + 1
-    input_total = (answer_input + synthesis_input) * attempts
-    output_total = config.MAX_OUTPUT_TOKENS[tier] * attempts
-    block_reasons = []
-    web_search_requested = bool(
-        req.target == "answer"
-        and (turn.get("options") or {}).get("web_search") is True
-    )
-    web_search_effective = bool(
-        web_search_requested and config.WEB_SEARCH_ENABLED and mode == "live"
-    )
-    if unavailable:
-        block_reasons.append("invalid_request")
-    if policy_result.get("action") == "block":
-        block_reasons.append("policy_blocked")
-    if input_total > config.MAX_INPUT_BYTES_PER_RUN:
-        block_reasons.append("input_byte_limit_exceeded")
-    if output_total > config.MAX_OUTPUT_TOKENS_PER_RUN:
-        block_reasons.append("output_token_limit_exceeded")
-    if web_search_requested and not config.WEB_SEARCH_ENABLED:
-        block_reasons.append("web_search_disabled")
-    warnings = []
-    if billable:
-        warnings.append(
-            {
-                "code": "billable_live_api",
-                "message": "再生成は新しい実API呼び出しとして課金される可能性があります。",
-            }
-        )
-    if web_search_effective:
-        warnings.append(
-            {
-                "code": "web_search_billable_tool",
-                "message": "再生成でもWeb検索tool分の利用量や料金が追加される場合があります。",
-            }
-        )
-    plan = {
-        "allowed": not block_reasons,
-        "block_reasons": block_reasons,
-        "billable": billable,
-        "mode": config.mode(),
-        "regeneration": {"target": req.target, "provider": source},
-        "options": {
-            "tier": tier,
-            "debate_effective": False,
-            "synthesize_effective": req.target == "synthesis",
-            "blind": (turn.get("options") or {}).get("blind") is True,
-            "web_search_requested": web_search_requested,
-            "web_search_effective": web_search_effective,
-        },
-        "providers": providers,
-        "synthesizer": synthesizer,
-        "web_search": {
-            "requested": web_search_requested,
-            "effective": web_search_effective,
-            "initial_answer_only": True,
-            "configured_max_uses": config.WEB_SEARCH_MAX_USES,
-            "strict_total_limit": source == "claude",
-        },
-        "calls": {
-            "answers": 1 if req.target == "answer" else 0,
-            "debate": 0,
-            "synthesis": 1 if req.target == "synthesis" else 0,
-            "total": 1,
-        },
-        "retry_envelope": {
-            "configured_retries_per_live_call": config.HTTP_RETRIES,
-            "live_initial_calls": 1 if billable else 0,
-            "additional_http_attempts": config.HTTP_RETRIES if billable else 0,
-            "total_provider_executions": attempts,
-            "max_output_tokens": output_total,
-            "disclaimer": "再生成の再試行も別のHTTP試行として課金される可能性があります。",
-        },
-        "input_envelope": {
-            "unit": "utf8_bytes",
-            "history": 0,
-            "answer_per_call": answer_input,
-            "answers_total": answer_input,
-            "debate_per_call": 0,
-            "debate_total": 0,
-            "synthesis": synthesis_input,
-            "total": answer_input + synthesis_input,
-            "live_initial_total": answer_input + synthesis_input if billable else 0,
-            "live_with_retries": input_total if billable else 0,
-            "total_with_retries": input_total,
-            "token_count_estimated": False,
-            "disclaimer": "UTF-8 byte量を入力tokenの安全側上限として金額予約に使います。",
-        },
-        "max_output_tokens": {
-            "per_call": config.MAX_OUTPUT_TOKENS[tier],
-            "answers": config.MAX_OUTPUT_TOKENS[tier]
-            if req.target == "answer"
-            else 0,
-            "debate": 0,
-            "synthesis": config.MAX_OUTPUT_TOKENS[tier]
-            if req.target == "synthesis"
-            else 0,
-            "total": config.MAX_OUTPUT_TOKENS[tier],
-            "live_total": config.MAX_OUTPUT_TOKENS[tier] if billable else 0,
-        },
-        "limits": {
-            "max_provider_calls_per_run": config.MAX_PROVIDER_CALLS_PER_RUN,
-            "max_output_tokens_per_run": config.MAX_OUTPUT_TOKENS_PER_RUN,
-            "max_input_bytes_per_run": config.MAX_INPUT_BYTES_PER_RUN,
-            "provider_calls_exceeded": False,
-            "output_tokens_exceeded": output_total
-            > config.MAX_OUTPUT_TOKENS_PER_RUN,
-            "input_bytes_exceeded": input_total > config.MAX_INPUT_BYTES_PER_RUN,
-        },
-        "policy": policy_result,
-        "attachments": {
-            "count": len(attachment_refs),
-            "items": attachment_refs,
-            "text_included_count": sum(
-                1 for item in attachment_refs if item.get("included_in_prompt") is True
-            ),
-        },
-        "warnings": warnings,
-    }
-    return budget_guard.decorate_plan(plan, store)
-
-
-def _regeneration_fingerprint(
-    conversation_id: str,
-    turn_request_id: str,
-    req: RegenerationRequest,
-) -> str:
-    canonical = json.dumps(
-        {
-            "conversation_id": conversation_id,
-            "turn_request_id": turn_request_id,
-            "target": req.target,
-            "provider": req.provider,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _ensure_original_attempt(
-    turn: dict[str, Any],
     *,
-    target_key: str,
-    target: str,
-    provider: str,
-    current: dict[str, Any],
-) -> str:
-    attempts = turn.setdefault("attempts", [])
-    active = turn.setdefault("active_attempts", {})
-    existing = active.get(target_key)
-    if isinstance(existing, str) and existing:
-        return existing
-    seed = f"{turn.get('request_id')}:{target_key}:original"
-    attempt_id = "original-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
-    attempts.append(
-        {
-            "attempt_id": attempt_id,
-            "parent_attempt_id": None,
-            "target": target,
-            "provider": provider,
-            "status": "completed",
-            "created_at": turn.get("created_at") or utc_now(),
-            "completed_at": turn.get("created_at") or utc_now(),
-            "original": True,
-            "result": deepcopy(current),
-        }
+    attachment_bundle: tuple[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    dependencies = regeneration.PlanDependencies(
+        config=config,
+        orchestrator=orchestrator,
+        runtime_snapshot=config.runtime_settings.snapshot,
+        scan_text=policy.scan_text,
+        attachment_context=_attachment_context_for_turn,
+        decorate_plan=lambda plan: budget_guard.decorate_plan(plan, store),
     )
-    active[target_key] = attempt_id
-    return attempt_id
+    try:
+        return regeneration.build_plan(
+            conversation,
+            turn_index,
+            target=req.target,
+            provider=req.provider,
+            dependencies=dependencies,
+            attachment_bundle=attachment_bundle,
+        )
+    except (regeneration.TargetError, regeneration.PlanError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
-def _find_attempt(turn: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
-    for attempt in turn.get("attempts") or []:
-        if isinstance(attempt, dict) and attempt.get("attempt_id") == attempt_id:
-            return attempt
-    return None
 
 
 def _enforce_run_limits(plan: dict[str, Any]) -> None:
@@ -857,7 +641,8 @@ def _request_fingerprint(req: ChatRequest) -> str:
         "synthesize": req.synthesize,
         "blind": req.blind,
         "web_search": req.web_search,
-        "attachment_ids": sorted(set(req.attachment_ids)),
+        # 添付blockは指定順でpromptへ入るため、順序も実行identityに含める。
+        "attachment_ids": list(dict.fromkeys(req.attachment_ids)),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -873,6 +658,9 @@ def _sanitize_provider_error(
         data["error"] = (
             "プロバイダの請求設定またはクレジット残高を確認してください"
         )
+        return
+    if data.get("error_code") == "model_refusal":
+        data["error"] = "モデルのポリシー判定により回答が拒否されました"
         return
     data.pop("error_code", None)
     data["error"] = fallback
@@ -952,114 +740,78 @@ def _sanitize_turn(turn: dict[str, Any]) -> dict[str, Any]:
     return scrubbed if isinstance(scrubbed, dict) else {}
 
 
-@dataclass(slots=True)
-class RunState:
-    request_id: str
-    conversation_id: str
-    request_fingerprint: str
-    events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
-    done: bool = False
-    created_at: float = field(default_factory=time.monotonic)
-    completed_at: float | None = None
-    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
-    task: asyncio.Task | None = None
-
-    async def publish(self, event: str, data: dict[str, Any]) -> None:
-        async with self.condition:
-            self.events.append((event, _sanitize_event_data(event, data)))
-            self.condition.notify_all()
-
-    async def finish(self) -> None:
-        async with self.condition:
-            self.done = True
-            self.completed_at = time.monotonic()
-            self.condition.notify_all()
-
-    async def subscribe(self, start_index: int = 0) -> AsyncIterator[str]:
-        index = max(0, start_index)
-        while True:
-            item: tuple[str, dict[str, Any]] | None = None
-            timed_out = False
-            async with self.condition:
-                if index < len(self.events):
-                    item = self.events[index]
-                    index += 1
-                elif self.done:
-                    break
-                else:
-                    try:
-                        await asyncio.wait_for(
-                            self.condition.wait(), timeout=config.SSE_PING_SEC
-                        )
-                    except asyncio.TimeoutError:
-                        timed_out = True
-            if item is not None:
-                yield _sse(item[0], item[1], index)
-            elif timed_out:
-                yield f": ping {int(time.time())}\n\n"
-
-
-class RunRegistry:
-    def __init__(self) -> None:
-        self._runs: dict[str, RunState] = {}
-        self._lock = asyncio.Lock()
-
-    async def claim(
-        self,
-        request_id: str,
-        state_factory: Callable[[], RunState],
-    ) -> tuple[RunState, bool]:
-        """request_idの状態作成を原子的に一度だけ行う。"""
-        async with self._lock:
-            self._cleanup_locked()
-            existing = self._runs.get(request_id)
-            if existing is not None:
-                return existing, False
-            state = state_factory()
-            if state.request_id != request_id:
-                raise ValueError("state_factory returned a mismatched request_id")
-            self._runs[request_id] = state
-            return state, True
-
-    async def lookup(self, request_id: str) -> RunState | None:
-        async with self._lock:
-            self._cleanup_locked()
-            return self._runs.get(request_id)
-
-    async def remove(self, request_id: str, state: RunState) -> None:
-        async with self._lock:
-            if self._runs.get(request_id) is state:
-                self._runs.pop(request_id, None)
-
-    def _cleanup_locked(self) -> None:
-        now = time.monotonic()
-        stale = [
-            request_id
-            for request_id, run in self._runs.items()
-            if run.done
-            and run.completed_at is not None
-            and now - run.completed_at > config.RUN_RETENTION_SEC
-        ]
-        for request_id in stale:
-            self._runs.pop(request_id, None)
-
-
-_registry = RunRegistry()
+_registry = RunRegistry(retention_sec=config.RUN_RETENTION_SEC)
 
 
 async def _claim_conversation_run(conversation_id: str, request_id: str) -> bool:
-    async with _active_conversation_guard:
-        existing = _active_conversation_runs.get(conversation_id)
-        if existing is not None and existing != request_id:
-            return False
-        _active_conversation_runs[conversation_id] = request_id
-        return True
+    return await runs.claim_conversation_run(
+        _active_conversation_runs,
+        _active_conversation_guard,
+        conversation_id,
+        request_id,
+    )
 
 
 async def _release_conversation_run(conversation_id: str, request_id: str) -> None:
+    await runs.release_conversation_run(
+        _active_conversation_runs,
+        _active_conversation_guard,
+        conversation_id,
+        request_id,
+    )
+
+
+async def _reject_destructive_change_during_run(conversation_id: str) -> None:
+    """Provider実行中にsnapshotや課金結果を破壊する操作を409で止める。"""
     async with _active_conversation_guard:
-        if _active_conversation_runs.get(conversation_id) == request_id:
-            _active_conversation_runs.pop(conversation_id, None)
+        active_request_id = _active_conversation_runs.get(conversation_id)
+    if active_request_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "conversation_busy",
+                "message": "この会話では生成処理中のため、分岐または削除は完了後に再試行してください。",
+            },
+        )
+
+
+async def _finalize_background_run(state: RunState) -> None:
+    """追加cancelからcleanupを隔離し、claim解放とdone通知を必ず完了する。"""
+
+    async def cleanup() -> None:
+        try:
+            await _release_conversation_run(
+                state.conversation_id,
+                state.request_id,
+            )
+        finally:
+            await state.finish()
+
+    cleanup_task = asyncio.create_task(cleanup())
+    cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    await cleanup_task
+    if cancelled and state.terminal_outcome is None:
+        raise asyncio.CancelledError
+
+
+async def _complete_critical(
+    awaitable: Awaitable[Any],
+) -> tuple[Any, bool]:
+    """終端処理を完走し、待機中にcancel要求を受けたかも返す。"""
+    task = asyncio.create_task(awaitable)
+    cancellation_received = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancellation_received
+        except asyncio.CancelledError:
+            cancellation_received = True
+            if task.done():
+                return task.result(), cancellation_received
 
 
 def _sse(event: str, data: dict[str, Any], event_id: int) -> str:
@@ -1069,6 +821,24 @@ def _sse(event: str, data: dict[str, Any], event_id: int) -> str:
         separators=(",", ":"),
     )
     return f"id: {event_id}\nevent: {event}\ndata: {payload}\n\n"
+
+
+def _new_run_state(
+    request_id: str,
+    conversation_id: str,
+    request_fingerprint: str,
+    *,
+    kind: Literal["chat", "regeneration"] = "chat",
+) -> RunState:
+    return RunState(
+        request_id=request_id,
+        conversation_id=conversation_id,
+        request_fingerprint=request_fingerprint,
+        kind=kind,
+        sanitize_event=_sanitize_event_data,
+        encode_event=_sse,
+        ping_interval=config.SSE_PING_SEC,
+    )
 
 
 def _events_from_saved_turn(conversation: dict[str, Any], turn: dict[str, Any]) -> list:
@@ -1186,6 +956,9 @@ def _new_pending_turn(
     options: orchestrator.TurnOptions,
     state: RunState,
     attachment_refs: list[dict[str, Any]],
+    *,
+    budget_reservation: dict[str, Any] | None,
+    execution_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     """外部呼出より先に保存する、同一request_idのdurable claim。"""
     clean_message, effective, _help_requested = orchestrator.parse_controls(
@@ -1201,6 +974,8 @@ def _new_pending_turn(
         "attachment_ids": list(req.attachment_ids),
         "attachment_conversation_id": state.conversation_id,
         "attachments": deepcopy(attachment_refs),
+        "budget_reservation": deepcopy(budget_reservation),
+        "execution_snapshot": deepcopy(execution_snapshot),
         "options": effective.public_dict(),
         "resume_request": {
             "tier": req.tier,
@@ -1278,38 +1053,123 @@ def _sync_partial_turn_from_events(
     turn["failed"] = run_status == "failed"
     turn["usage_may_be_incomplete"] = run_status != "completed"
     turn["event_log"] = [
-            {"event": event, "data": deepcopy(data)}
-            for event, data in state.events
-        ]
+        {"event": event, "data": deepcopy(data)}
+        for event, data in state.events
+    ]
+
+
+async def _persist_incomplete_chat_turn(
+    state: RunState,
+    *,
+    run_status: Literal["cancelled", "failed"],
+) -> dict[str, Any] | None:
+    """pending保存後のouter例外を、最新conversationへdurableに確定する。"""
+    async with _hold_conversation_lock(state.conversation_id):
+        try:
+            conversation = await _blocking_call(
+                store.load,
+                state.conversation_id,
+            )
+            turn_index = _turn_index_by_request_id(
+                conversation,
+                state.request_id,
+            )
+        except (ConversationNotFound, HTTPException):
+            return None
+        current = conversation["turns"][turn_index]
+        if current.get("status") == "completed":
+            return store.summary(conversation)
+        _sync_partial_turn_from_events(
+            current,
+            state,
+            run_status=run_status,
+        )
+        conversation["turns"][turn_index] = _sanitize_turn(current)
+        await _blocking_call(store.save, conversation)
+        return store.summary(conversation)
 
 
 async def _execute_run(state: RunState, req: ChatRequest) -> None:
     cancelled_summary: dict[str, Any] | None = None
     failed_summary: dict[str, Any] | None = None
+    dispatch_started = False
+    pending_persisted = False
+    terminal_persisted = False
+    budget_finalized = False
     try:
         async with _run_slots:
-            lock = _conversation_locks[state.conversation_id]
-            async with lock:
-                conversation = store.load(state.conversation_id)
+            async with _hold_conversation_lock(state.conversation_id):
+                conversation = await _blocking_call(store.load, state.conversation_id)
                 saved = store.find_turn_by_request_id(conversation, state.request_id)
                 if saved is not None:
                     for event, data in _events_from_saved_turn(conversation, saved):
                         await state.publish(event, data)
                     return
 
+                attachment_context, attachment_refs = await _blocking_call(
+                    attachment_store.build_context,
+                    state.conversation_id,
+                    req.attachment_ids,
+                )
+                final_plan = _plan_from_snapshot(
+                    req,
+                    conversation,
+                    attachment_bundle=(attachment_context, attachment_refs),
+                    decorate_budget=False,
+                )
+                _enforce_run_limits(final_plan)
+                _enforce_explicit_confirmations(final_plan, req)
+                reservation = await _blocking_call(
+                    budget_guard.refresh_reservation,
+                    request_id=state.request_id,
+                    request_fingerprint=state.request_fingerprint,
+                    plan=final_plan,
+                    store=store,
+                    reservation_owner=state.execution_id,
+                )
+                provider_models = {
+                    str(item["name"]): str(item["model"])
+                    for item in final_plan.get("providers") or []
+                    if isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and isinstance(item.get("model"), str)
+                }
+                synthesizer_plan = final_plan.get("synthesizer")
+                synthesizer_model = (
+                    str(synthesizer_plan["model"])
+                    if isinstance(synthesizer_plan, dict)
+                    and isinstance(synthesizer_plan.get("model"), str)
+                    else None
+                )
+                synthesizer_provider = (
+                    str(synthesizer_plan["name"])
+                    if isinstance(synthesizer_plan, dict)
+                    and isinstance(synthesizer_plan.get("name"), str)
+                    else None
+                )
+                selected_providers = tuple(provider_models)
                 options = orchestrator.TurnOptions(
                     tier=req.tier,
                     debate=req.debate,
-                    providers=tuple(req.providers or ()),
+                    providers=selected_providers,
                     synthesize=req.synthesize,
                     blind=req.blind,
                     web_search=req.web_search,
                 )
-                attachment_context, attachment_refs = attachment_store.build_context(
-                    state.conversation_id,
-                    req.attachment_ids,
+                execution_snapshot = {
+                    "planned_at": utc_now(),
+                    "providers": provider_models,
+                    "synthesizer": synthesizer_model,
+                    "synthesizer_provider": synthesizer_provider,
+                }
+                pending = _new_pending_turn(
+                    req,
+                    options,
+                    state,
+                    attachment_refs,
+                    budget_reservation=reservation,
+                    execution_snapshot=execution_snapshot,
                 )
-                pending = _new_pending_turn(req, options, state, attachment_refs)
                 if not conversation.get("turns") and pending.get(
                     "clean_message"
                 ) not in {"", "!help"}:
@@ -1319,18 +1179,30 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
                 turns = conversation.setdefault("turns", [])
                 turns.append(pending)
                 pending_index = len(turns) - 1
-                store.save(conversation)
+                _, cancelled_while_saving_pending = await _complete_critical(
+                    _blocking_call(store.save, conversation)
+                )
+                pending_persisted = True
+                if cancelled_while_saving_pending:
+                    raise asyncio.CancelledError
 
                 async def durable_emit(event: str, data: dict[str, Any]) -> None:
                     await state.publish(event, data)
+                    if event not in {"answer", "synthesis"}:
+                        return
                     _sync_partial_turn_from_events(
                         pending,
                         state,
                         run_status="running",
                     )
-                    store.save(conversation)
+                    await _blocking_call(store.save, conversation)
 
-                try:
+                dispatch_started = True
+                with orchestrator.freeze_execution_models(
+                    provider_models,
+                    synthesizer_model,
+                    synthesizer_provider,
+                ):
                     if attachment_context:
                         turn = await orchestrator.run_turn(
                             conversation,
@@ -1348,67 +1220,74 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
                             state.request_id,
                             durable_emit,
                         )
-                except asyncio.CancelledError:
-                    _sync_partial_turn_from_events(
-                        pending,
-                        state,
-                        run_status="cancelled",
+
+                turn = _sanitize_turn(turn)
+                turn["attachment_ids"] = list(req.attachment_ids)
+                turn["attachment_conversation_id"] = state.conversation_id
+                turn["attachments"] = deepcopy(attachment_refs)
+                turn["request_fingerprint"] = state.request_fingerprint
+                turn["budget_reservation"] = deepcopy(reservation)
+                turn["execution_snapshot"] = deepcopy(execution_snapshot)
+                turn["event_log"] = [
+                    {"event": event, "data": deepcopy(data)}
+                    for event, data in state.events
+                ]
+                turn["status"] = "completed"
+                turn["cancelled"] = False
+                turn["failed"] = False
+                turn["usage_may_be_incomplete"] = False
+                turns[pending_index] = turn
+
+                async def finalize_completed_turn() -> None:
+                    nonlocal terminal_persisted, budget_finalized
+                    await _blocking_call(store.save, conversation)
+                    terminal_persisted = True
+                    await _blocking_call(
+                        budget_guard.settle,
+                        state.request_id,
+                        usage_reconciled=finance.turn_usage_reconciled(turn),
+                        turn=turn,
                     )
-                    pending = _sanitize_turn(pending)
-                    turns[pending_index] = pending
-                    store.save(conversation)
-                    budget_guard.settle(
+                    budget_finalized = True
+                    state.terminal_outcome = "completed"
+                    await state.publish(
+                        "done",
+                        {
+                            "request_id": state.request_id,
+                            "conversation": store.summary(conversation),
+                        },
+                    )
+
+                # Provider結果が確定した後は、cancelが終端保存と予算確定を
+                # 分断しないよう一連の処理を完走してcompletedを正とする。
+                await _complete_critical(finalize_completed_turn())
+    except asyncio.CancelledError:
+        state.terminal_outcome = "cancelled"
+        if pending_persisted and not terminal_persisted:
+            cancelled_summary, _ = await _complete_critical(
+                _persist_incomplete_chat_turn(
+                    state,
+                    run_status="cancelled",
+                )
+            )
+            terminal_persisted = cancelled_summary is not None
+        if not budget_finalized:
+            if dispatch_started:
+                await _complete_critical(
+                    _blocking_call(
+                        budget_guard.settle,
                         state.request_id,
                         usage_reconciled=False,
                     )
-                    cancelled_summary = store.summary(conversation)
-                    raise
-                except Exception:
-                    _sync_partial_turn_from_events(
-                        pending,
-                        state,
-                        run_status="failed",
-                    )
-                    pending = _sanitize_turn(pending)
-                    turns[pending_index] = pending
-                    try:
-                        store.save(conversation)
-                        budget_guard.settle(
-                            state.request_id,
-                            usage_reconciled=False,
-                        )
-                        failed_summary = store.summary(conversation)
-                    except Exception:
-                        pass
-                    raise
-                else:
-                    turn = _sanitize_turn(turn)
-                    turn["attachment_ids"] = list(req.attachment_ids)
-                    turn["attachment_conversation_id"] = state.conversation_id
-                    turn["attachments"] = deepcopy(attachment_refs)
-                    turn["request_fingerprint"] = state.request_fingerprint
-                    turn["event_log"] = [
-                        {"event": event, "data": deepcopy(data)}
-                        for event, data in state.events
-                    ]
-                    turn["status"] = "completed"
-                    turn["cancelled"] = False
-                    turn["failed"] = False
-                    turn["usage_may_be_incomplete"] = False
-                    turns[pending_index] = turn
-                    store.save(conversation)
-                    budget_guard.settle(
-                        state.request_id,
-                        usage_reconciled=finance.turn_usage_reconciled(turn),
-                    )
-                await state.publish(
-                    "done",
-                    {
-                        "request_id": state.request_id,
-                        "conversation": store.summary(conversation),
-                    },
                 )
-    except asyncio.CancelledError:
+            else:
+                await _complete_critical(
+                    _blocking_call(
+                        budget_guard.release_undispatched,
+                        state.request_id,
+                    )
+                )
+            budget_finalized = True
         await state.publish(
             "error",
             {
@@ -1427,6 +1306,32 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
         await state.publish("done", done_data)
         raise
     except Exception as exc:
+        state.terminal_outcome = "failed"
+        if pending_persisted and not terminal_persisted:
+            failed_summary, _ = await _complete_critical(
+                _persist_incomplete_chat_turn(
+                    state,
+                    run_status="failed",
+                )
+            )
+            terminal_persisted = failed_summary is not None
+        if not budget_finalized:
+            if dispatch_started:
+                await _complete_critical(
+                    _blocking_call(
+                        budget_guard.settle,
+                        state.request_id,
+                        usage_reconciled=False,
+                    )
+                )
+            else:
+                await _complete_critical(
+                    _blocking_call(
+                        budget_guard.release_undispatched,
+                        state.request_id,
+                    )
+                )
+            budget_finalized = True
         logger.error(
             "run failed request_id=%s conversation_id=%s exception_type=%s",
             state.request_id,
@@ -1442,8 +1347,7 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
             done_data["conversation"] = failed_summary
         await state.publish("done", done_data)
     finally:
-        await _release_conversation_run(state.conversation_id, state.request_id)
-        await state.finish()
+        await _finalize_background_run(state)
 
 
 def _resolve_request_id(req: ChatRequest, request: Request) -> str:
@@ -1501,7 +1405,7 @@ def _stream_response(state: RunState, start_index: int = 0) -> StreamingResponse
 
 @app.get("/api/health", dependencies=[Depends(check_auth)])
 def health() -> dict[str, Any]:
-    return {
+    result = {
         "ok": True,
         "version": app.version,
         "mode": config.mode(),
@@ -1510,13 +1414,16 @@ def health() -> dict[str, Any]:
         "auth_required": bool(config.AUTH_TOKEN),
         "single_process_enforced": True,
     }
+    public = _scrub_public(result)
+    return public if isinstance(public, dict) else {}
 
 
 @app.get("/api/settings", dependencies=[Depends(check_auth)])
 def settings() -> dict[str, Any]:
     result = config.public_settings()
     result["finance"] = budget_guard.public_snapshot(store)
-    return result
+    public = _scrub_public(result)
+    return public if isinstance(public, dict) else {}
 
 
 @app.patch("/api/settings/runtime", dependencies=[Depends(check_auth)])
@@ -1552,9 +1459,13 @@ def update_runtime_settings(req: RuntimeSettingsUpdateRequest) -> dict[str, Any]
 @app.get("/api/telemetry", dependencies=[Depends(check_auth)])
 async def usage_telemetry() -> dict[str, Any]:
     """local実績と、明示有効時だけ読み取り専用の管理telemetryを返す。"""
-    snapshot = telemetry.local_snapshot(store)
-    snapshot["finance"] = budget_guard.public_snapshot(store)
-    snapshot["admin"] = await admin_telemetry.snapshot()
+    snapshot, finance_snapshot, admin_snapshot = await asyncio.gather(
+        asyncio.to_thread(telemetry.local_snapshot, store),
+        asyncio.to_thread(budget_guard.public_snapshot, store),
+        admin_telemetry.snapshot(),
+    )
+    snapshot["finance"] = finance_snapshot
+    snapshot["admin"] = admin_snapshot
     public = _scrub_public(snapshot)
     return public if isinstance(public, dict) else {}
 
@@ -1575,6 +1486,7 @@ def release_budget_reconciliation(
         reservation = budget_guard.release_after_manual_reconciliation(
             request_id,
             confirmed_no_unobserved_charge=req.confirmed_no_unobserved_charge,
+            store=store,
             note=note,
         )
     except finance.ReconciliationError as exc:
@@ -1609,45 +1521,123 @@ async def regeneration_plan(
     assert canonical_id is not None
     if not _valid_request_id(turn_request_id):
         raise HTTPException(status_code=404, detail="対象ターンが見つかりません")
-    async with _conversation_locks[canonical_id]:
+    async with _hold_conversation_lock(canonical_id):
         try:
-            conversation_data = store.load(canonical_id)
+            conversation_data = await _blocking_call(store.load, canonical_id)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
         turn_index = _turn_index_by_request_id(conversation_data, turn_request_id)
-        return _regeneration_plan(conversation_data, turn_index, req)
+        result = await _blocking_call(
+            _regeneration_plan,
+            conversation_data,
+            turn_index,
+            req,
+        )
+        public = _scrub_public(result)
+        return public if isinstance(public, dict) else {}
 
 
-@app.post(
-    "/api/conversations/{conversation_id}/turns/{turn_request_id}/regenerate",
-    dependencies=[Depends(check_auth)],
-)
-async def regenerate_turn_result(
+def _enforce_regeneration_confirmations(
+    plan: dict[str, Any],
+    req: RegenerationRequest,
+) -> None:
+    required = regeneration.required_confirmations(
+        plan,
+        confirm_live_api=req.confirm_live_api,
+        confirm_sensitive_data=req.confirm_sensitive_data,
+    )
+    if required:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={
+                "code": "explicit_confirmation_required",
+                "message": "再生成の実API利用には明示確認が必要です。",
+                "required": required,
+                "plan": plan,
+            },
+        )
+
+
+async def _mark_regeneration_interrupted(
+    conversation_id: str,
+    turn_request_id: str,
+    regeneration_id: str,
+    *,
+    cancelled: bool,
+) -> None:
+    """cancel・shutdown・通常障害の未完了attemptをdurableに中断確定する。"""
+    async with _hold_conversation_lock(conversation_id):
+        try:
+            conversation_data = await _blocking_call(store.load, conversation_id)
+            turn_index = _turn_index_by_request_id(
+                conversation_data,
+                turn_request_id,
+            )
+        except (ConversationNotFound, HTTPException):
+            return
+        turn = conversation_data["turns"][turn_index]
+        attempt = regeneration.find_attempt(turn, regeneration_id)
+        if attempt is None or not regeneration.interrupt_attempt(
+            attempt,
+            now=utc_now(),
+            cancelled=cancelled,
+        ):
+            return
+        await _blocking_call(store.save, conversation_data)
+
+
+def _saved_regeneration_replay(
+    conversation_id: str,
+    turn_request_id: str,
+    regeneration_id: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    """保存済みterminal attemptをrate/active claimより先に無課金再生する。"""
+    try:
+        conversation_data = store.load(conversation_id)
+        turn_index = _turn_index_by_request_id(
+            conversation_data,
+            turn_request_id,
+        )
+    except (ConversationNotFound, HTTPException):
+        return None
+    turn = conversation_data["turns"][turn_index]
+    existing = regeneration.find_attempt(turn, regeneration_id)
+    if existing is None:
+        return None
+    if existing.get("request_fingerprint") != fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="regeneration_idが異なる要求で使用済みです",
+        )
+    if existing.get("status") not in {"completed", "failed", "interrupted"}:
+        return None
+    public = _scrub_public(
+        {
+            "attempt": existing,
+            "conversation": conversation_data,
+            "replayed": True,
+        }
+    )
+    return public if isinstance(public, dict) else {}
+
+
+async def _execute_regeneration(
+    state: RunState,
     conversation_id: str,
     turn_request_id: str,
     req: RegenerationRequest,
-    request: Request,
-) -> dict[str, Any]:
-    canonical_id = _canonical_conversation_id(conversation_id)
-    assert canonical_id is not None
-    if not _valid_request_id(turn_request_id):
-        raise HTTPException(status_code=404, detail="対象ターンが見つかりません")
-    await _rate_limiter.check(_rate_limit_key(request), req.regeneration_id)
-    claimed = await _claim_conversation_run(canonical_id, req.regeneration_id)
-    if not claimed:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "conversation_busy",
-                "message": "この会話では別の生成処理が実行中です。",
-            },
-        )
+    fingerprint: str,
+) -> None:
+    """再生成をHTTP接続から独立して実行し、短いlock区間だけで保存する。"""
+    reserve_started = False
     dispatch_started = False
+    budget_finalized = False
     try:
         async with _run_slots:
-            async with _conversation_locks[canonical_id]:
+            async with _hold_conversation_lock(conversation_id):
                 try:
-                    conversation_data = store.load(canonical_id)
+                    conversation_data = await _blocking_call(store.load, conversation_id)
                 except ConversationNotFound as exc:
                     raise HTTPException(
                         status_code=404,
@@ -1659,12 +1649,7 @@ async def regenerate_turn_result(
                 )
                 turn = conversation_data["turns"][turn_index]
                 target_key, provider_name, current = _regeneration_target(turn, req)
-                fingerprint = _regeneration_fingerprint(
-                    canonical_id,
-                    turn_request_id,
-                    req,
-                )
-                existing = _find_attempt(turn, req.regeneration_id)
+                existing = regeneration.find_attempt(turn, req.regeneration_id)
                 if existing is not None:
                     if existing.get("request_fingerprint") != fingerprint:
                         raise HTTPException(
@@ -1683,35 +1668,31 @@ async def regenerate_turn_result(
                                 "replayed": True,
                             }
                         )
-                        return public if isinstance(public, dict) else {}
+                        state.result = public if isinstance(public, dict) else {}
+                        return
                     raise HTTPException(
                         status_code=409,
                         detail="同じ再生成attemptが実行中です",
                     )
 
-                plan = _regeneration_plan(conversation_data, turn_index, req)
+                attachment_bundle = await _blocking_call(
+                    _attachment_context_for_turn,
+                    conversation_data,
+                    turn,
+                )
+                plan = await _blocking_call(
+                    _regeneration_plan,
+                    conversation_data,
+                    turn_index,
+                    req,
+                    attachment_bundle=attachment_bundle,
+                )
                 _enforce_run_limits(plan)
-                required = []
-                if plan.get("billable") and not req.confirm_live_api:
-                    required.append("confirm_live_api")
-                if (
-                    plan.get("billable")
-                    and (plan.get("policy") or {}).get("action") == "confirm"
-                    and not req.confirm_sensitive_data
-                ):
-                    required.append("confirm_sensitive_data")
-                if required:
-                    raise HTTPException(
-                        status_code=status.HTTP_428_PRECONDITION_REQUIRED,
-                        detail={
-                            "code": "explicit_confirmation_required",
-                            "message": "再生成の実API利用には明示確認が必要です。",
-                            "required": required,
-                            "plan": plan,
-                        },
-                    )
+                _enforce_regeneration_confirmations(plan, req)
+                if req.target == "synthesis":
+                    provider_name = str(plan["synthesizer"]["name"])
 
-                parent_attempt_id = _ensure_original_attempt(
+                parent_attempt_id = regeneration.ensure_original_attempt(
                     turn,
                     target_key=target_key,
                     target=req.target,
@@ -1721,12 +1702,16 @@ async def regenerate_turn_result(
                         else provider_name
                     ),
                     current=current,
+                    now=utc_now,
                 )
-                reservation = budget_guard.reserve(
+                reserve_started = True
+                reservation = await _blocking_call(
+                    budget_guard.reserve,
                     request_id=req.regeneration_id,
                     request_fingerprint=fingerprint,
                     plan=plan,
                     store=store,
+                    reservation_owner=state.execution_id,
                 )
                 attempt = {
                     "attempt_id": req.regeneration_id,
@@ -1740,47 +1725,81 @@ async def regenerate_turn_result(
                     "original": False,
                     "cost_estimate": deepcopy(plan.get("cost_estimate") or {}),
                     "budget_reservation": deepcopy(reservation),
+                    "execution_snapshot": {
+                        "planned_at": utc_now(),
+                        "providers": {
+                            str(item["name"]): str(item["model"])
+                            for item in plan.get("providers") or []
+                            if isinstance(item, dict)
+                            and isinstance(item.get("name"), str)
+                            and isinstance(item.get("model"), str)
+                        },
+                        "synthesizer": (
+                            str(plan["synthesizer"]["model"])
+                            if isinstance(plan.get("synthesizer"), dict)
+                            and isinstance(plan["synthesizer"].get("model"), str)
+                            else None
+                        ),
+                        "synthesizer_provider": (
+                            str(plan["synthesizer"]["name"])
+                            if isinstance(plan.get("synthesizer"), dict)
+                            and isinstance(plan["synthesizer"].get("name"), str)
+                            else None
+                        ),
+                    },
                     "usage_may_be_incomplete": True,
                 }
                 turn.setdefault("attempts", []).append(attempt)
-                try:
-                    store.save(conversation_data)
-                except Exception:
-                    budget_guard.release_undispatched(req.regeneration_id)
-                    raise
-
+                await _blocking_call(store.save, conversation_data)
                 attempt["status"] = "dispatching"
                 attempt["updated_at"] = utc_now()
-                store.save(conversation_data)
-                dispatch_started = True
+                await _blocking_call(store.save, conversation_data)
 
                 tier = str((turn.get("options") or {}).get("tier") or "balanced")
                 if tier not in {"low", "balanced", "high"}:
                     tier = "balanced"
+                message = str(turn.get("clean_message") or turn.get("message") or "")
+                model_message = message + attachment_bundle[0]
+                context = deepcopy(conversation_data)
+                context["turns"] = deepcopy(
+                    conversation_data.get("turns", [])[:turn_index]
+                )
+                answers = {
+                    name: value
+                    for name, value in (turn.get("answers") or {}).items()
+                    if name in config.WORKERS
+                    and isinstance(value, dict)
+                    and value.get("ok")
+                }
+                aliases = (
+                    orchestrator._blind_aliases(
+                        list(answers),
+                        str(turn.get("request_id") or req.regeneration_id),
+                    )
+                    if (turn.get("options") or {}).get("blind") is True
+                    else None
+                )
+
+            execution_snapshot = attempt["execution_snapshot"]
+            dispatch_started = True
+            with orchestrator.freeze_execution_models(
+                execution_snapshot["providers"],
+                execution_snapshot["synthesizer"],
+                execution_snapshot.get("synthesizer_provider"),
+            ):
                 if req.target == "answer":
-                    context = deepcopy(conversation_data)
-                    context["turns"] = deepcopy(
-                        conversation_data.get("turns", [])[:turn_index]
-                    )
-                    message = str(
-                        turn.get("clean_message") or turn.get("message") or ""
-                    )
-                    attachment_context, _attachment_refs = _attachment_context_for_turn(
-                        conversation_data,
-                        turn,
-                    )
-                    model_message = message + attachment_context
                     result = await orchestrator._run_provider(
                         provider_name,
                         orchestrator._worker_prompt(context, model_message),
                         system=(
                             orchestrator.WORKER_SYSTEM
-                            + " 前回回答を参照せず、同じ質問へ新しい独立回答を作ってください。"
+                            + " "
+                            + regeneration.ANSWER_REGENERATION_INSTRUCTION
                         ),
                         tier=tier,
                         round_number=1,
                         prompt_cache_key=orchestrator._prompt_cache_key(
-                            canonical_id,
+                            conversation_id,
                             provider_name,
                         ),
                         redact_confirm=True,
@@ -1790,82 +1809,97 @@ async def regenerate_turn_result(
                         ),
                     )
                 else:
-                    message = str(
-                        turn.get("clean_message") or turn.get("message") or ""
-                    )
-                    attachment_context, _attachment_refs = _attachment_context_for_turn(
-                        conversation_data,
-                        turn,
-                    )
-                    model_message = message + attachment_context
-                    answers = {
-                        name: value
-                        for name, value in (turn.get("answers") or {}).items()
-                        if name in config.WORKERS
-                        and isinstance(value, dict)
-                        and value.get("ok")
-                    }
-                    aliases = (
-                        orchestrator._blind_aliases(
-                            list(answers),
-                            str(turn.get("request_id") or req.regeneration_id),
-                        )
-                        if (turn.get("options") or {}).get("blind") is True
-                        else None
-                    )
                     result = await orchestrator._run_synthesis(
                         model_message,
                         answers,
                         tier,
                         aliases,
-                        canonical_id,
+                        conversation_id,
                     )
 
-                result = _scrub_public(result)
-                if not isinstance(result, dict):
-                    result = {
-                        "ok": False,
-                        "error": "再生成結果を安全に処理できませんでした",
-                        "usage": {},
-                        "usage_may_be_incomplete": True,
-                    }
-                attempt["result"] = deepcopy(result)
-                attempt["status"] = "completed" if result.get("ok") else "failed"
-                attempt["completed_at"] = utc_now()
-                attempt["updated_at"] = attempt["completed_at"]
-                attempt["usage_may_be_incomplete"] = bool(
-                    result.get("usage_may_be_incomplete")
-                )
-                if result.get("ok"):
-                    turn.setdefault("active_attempts", {})[
-                        target_key
-                    ] = req.regeneration_id
-                    if req.target == "answer":
-                        turn.setdefault("answers", {})[provider_name] = deepcopy(result)
-                        successful = [
-                            {"source": name, "text": str(value.get("text") or "")}
-                            for name, value in (turn.get("answers") or {}).items()
-                            if isinstance(value, dict) and value.get("ok")
-                        ]
-                        turn["insights"] = orchestrator.analyze_insights(successful)
-                        turn["synthesis_stale"] = True
-                    else:
-                        turn["synthesis"] = deepcopy(result)
-                        turn["synthesis_stale"] = False
-                store.save(conversation_data)
-                budget_guard.settle(
+            result = _scrub_public(result)
+            if not isinstance(result, dict):
+                result = {
+                    "ok": False,
+                    "error": "再生成結果を安全に処理できませんでした",
+                    "usage": {},
+                    "usage_may_be_incomplete": True,
+                }
+            billing_turn = {
+                "answers": (
+                    {provider_name: result}
+                    if req.target == "answer"
+                    else {}
+                ),
+                "synthesis": result if req.target == "synthesis" else {},
+            }
+
+            async def finalize_regeneration_result() -> dict[str, Any]:
+                nonlocal budget_finalized
+                async with _hold_conversation_lock(conversation_id):
+                    conversation_data = await _blocking_call(
+                        store.load,
+                        conversation_id,
+                    )
+                    turn_index = _turn_index_by_request_id(
+                        conversation_data,
+                        turn_request_id,
+                    )
+                    turn = conversation_data["turns"][turn_index]
+                    attempt = regeneration.find_attempt(
+                        turn,
+                        req.regeneration_id,
+                    )
+                    if attempt is None:
+                        raise RuntimeError(
+                            "durable regeneration attempt is missing"
+                        )
+                    attempt["result"] = deepcopy(result)
+                    attempt["status"] = (
+                        "completed" if result.get("ok") else "failed"
+                    )
+                    attempt["completed_at"] = utc_now()
+                    attempt["updated_at"] = attempt["completed_at"]
+                    attempt["usage_may_be_incomplete"] = bool(
+                        result.get("usage_may_be_incomplete")
+                    )
+                    if result.get("ok"):
+                        turn.setdefault("active_attempts", {})[
+                            target_key
+                        ] = req.regeneration_id
+                        if req.target == "answer":
+                            turn.setdefault("answers", {})[
+                                provider_name
+                            ] = deepcopy(result)
+                            successful = [
+                                {
+                                    "source": name,
+                                    "text": str(value.get("text") or ""),
+                                }
+                                for name, value in (
+                                    turn.get("answers") or {}
+                                ).items()
+                                if isinstance(value, dict) and value.get("ok")
+                            ]
+                            turn["insights"] = orchestrator.analyze_insights(
+                                successful
+                            )
+                            turn["synthesis_stale"] = True
+                        else:
+                            turn["synthesis"] = deepcopy(result)
+                            turn["synthesis_stale"] = False
+                    await _blocking_call(store.save, conversation_data)
+
+                await _blocking_call(
+                    budget_guard.settle,
                     req.regeneration_id,
                     usage_reconciled=finance.turn_usage_reconciled(
-                        {
-                            "answers": {provider_name: result}
-                            if req.target == "answer"
-                            else {},
-                            "synthesis": result
-                            if req.target == "synthesis"
-                            else {},
-                        }
+                        billing_turn
                     ),
+                    turn=billing_turn,
                 )
+                budget_finalized = True
+                state.terminal_outcome = "completed"
                 public = _scrub_public(
                     {
                         "attempt": attempt,
@@ -1874,38 +1908,243 @@ async def regenerate_turn_result(
                     }
                 )
                 return public if isinstance(public, dict) else {}
+
+            # Provider結果後は保存・budget settle・公開結果を一体で完走する。
+            state.result, _ = await _complete_critical(
+                finalize_regeneration_result()
+            )
     except asyncio.CancelledError:
-        if dispatch_started:
-            budget_guard.settle(req.regeneration_id, usage_reconciled=False)
-        raise
-    except HTTPException:
-        raise
+        state.terminal_outcome = "cancelled"
+        if reserve_started and not budget_finalized:
+            if dispatch_started:
+                await _blocking_call(
+                    budget_guard.settle,
+                    req.regeneration_id,
+                    usage_reconciled=False,
+                )
+            else:
+                await _blocking_call(
+                    budget_guard.release_undispatched,
+                    req.regeneration_id,
+                )
+        await _mark_regeneration_interrupted(
+            conversation_id,
+            turn_request_id,
+            req.regeneration_id,
+            cancelled=True,
+        )
+        state.failure_status = 409
+        state.failure_detail = {
+            "code": "regeneration_cancelled",
+            "message": "再生成がキャンセルされました。",
+        }
+    except finance.BudgetViolation as exc:
+        state.terminal_outcome = "failed"
+        state.failure_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+        state.failure_detail = {
+            "code": exc.code,
+            "message": str(exc),
+            "budget": exc.snapshot,
+        }
+    except HTTPException as exc:
+        state.terminal_outcome = "failed"
+        state.failure_status = exc.status_code
+        state.failure_detail = _scrub_public(exc.detail)
+
+        async def finalize_http_failure() -> None:
+            nonlocal budget_finalized
+            if reserve_started and not budget_finalized:
+                if dispatch_started:
+                    await _blocking_call(
+                        budget_guard.settle,
+                        req.regeneration_id,
+                        usage_reconciled=False,
+                    )
+                else:
+                    await _blocking_call(
+                        budget_guard.release_undispatched,
+                        req.regeneration_id,
+                    )
+                budget_finalized = True
+                await _mark_regeneration_interrupted(
+                    conversation_id,
+                    turn_request_id,
+                    req.regeneration_id,
+                    cancelled=False,
+                )
+
+        # Provider/validation failureが先に確定した後のcancelは、台帳と
+        # durable attemptを分断せずfailedとして完走させる。
+        await _complete_critical(finalize_http_failure())
     except Exception as exc:
-        if dispatch_started:
-            budget_guard.settle(req.regeneration_id, usage_reconciled=False)
+        state.terminal_outcome = "failed"
         logger.error(
             "regeneration failed regeneration_id=%s exception_type=%s",
             req.regeneration_id,
             type(exc).__name__,
         )
-        raise HTTPException(
-            status_code=500,
-            detail="再生成に失敗しました",
-        ) from exc
+        state.failure_status = 500
+        state.failure_detail = "再生成に失敗しました"
+
+        async def finalize_unexpected_failure() -> None:
+            nonlocal budget_finalized
+            if reserve_started and not budget_finalized:
+                if dispatch_started:
+                    await _blocking_call(
+                        budget_guard.settle,
+                        req.regeneration_id,
+                        usage_reconciled=False,
+                    )
+                else:
+                    await _blocking_call(
+                        budget_guard.release_undispatched,
+                        req.regeneration_id,
+                    )
+                budget_finalized = True
+            await _mark_regeneration_interrupted(
+                conversation_id,
+                turn_request_id,
+                req.regeneration_id,
+                cancelled=False,
+            )
+
+        await _complete_critical(finalize_unexpected_failure())
     finally:
-        await _release_conversation_run(canonical_id, req.regeneration_id)
+        await _finalize_background_run(state)
+        # 再生成は完了attemptをdurable storeから再生できる。会話全体を含む
+        # state.resultを共通1時間retentionへ残さず、待機中callerの参照だけにする。
+        await _registry.remove(state.request_id, state)
+
+
+@app.post(
+    "/api/conversations/{conversation_id}/turns/{turn_request_id}/regenerate",
+    dependencies=[Depends(check_auth)],
+)
+async def regenerate_turn_result(
+    conversation_id: str,
+    turn_request_id: str,
+    req: RegenerationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    canonical_id = _canonical_conversation_id(conversation_id)
+    assert canonical_id is not None
+    if not _valid_request_id(turn_request_id):
+        raise HTTPException(status_code=404, detail="対象ターンが見つかりません")
+    fingerprint = regeneration.fingerprint(
+        canonical_id,
+        turn_request_id,
+        target=req.target,
+        provider=req.provider,
+    )
+    saved_replay = await _blocking_call(
+        _saved_regeneration_replay,
+        canonical_id,
+        turn_request_id,
+        req.regeneration_id,
+        fingerprint,
+    )
+    if saved_replay is not None:
+        return saved_replay
+    await _rate_limiter.check(_rate_limit_key(request), req.regeneration_id)
+    state, created = await _registry.claim(
+        req.regeneration_id,
+        lambda: _new_run_state(
+            req.regeneration_id,
+            canonical_id,
+            fingerprint,
+            kind="regeneration",
+        ),
+    )
+    if (
+        state.kind != "regeneration"
+        or state.request_fingerprint != fingerprint
+        or state.conversation_id != canonical_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="regeneration_idが異なる要求で使用済みです",
+        )
+
+    if created:
+        try:
+            claimed = await _claim_conversation_run(
+                canonical_id,
+                req.regeneration_id,
+            )
+        except BaseException:
+            await _release_conversation_run(canonical_id, req.regeneration_id)
+            await state.finish()
+            await _registry.remove(req.regeneration_id, state)
+            raise
+        if not claimed:
+            state.failure_status = 409
+            state.failure_detail = {
+                "code": "conversation_busy",
+                "message": "この会話では別の生成処理が実行中です。",
+            }
+            await state.finish()
+            await _registry.remove(req.regeneration_id, state)
+        else:
+            try:
+                started = await _registry.start(
+                    state,
+                    lambda: _execute_regeneration(
+                        state,
+                        canonical_id,
+                        turn_request_id,
+                        req,
+                        fingerprint,
+                    ),
+                )
+            except BaseException:
+                # task作成後はbackground runnerがclaimを所有する。作成前に
+                # handlerだけがcancelされた場合に限り、ここで解放する。
+                if state.task is None:
+                    await _release_conversation_run(
+                        canonical_id,
+                        req.regeneration_id,
+                    )
+                    await state.finish()
+                    await _registry.remove(req.regeneration_id, state)
+                raise
+            if not started:
+                await _release_conversation_run(canonical_id, req.regeneration_id)
+                state.terminal_outcome = "cancelled"
+                state.failure_status = 409
+                state.failure_detail = {
+                    "code": "regeneration_cancelled",
+                    "message": "再生成は開始前にキャンセルされました。",
+                }
+                await state.finish()
+
+    task = state.task
+    if task is not None and not state.done:
+        await asyncio.shield(task)
+    elif not state.done:
+        await state.wait_finished()
+    if state.failure_status is not None:
+        raise HTTPException(
+            status_code=state.failure_status,
+            detail=state.failure_detail,
+        )
+    result = deepcopy(state.result) if isinstance(state.result, dict) else {}
+    if not created and result:
+        result["replayed"] = True
+    return result
 
 
 @app.post("/api/plan", dependencies=[Depends(check_auth)])
 def plan(req: PlanRequest) -> dict[str, Any]:
     """課金APIを一切呼ばず、現在の設定による会議の安全側上限を返す。"""
-    return _plan_from_request(req)
+    public = _scrub_public(_plan_from_request(req))
+    return public if isinstance(public, dict) else {}
 
 
 @app.post("/api/policy/scan", dependencies=[Depends(check_auth)])
 def scan_policy(req: PolicyScanRequest) -> dict[str, Any]:
     """課金APIや外部サービスを使わず、送信前の文字列をローカル検査する。"""
-    return policy.scan_text(req.text)
+    public = _scrub_public(policy.scan_text(req.text))
+    return public if isinstance(public, dict) else {}
 
 
 @app.post("/api/conversations", dependencies=[Depends(check_auth)])
@@ -1965,14 +2204,15 @@ async def upload_attachment(
 ) -> dict[str, Any]:
     canonical_id = _canonical_conversation_id(conversation_id)
     assert canonical_id is not None
-    try:
-        store.load(canonical_id)
-    except ConversationNotFound as exc:
-        raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
-    try:
-        item = await attachment_store.save_upload(canonical_id, file)
-    except attachments.AttachmentError as exc:
-        raise _attachment_http_exception(exc) from exc
+    async with _hold_conversation_lock(canonical_id):
+        try:
+            await _blocking_call(store.load, canonical_id)
+        except ConversationNotFound as exc:
+            raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
+        try:
+            item = await attachment_store.save_upload(canonical_id, file)
+        except attachments.AttachmentError as exc:
+            raise _attachment_http_exception(exc) from exc
     public = _scrub_public(item)
     return public if isinstance(public, dict) else {}
 
@@ -1993,6 +2233,7 @@ def download_attachment(conversation_id: str, attachment_id: str) -> FileRespons
         path,
         media_type=str(metadata["mime_type"]),
         filename=str(metadata["name"]),
+        headers={"X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -2000,13 +2241,25 @@ def download_attachment(conversation_id: str, attachment_id: str) -> FileRespons
     "/api/conversations/{conversation_id}/attachments/{attachment_id}",
     dependencies=[Depends(check_auth)],
 )
-def delete_attachment(conversation_id: str, attachment_id: str) -> dict[str, bool]:
+async def delete_attachment(
+    conversation_id: str,
+    attachment_id: str,
+) -> dict[str, bool]:
     canonical_id = _canonical_conversation_id(conversation_id)
     assert canonical_id is not None
-    try:
-        attachment_store.delete(canonical_id, attachment_id)
-    except attachments.AttachmentError as exc:
-        raise _attachment_http_exception(exc) from exc
+    async with _hold_conversation_lock(canonical_id):
+        try:
+            await _blocking_call(store.load, canonical_id)
+        except ConversationNotFound as exc:
+            raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
+        try:
+            await _blocking_call(
+                attachment_store.delete,
+                canonical_id,
+                attachment_id,
+            )
+        except attachments.AttachmentError as exc:
+            raise _attachment_http_exception(exc) from exc
     return {"ok": True}
 
 
@@ -2084,13 +2337,13 @@ def export_conversation_archive(conversation_id: str) -> FileResponse:
 async def rename_conversation(conversation_id: str, req: RenameRequest) -> dict[str, Any]:
     canonical_id = _canonical_conversation_id(conversation_id)
     assert canonical_id is not None
-    async with _conversation_locks[canonical_id]:
+    async with _hold_conversation_lock(canonical_id):
         try:
-            data = store.load(canonical_id)
+            data = await _blocking_call(store.load, canonical_id)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
         data["title"] = req.title.strip()
-        store.save(data)
+        await _blocking_call(store.save, data)
         public = _scrub_public(store.summary(data))
         return public if isinstance(public, dict) else {}
 
@@ -2106,9 +2359,9 @@ async def update_conversation_memory(
     """会話ごとのローカルメモを楽観lock付きで更新する。"""
     canonical_id = _canonical_conversation_id(conversation_id)
     assert canonical_id is not None
-    async with _conversation_locks[canonical_id]:
+    async with _hold_conversation_lock(canonical_id):
         try:
-            conversation_data = store.load(canonical_id)
+            conversation_data = await _blocking_call(store.load, canonical_id)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
         current = conversation_data.get("memory")
@@ -2136,7 +2389,7 @@ async def update_conversation_memory(
             "updated_at": utc_now(),
             "secret_candidates_redacted": scan["action"] == "block",
         }
-        store.save(conversation_data)
+        await _blocking_call(store.save, conversation_data)
         public = _scrub_public(conversation_data)
         return public if isinstance(public, dict) else {}
 
@@ -2154,9 +2407,10 @@ async def fork_conversation_at_turn(
     assert canonical_id is not None
     if not _valid_request_id(turn_request_id):
         raise HTTPException(status_code=404, detail="対象ターンが見つかりません")
-    async with _conversation_locks[canonical_id]:
+    async with _hold_conversation_lock(canonical_id):
+        await _reject_destructive_change_during_run(canonical_id)
         try:
-            parent = store.load(canonical_id)
+            parent = await _blocking_call(store.load, canonical_id)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
         turn_index = _turn_index_by_request_id(parent, turn_request_id)
@@ -2166,7 +2420,8 @@ async def fork_conversation_at_turn(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="完了済みターンだけを編集分岐できます",
             )
-        branch = store.create_branch(
+        branch = await _blocking_call(
+            store.create_branch,
             parent,
             before_turn_index=turn_index,
             parent_turn_request_id=turn_request_id,
@@ -2179,10 +2434,11 @@ async def fork_conversation_at_turn(
 async def delete_conversation(conversation_id: str) -> dict[str, bool]:
     canonical_id = _canonical_conversation_id(conversation_id)
     assert canonical_id is not None
-    async with _conversation_locks[canonical_id]:
+    async with _hold_conversation_lock(canonical_id):
+        await _reject_destructive_change_during_run(canonical_id)
         try:
-            attachment_store.delete_conversation(canonical_id)
-            store.delete(canonical_id)
+            await _blocking_call(attachment_store.delete_conversation, canonical_id)
+            await _blocking_call(store.delete, canonical_id)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
         return {"ok": True}
@@ -2190,59 +2446,147 @@ async def delete_conversation(conversation_id: str) -> dict[str, bool]:
 
 @app.post("/api/chat", dependencies=[Depends(check_auth)])
 async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
-    run_plan = _plan_from_request(req)
-    _enforce_run_limits(run_plan)
-    _enforce_explicit_confirmations(run_plan, req)
     request_id = _resolve_request_id(req, request)
     start_index = _last_event_index(request)
     requested_conversation_id = _canonical_conversation_id(req.conversation_id)
     fingerprint = _request_fingerprint(req)
-    if start_index > 0:
-        resumable = await _registry.lookup(request_id)
-        if resumable is None and store.find_conversation_by_request_id(request_id) is None:
+    try:
+        found = await _blocking_call(
+            store.find_conversation_by_request_id,
+            request_id,
+            preferred_conversation_id=requested_conversation_id,
+        )
+    except AmbiguousRequestId as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "request_id_ambiguous",
+                "message": "request_idが複数の分岐会話に存在します。会話IDを指定してください。",
+            },
+        ) from exc
+    if found is not None:
+        found_conversation, found_turn = found
+        if (
+            requested_conversation_id is not None
+            and requested_conversation_id != found_conversation["id"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="request_idが別の会話で使用済みです",
+            )
+        saved_fingerprint = found_turn.get("request_fingerprint")
+        if isinstance(saved_fingerprint, str) and saved_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="request_idが異なるリクエストで使用済みです",
+            )
+        candidate_conversation_id = str(found_conversation["id"])
+        create_conversation = False
+    elif requested_conversation_id is not None:
+        try:
+            await _blocking_call(store.load, requested_conversation_id)
+        except ConversationNotFound as exc:
+            raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
+        candidate_conversation_id = requested_conversation_id
+        create_conversation = False
+    else:
+        candidate_conversation_id = str(uuid.uuid4())
+        create_conversation = True
+
+    # 保存済み結果や実行中stateは課金を発生させない再生・joinである。
+    # 現在の添付TTL、runtime設定、予算、確認フラグで再計画する前に返す。
+    if found is not None:
+        state, created = await _registry.claim(
+            request_id,
+            lambda: _new_run_state(
+                request_id,
+                candidate_conversation_id,
+                fingerprint,
+            ),
+        )
+        if state.kind != "chat" or state.request_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="request_idが異なるリクエストで使用済みです",
+            )
+        if (
+            requested_conversation_id is not None
+            and requested_conversation_id != state.conversation_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="request_idが別の会話で使用済みです",
+            )
+        if created:
+            found_conversation, found_turn = found
+            for event, data in _events_from_saved_turn(
+                found_conversation,
+                found_turn,
+            ):
+                await state.publish(event, data)
+            await state.finish()
+        if start_index > len(state.events):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "resume_not_available",
                     "message": "指定されたLast-Event-IDを再開できません",
-                    "max_event_id": 0,
+                    "max_event_id": len(state.events),
                 },
             )
-    await _rate_limiter.check(_rate_limit_key(request), request_id)
+        return _stream_response(state, start_index)
 
-    def state_factory() -> RunState:
-        found = store.find_conversation_by_request_id(request_id)
-        if found is not None:
-            conversation_data, saved_turn = found
-            if (
-                requested_conversation_id is not None
-                and requested_conversation_id != conversation_data["id"]
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="request_idが別の会話で使用済みです",
-                )
-            saved_fingerprint = saved_turn.get("request_fingerprint")
-            if isinstance(saved_fingerprint, str) and saved_fingerprint != fingerprint:
-                raise HTTPException(
-                    status_code=409,
-                    detail="request_idが異なるリクエストで使用済みです",
-                )
-        elif requested_conversation_id is not None:
-            try:
-                conversation_data = store.load(requested_conversation_id)
-            except ConversationNotFound as exc:
-                raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
-        else:
-            conversation_data = store.create(req.message)
-        return RunState(
-            request_id=request_id,
-            conversation_id=conversation_data["id"],
-            request_fingerprint=fingerprint,
+    resumable = await _registry.lookup(request_id)
+    if resumable is not None:
+        if (
+            resumable.kind != "chat"
+            or resumable.request_fingerprint != fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="request_idが異なるリクエストで使用済みです",
+            )
+        if (
+            requested_conversation_id is not None
+            and requested_conversation_id != resumable.conversation_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="request_idが別の会話で使用済みです",
+            )
+        if start_index > len(resumable.events):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "resume_not_available",
+                    "message": "指定されたLast-Event-IDを再開できません",
+                    "max_event_id": len(resumable.events),
+                },
+            )
+        return _stream_response(resumable, start_index)
+
+    if start_index > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "resume_not_available",
+                "message": "指定されたLast-Event-IDを再開できません",
+                "max_event_id": 0,
+            },
         )
-
-    state, created = await _registry.claim(request_id, state_factory)
-    if state.request_fingerprint != fingerprint:
+    run_plan = await _blocking_call(_plan_from_request, req)
+    _enforce_run_limits(run_plan)
+    _enforce_explicit_confirmations(run_plan, req)
+    await _rate_limiter.check(_rate_limit_key(request), request_id)
+    state, created = await _registry.claim(
+        request_id,
+        lambda: _new_run_state(
+            request_id,
+            candidate_conversation_id,
+            fingerprint,
+        ),
+    )
+    if state.kind != "chat" or state.request_fingerprint != fingerprint:
         raise HTTPException(
             status_code=409,
             detail="request_idが異なるリクエストで使用済みです",
@@ -2254,18 +2598,45 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         raise HTTPException(status_code=409, detail="request_idが別の会話で使用済みです")
 
     if created:
-        conversation_data = store.load(state.conversation_id)
+        try:
+            if create_conversation:
+                conversation_data = await _blocking_call(
+                    store.create,
+                    req.message,
+                    conversation_id=state.conversation_id,
+                )
+            else:
+                conversation_data = await _blocking_call(
+                    store.load,
+                    state.conversation_id,
+                )
+        except BaseException:
+            await state.finish()
+            await _registry.remove(request_id, state)
+            raise
         saved_turn = store.find_turn_by_request_id(conversation_data, request_id)
         if saved_turn is not None:
             for event, data in _events_from_saved_turn(conversation_data, saved_turn):
                 await state.publish(event, data)
             await state.finish()
         else:
-            claimed = await _claim_conversation_run(
-                state.conversation_id,
-                state.request_id,
-            )
+            try:
+                claimed = await _claim_conversation_run(
+                    state.conversation_id,
+                    state.request_id,
+                )
+            except BaseException:
+                # claim完了境界でcallerがcancelされても、task未割当の
+                # registry/会話claimを残さない。
+                await _release_conversation_run(
+                    state.conversation_id,
+                    state.request_id,
+                )
+                await state.finish()
+                await _registry.remove(request_id, state)
+                raise
             if not claimed:
+                await state.finish()
                 await _registry.remove(request_id, state)
                 raise HTTPException(
                     status_code=409,
@@ -2275,18 +2646,78 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     },
                 )
             try:
-                budget_guard.reserve(
+                if state.cancel_requested:
+                    await _release_conversation_run(
+                        state.conversation_id,
+                        state.request_id,
+                    )
+                    await state.publish(
+                        "error",
+                        {
+                            "request_id": state.request_id,
+                            "message": "会議がキャンセルされました",
+                            "cancelled": True,
+                        },
+                    )
+                    await state.publish(
+                        "done",
+                        {
+                            "request_id": state.request_id,
+                            "failed": True,
+                            "cancelled": True,
+                        },
+                    )
+                    await state.finish()
+                    return _stream_response(state, start_index)
+
+                # claim後に再計画し、履歴・memory・添付・予算のTOCTOUを閉じる。
+                run_plan = await _blocking_call(_plan_from_request, req)
+                _enforce_run_limits(run_plan)
+                _enforce_explicit_confirmations(run_plan, req)
+                await _blocking_call(
+                    budget_guard.reserve,
                     request_id=state.request_id,
                     request_fingerprint=state.request_fingerprint,
                     plan=run_plan,
                     store=store,
+                    reservation_owner=state.execution_id,
                 )
-                state.task = asyncio.create_task(_execute_run(state, req))
+                started = await _registry.start(
+                    state,
+                    lambda: _execute_run(state, req),
+                )
+                if not started:
+                    await _blocking_call(
+                        budget_guard.release_undispatched,
+                        state.request_id,
+                    )
+                    await _release_conversation_run(
+                        state.conversation_id,
+                        state.request_id,
+                    )
+                    await state.publish(
+                        "error",
+                        {
+                            "request_id": state.request_id,
+                            "message": "会議がキャンセルされました",
+                            "cancelled": True,
+                        },
+                    )
+                    await state.publish(
+                        "done",
+                        {
+                            "request_id": state.request_id,
+                            "failed": True,
+                            "cancelled": True,
+                        },
+                    )
+                    await state.finish()
             except finance.BudgetViolation as exc:
                 await _release_conversation_run(
                     state.conversation_id,
                     state.request_id,
                 )
+                await state.finish()
                 await _registry.remove(request_id, state)
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -2296,13 +2727,20 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         "budget": exc.snapshot,
                     },
                 ) from exc
-            except Exception:
-                budget_guard.release_undispatched(state.request_id)
-                await _release_conversation_run(
-                    state.conversation_id,
-                    state.request_id,
-                )
-                await _registry.remove(request_id, state)
+            except BaseException:
+                # task作成後は_execute_runが予算・conversation claimを所有する。
+                # start handshake中にcallerがcancelされても二重解放しない。
+                if state.task is None:
+                    await _blocking_call(
+                        budget_guard.release_undispatched,
+                        state.request_id,
+                    )
+                    await _release_conversation_run(
+                        state.conversation_id,
+                        state.request_id,
+                    )
+                    await state.finish()
+                    await _registry.remove(request_id, state)
                 raise
     if start_index > len(state.events):
         raise HTTPException(
@@ -2320,14 +2758,22 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 async def cancel_run(request_id: str) -> dict[str, Any]:
     if not _valid_request_id(request_id):
         raise HTTPException(status_code=404, detail="実行中の会議が見つかりません")
-    state = await _registry.lookup(request_id)
+    state, task, already_done = await _registry.request_cancel(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="実行中の会議が見つかりません")
-    if state.done or state.task is None or state.task.done():
-        return {"ok": True, "already_done": True, "request_id": request_id}
-    state.task.cancel()
+    if already_done:
+        return {
+            "ok": True,
+            "already_done": True,
+            "request_id": request_id,
+            "cancelled": state.terminal_outcome == "cancelled",
+            "terminal_outcome": state.terminal_outcome,
+        }
     try:
-        await asyncio.wait_for(asyncio.shield(state.task), timeout=5.0)
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        else:
+            await state.wait_finished(timeout=5.0)
     except asyncio.CancelledError:
         pass
     except asyncio.TimeoutError:
@@ -2337,7 +2783,8 @@ async def cancel_run(request_id: str) -> dict[str, Any]:
     return {
         "ok": True,
         "cancellation_requested": True,
-        "cancelled": state.done,
+        "cancelled": state.terminal_outcome == "cancelled",
+        "terminal_outcome": state.terminal_outcome,
         "provider_stop_guaranteed": False,
         "warning": "外部Provider側の処理停止・課金停止は保証されません",
         "request_id": request_id,

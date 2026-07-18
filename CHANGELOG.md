@@ -4,9 +4,108 @@
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、バージョン番号は
 [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [Unreleased]
+
+### Added
+
+- chatと再生成が共有する `runs.py` のbackground run state machine、cancel handshake、会話lock pool、
+  自動回収するrate limiterと、その単体回帰test。
+- 再生成target、fingerprint、attempt遷移、確認判定を純粋関数として分離した `regeneration.py`。
+- Flutterの会話選択・世代guardを担う `ConversationSelectionController` と、live run・SSE終端・idle監視を担う
+  `LiveRunController` / `LiveStreamSession`。
+- 組織管理telemetryへProvider別の実効window、予算windowとの一致状態、Anthropicの最終完全UTC bucketを追加し、
+  Flutter利用状況画面でも不一致を常時表示。
+
+### Changed
+
+- 公開上の製品名を `Clage Cook` へ統一し、README、設計・運用文書、OpenAPIタイトル、CLIヘルプ、
+  Flutter package説明、User-Agent、内部alias/cache namespaceから製品名としての `OSS` 接尾辞を削除した。
+- `CLAGE_LIVE_API_ENABLED=true` でAPIキーが0件の場合は暗黙のMockへ移行せず、参加Providerなしとして
+  fail-closedにした。Mock混在は `INCLUDE_MOCK_PROVIDERS=true` の明示時だけ許可する。
+- 対応Claude modelへtier別 `output_config.effort` とadaptive thinkingを反映し、Web検索toolを
+  `web_search_20260318` へ更新した。非対応・未知modelはbasic版へ安全にfallbackする。
+- Anthropic管理telemetryは任意offsetの予算windowを同一期間と見せず、UTC日次bucketの問い合わせ期間と
+  `complete_through` を別metadataとして返す。cache keyも予算日の切替で失効する。
+- request ID indexと、ConversationStore revision・予算日・price versionをkeyにしたBudgetGuardの
+  actual-cost snapshot cacheを導入し、budget判定の重複full scanを削減した。local usage telemetryは
+  引き続きrequestごとに全conversation JSONを走査する。
+- durable SSE保存はanswer/synthesis checkpointと終端turn保存へ絞った。終端保存ではその時点までの
+  非終端生成eventをjournalへ確定し、再生時の `error` / `done` はdurableなturn状態から再構成する。
+- admin telemetryは既定OFF・read-only・別資格情報の境界を維持し、financeは未観測課金を0円解放しない
+  fail-closed予算予約として保持した。管理値とlocal推定を請求書として混合しない。
+- dispatch直前の会話・添付・runtime model snapshotからauthoritative planを再構築し、参加Provider/modelと
+  統合Provider/modelをrun完了まで固定した。予算予約も同じplanと予算日でatomicに再検証する。
+- 完了した再生成stateはdurable attemptから再生できるためregistryから直ちに除去し、conversation全体を含む
+  `state.result` を共通の `RUN_RETENTION_SEC`（既定1時間）へ保持しないようにした。
+
+### Fixed
+
+- HTTP 529を含む全5xxをretry対象にし、数値/HTTP-dateの `Retry-After` を尊重した。60秒を超える指定では
+  早すぎる再試行も長時間sleepも行わず、そのcallを失敗として返す。
+- Claudeの `refusal` をallowlist済み固定分類で通知し、`pause_turn` をpartial/incompleteとして保持した。
+  Geminiの `budget_exceeded` もincomplete reasonとして保持する。
+- chatのProvider送信前に失敗・cancelされた予算予約を解放し、送信後のusage不明予約だけを照合待ちへ残すよう
+  所有権を整理した。開始handshake中のcancelによるtask/予約の二重解放raceも解消した。
+- 起動時に再生成attemptの `reserved` / `dispatching` / `running` を `interrupted` へ復旧し、再生成を
+  background registry、再接続可能な同一ID、cancel endpointへ統合した。Provider実行中は会話lockを保持しない。
+- 過去turnを別日に再生成した費用を元turnの日付へ誤帰属して日次budgetから漏らす問題を修正し、予約時の
+  `budget_day`、attempt日時、turn日時の順でattemptごとに集計するよう変更した。
+- branchにcopyされた同一turn/attemptのusage・費用を全会話集計で二重加算する問題と、
+  重複request ID indexが親の正当なreplayを別branchへ誤結合する問題を修正した。
+- settled予約へ実測換算額をdurable保存し、conversation削除後も当日のcommitから消えないようにした。
+  応答modelを価格換算できない場合は予約上限を保持し、手動reconciliationも既知実測額または予約上限を
+  `settled_after_manual_reconciliation` として残す。
+- cached inputの包含関係をProvider別に正規化した。Anthropicの `input_tokens` はcache read/writeとは独立した
+  uncached区分として使い、他Providerでは正規化済みinputからcached inputを差し引いて二重計上を防ぐ。
+- reasoning課金をProvider response shape別に正規化した。Gemini Interactionsの `total_thought_tokens` だけを
+  output外数として加算し、OpenAI/xAI Responsesのreasoning内包outputを二重加算しない。旧xAI Chat互換shapeの
+  durable Grok usageは `total_tokens - input_tokens` をfallbackにしてcompletion外数を保持する。
+- active予約のgross額と同じrequestで観測済みの実績を重ねず、差額だけを
+  `active_reservation_top_up` としてcommittedへ加えるよう修正した。APIとFlutterは予約総額と追加拘束を別表示する。
+- branch片側で再生成した際に既存回答を包むoriginal attemptを元turnと同じbilling identityへ戻し、未包装の
+  copy元回答との二重費用・token計上をfinanceとlocal usage telemetryの双方で防いだ。実際の追加再生成attemptは
+  独立identityのまま保持する。
+- registryから完了stateを即時除去した後の保存済みterminal再生成replayを、rate limiterとactive conversation
+  claimより前に解決し、外部呼出を行わない同一結果が新規実行向けの429/409で拒否される問題を修正した。
+- 解放済み予算予約の無条件再利用、照合待ち/確定済みIDの再dispatch、run slot待機中の日跨ぎ、
+  ownerの異なる同一予約を状態別遷移・dispatch直前refresh・durable `budget_reservation` で防止した。
+- cancelを複数回送ったときcleanupへ再度 `CancelledError` を注入してconversation claimを残す問題を修正し、
+  shutdown時もbackground runをcancel・回収してからdata directory lockを解放するようにした。
+- Provider結果後のchat/再生成について、終端保存・budget settle・結果公開をcancelから保護し、先に確定した
+  completed/failedをcancelledで上書きしないようにした。cancel APIは `terminal_outcome` を返し、Flutterも
+  完了・失敗・停止を対応する確定表示とiconへ分ける。再生成Provider failure後のcleanup中のcancelもfailedを
+  維持し、未確定usageの台帳settleと `cancelled=false` のdurable attempt中断記録を完走する。
+- SSE bodyの完全沈黙を90秒で切断状態へ移し、keepalive commentでidle期限を更新するようにした。
+  Content-Type、event ID永続/リセット/NUL、Unicode安全なerror切詰め、非2xx bodyの10秒/64 KiB上限も修正した。
+- Flutterのrefresh/会話切替と添付uploadの世代race、未保存URLへのruntime PATCH、メモdialog label、
+  preflight error欠落を修正した。読込中会話への誤送信、stream resource残留、旧接続先statusの誤表示も防止した。
+- 会話lock/rate-limit entryの無限増加、cancel直前の偽 `already_done`、plan実行間TOCTOU、公開routeの
+  scrub漏れ、insightsの丸め平均と重複数値scanを修正した。
+- 再生成実行時の追加system指示をplan入力量に含め、内部failureをuser cancelとして永続化する分類ミスを修正した。
+- conversation upload/deleteを同じlockへ統合し、削除中uploadのorphan化を防いた。重いstore・budget I/Oも
+  async実行経路からthreadへ逃がし、全会話scan中の長時間store lock保持を廃止した。
+- runtime設定をplanごとに1回だけsnapshotし、再生成を含むProvider/model、SSE meta、全Provider失敗時の
+  synthesis sourceが途中の設定変更と混在しないようにした。
+- 保存済みchat replayと実行中runへのjoinを新規plan・添付TTL・予算・確認判定より先に解決し、無課金の
+  再接続が現在設定で拒否される問題を修正した。添付順序もrequest fingerprintへ含めた。
+- 部分的なprice tableでも判明済みrateカテゴリをknown subtotalへ加え、unknown `allow` 時に既知費用を
+  予約から落とさないようにした。mock/skipped entryは実費の未価格requestへ数えない。
+
+### Security
+
+- Web版ではBearer tokenがbrowser storage上にあり、XSS・拡張機能・共有端末から十分に保護されない旨を
+  設定画面へ常時表示した。
+- PDF text抽出を10秒上限の隔離subprocessへ移し、元添付の起動時/access時TTL purgeとdownloadの
+  `X-Content-Type-Options: nosniff` を追加した。UTF-8 outputを明示し、stderrを保持せず、SHA-256/設定別の
+  process内5分/64件TTL/LRU single-flight cacheとsubprocess同時2件上限を設けた。抽出cacheの期限切れは
+  cache access時に除去し、process再起動時はcache全体を破棄する。
+- live Web検索のtool別課金をtoken単価だけで「完全な金額見積もり」と扱う問題を修正し、
+  budget有効時はunknown-cost policyでfail-closedまたは明示警告付き実行にした。`allow` でも価格判明済みの
+  token小計は会議・日次上限で検査・予約し、不明なtool料金だけをlocal上限外として扱う。
+
 ## [0.2.0] - 2026-07-18
 
-後方互換性を前提としない、最初の実用的なBYOK OSS版です。
+後方互換性を前提としない、公開を想定した最初の実用的なBYOK版です。repositoryは公開準備中のprivateです。
 
 ### Added
 

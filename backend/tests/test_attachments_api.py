@@ -3,10 +3,12 @@
 import asyncio
 import io
 import json
+import subprocess
 from collections import defaultdict
 
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
+import pytest
 
 import attachments
 import config
@@ -61,6 +63,11 @@ def test_text_attachment_is_opaque_owned_and_included_in_plan_and_turn(
     assert item["name"] == "notes.txt"
     assert item["text_extractable"] is True
     assert ".attachments" not in json.dumps(item)
+    downloaded = client.get(
+        f"/api/conversations/{conversation['id']}/attachments/{item['id']}"
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
 
     plan = client.post(
         "/api/plan",
@@ -87,6 +94,41 @@ def test_text_attachment_is_opaque_owned_and_included_in_plan_and_turn(
     assert saved["message"] == "資料を要約して"
     assert saved["attachment_ids"] == [item["id"]]
     assert saved["attachments"][0]["included_in_prompt"] is True
+
+
+def test_reversing_attachment_order_is_a_different_request_fingerprint(
+    tmp_path,
+    monkeypatch,
+):
+    _reset(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    conversation = client.post("/api/conversations").json()
+    first = client.post(
+        f"/api/conversations/{conversation['id']}/attachments",
+        files={"file": ("first.txt", b"first", "text/plain")},
+    ).json()
+    second = client.post(
+        f"/api/conversations/{conversation['id']}/attachments",
+        files={"file": ("second.txt", b"second", "text/plain")},
+    ).json()
+    base = {
+        "message": "compare in order",
+        "conversation_id": conversation["id"],
+        "request_id": "attachment-order-request",
+    }
+
+    original = client.post(
+        "/api/chat",
+        json={**base, "attachment_ids": [first["id"], second["id"]]},
+    )
+    reversed_order = client.post(
+        "/api/chat",
+        json={**base, "attachment_ids": [second["id"], first["id"]]},
+    )
+
+    assert original.status_code == 200
+    assert reversed_order.status_code == 409
+    assert len(main.store.load(conversation["id"])["turns"]) == 1
 
 
 def test_attachment_cannot_be_used_from_another_conversation(tmp_path, monkeypatch):
@@ -179,3 +221,85 @@ def test_pdf_attachment_is_signature_checked_and_extracted(tmp_path, monkeypatch
     )
     assert plan.status_code == 200
     assert plan.json()["attachments"]["text_included_count"] == 1
+
+
+def test_expired_attachments_can_be_purged_without_an_access(tmp_path, monkeypatch):
+    _reset(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    conversation = client.post("/api/conversations").json()
+    item = client.post(
+        f"/api/conversations/{conversation['id']}/attachments",
+        files={"file": ("old.txt", b"old", "text/plain")},
+    ).json()
+    metadata_path = (
+        main.attachment_store.root
+        / conversation["id"]
+        / f"{item['id']}.json"
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = "2000-01-01T00:00:00.000Z"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert main.attachment_store.purge_expired() == 1
+    assert not metadata_path.exists()
+    assert not metadata_path.with_suffix(".blob").exists()
+
+
+def test_pdf_extraction_is_isolated_and_has_a_hard_timeout(tmp_path, monkeypatch):
+    store = attachments.AttachmentStore(tmp_path)
+    conversation_id = "12345678-1234-4234-8234-123456789abc"
+    attachment_id = "87654321-4321-4321-8321-cba987654321"
+    directory = store.root / conversation_id
+    directory.mkdir(parents=True)
+    (directory / f"{attachment_id}.blob").write_bytes(b"%PDF-1.7\n")
+    metadata = {
+        "conversation_id": conversation_id,
+        "id": attachment_id,
+        "kind": "pdf",
+    }
+    observed = {}
+
+    def timeout(command, **kwargs):
+        observed["command"] = command
+        observed["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(attachments.subprocess, "run", timeout)
+    with pytest.raises(attachments.AttachmentError) as caught:
+        store._extract_text(metadata)
+
+    assert caught.value.code == "attachment_pdf_timeout"
+    assert "-I" in observed["command"]
+    assert observed["timeout"] == attachments._PDF_EXTRACT_TIMEOUT_SEC
+
+
+def test_pdf_subprocess_uses_explicit_utf8_and_discards_stderr(tmp_path, monkeypatch):
+    store = attachments.AttachmentStore(tmp_path)
+    conversation_id = "12345678-1234-4234-8234-123456789abc"
+    attachment_id = "87654321-4321-4321-8321-cba987654321"
+    directory = store.root / conversation_id
+    directory.mkdir(parents=True)
+    (directory / f"{attachment_id}.blob").write_bytes(b"%PDF-1.7\n")
+    metadata = {
+        "conversation_id": conversation_id,
+        "id": attachment_id,
+        "kind": "pdf",
+    }
+    observed = {}
+
+    def complete(command, **kwargs):
+        observed["command"] = command
+        observed["stdout"] = kwargs["stdout"]
+        observed["stderr"] = kwargs["stderr"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="日本語と絵文字🍳".encode("utf-8"),
+        )
+
+    monkeypatch.setattr(attachments.subprocess, "run", complete)
+
+    assert store._extract_text(metadata) == "日本語と絵文字🍳"
+    assert "sys.stdout.buffer.write" in observed["command"][3]
+    assert observed["stdout"] is subprocess.PIPE
+    assert observed["stderr"] is subprocess.DEVNULL

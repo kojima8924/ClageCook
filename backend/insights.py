@@ -232,9 +232,7 @@ def analyze_insights(
         comparison_totals[right] += 1
 
     agreement_score = (
-        sum(float(item["similarity"]) for item in pairwise) / len(pairwise)
-        if pairwise
-        else 0.0
+        sum(similarity_totals.values()) / (2 * len(pairwise)) if pairwise else 0.0
     )
     provider_similarities = {
         source: _rounded(similarity_totals[source] / comparison_totals[source])
@@ -461,14 +459,15 @@ def _caution_signals(text: str) -> list[dict[str, object]]:
                 }
             )
 
-    numeric_matches = _ordered_unique(
+    numeric_occurrences = [
         match.group(0).strip() for match in _NUMBER_PATTERN.finditer(text)
-    )
+    ]
+    numeric_matches = _ordered_unique(numeric_occurrences)
     if numeric_matches:
         signals.append(
             {
                 "type": "numeric_expression",
-                "count": sum(1 for _ in _NUMBER_PATTERN.finditer(text)),
+                "count": len(numeric_occurrences),
                 "matches": numeric_matches,
                 "description": _CAUTION_DESCRIPTIONS["numeric_expression"],
             }

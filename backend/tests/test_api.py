@@ -101,6 +101,37 @@ def test_chat_sse_persists_and_replays_idempotently(tmp_path, monkeypatch):
     assert len(main.store.load(conversation_id)["turns"]) == 1
 
 
+def test_saved_chat_replay_does_not_replan_or_require_current_confirmation(
+    tmp_path,
+    monkeypatch,
+):
+    _reset(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    payload = {
+        "message": "durable replay",
+        "request_id": "durable-replay-request",
+    }
+    first = client.post("/api/chat", json=payload)
+    assert first.status_code == 200
+    conversation_id = first.headers["x-conversation-id"]
+    monkeypatch.setattr(main, "_registry", main.RunRegistry())
+
+    def forbidden_replan(_req):
+        raise AssertionError("saved replay must not be replanned")
+
+    monkeypatch.setattr(main, "_plan_from_request", forbidden_replan)
+    replay = client.post(
+        "/api/chat",
+        json={**payload, "conversation_id": conversation_id},
+    )
+
+    assert replay.status_code == 200
+    records = _event_records(replay)
+    assert records[0][2]["replayed"] is True
+    assert records[-1][1] == "done"
+    assert len(main.store.load(conversation_id)["turns"]) == 1
+
+
 def test_fork_conversation_keeps_parent_and_copies_only_prefix(tmp_path, monkeypatch):
     _reset(tmp_path, monkeypatch)
     parent = main.store.create("branch parent")
@@ -540,12 +571,24 @@ def test_only_allowlisted_provider_error_code_reaches_public_data(monkeypatch):
             "error_code": "arbitrary-vendor-code",
         },
     )
+    refusal = main._sanitize_event_data(
+        "answer",
+        {
+            "source": "claude",
+            "ok": False,
+            "error": raw,
+            "error_code": "model_refusal",
+        },
+    )
 
     assert billing["error_code"] == "billing_or_credit_required"
     assert billing["error"] == (
         "プロバイダの請求設定またはクレジット残高を確認してください"
     )
     assert raw not in str(billing)
+    assert refusal["error_code"] == "model_refusal"
+    assert refusal["error"] == "モデルのポリシー判定により回答が拒否されました"
+    assert raw not in str(refusal)
     assert "error_code" not in arbitrary
     assert arbitrary["error"] == "AIからの回答取得に失敗しました"
     assert raw not in str(arbitrary)

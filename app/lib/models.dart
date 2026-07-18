@@ -481,6 +481,7 @@ class BudgetSnapshot {
     this.dailyLimitUsd,
     this.todayActualUsd,
     this.todayReservedUsd,
+    this.todayActiveReservationTopUpUsd,
     this.todayCommittedUsd,
     this.todayRemainingUsd,
     this.day = '',
@@ -509,6 +510,9 @@ class BudgetSnapshot {
       dailyLimitUsd: _nullableText(limits['daily_usd']),
       todayActualUsd: _nullableText(today['actual_estimated_usd']),
       todayReservedUsd: _nullableText(today['active_reservations_usd']),
+      todayActiveReservationTopUpUsd: _nullableText(
+        today['active_reservation_top_up_usd'],
+      ),
       todayCommittedUsd: _nullableText(today['committed_usd']),
       todayRemainingUsd: _nullableText(today['remaining_usd']),
       day: today['day']?.toString() ?? '',
@@ -536,6 +540,7 @@ class BudgetSnapshot {
   final String? dailyLimitUsd;
   final String? todayActualUsd;
   final String? todayReservedUsd;
+  final String? todayActiveReservationTopUpUsd;
   final String? todayCommittedUsd;
   final String? todayRemainingUsd;
   final String day;
@@ -706,6 +711,7 @@ class AdminProviderTelemetry {
     this.hardLimitUsd,
     this.balanceSignConvention = '',
     this.errorCodes = const [],
+    this.window = const AdminProviderWindow(),
   });
 
   factory AdminProviderTelemetry.fromJson(Map<String, dynamic> json) {
@@ -716,6 +722,7 @@ class AdminProviderTelemetry {
     final billing =
         _dynamicMapOrNull(json['current_billing_period']) ?? const {};
     final limits = _dynamicMapOrNull(json['spending_limits']) ?? const {};
+    final window = _dynamicMapOrNull(json['window']);
     final errors = <String>[];
     void collect(Map<String, dynamic> section) {
       final code = _nullableText(section['error_code']);
@@ -744,6 +751,9 @@ class AdminProviderTelemetry {
       hardLimitUsd: _nullableText(limits['effective_hard_usd']),
       balanceSignConvention: credit['sign_convention']?.toString() ?? '',
       errorCodes: List.unmodifiable(errors),
+      window: window == null
+          ? const AdminProviderWindow()
+          : AdminProviderWindow.fromJson(window),
     );
   }
 
@@ -760,6 +770,57 @@ class AdminProviderTelemetry {
   final String? hardLimitUsd;
   final String balanceSignConvention;
   final List<String> errorCodes;
+  final AdminProviderWindow window;
+}
+
+/// Effective query window reported by one Provider's management API adapter.
+///
+/// Only presentation-safe window metadata is retained. Unknown fields are
+/// intentionally ignored so backend schema additions do not break the app.
+class AdminProviderWindow {
+  const AdminProviderWindow({
+    this.startingAt,
+    this.endingAt,
+    this.requestedStartingAt,
+    this.requestedEndingAt,
+    this.alignment,
+    this.bucketWidth,
+    this.exactBudgetWindow,
+    this.completeThrough,
+  });
+
+  factory AdminProviderWindow.fromJson(Map<String, dynamic> json) =>
+      AdminProviderWindow(
+        startingAt: _nullableString(json['starting_at']),
+        endingAt: _nullableString(json['ending_at']),
+        requestedStartingAt: _nullableString(json['requested_starting_at']),
+        requestedEndingAt: _nullableString(json['requested_ending_at']),
+        alignment: _nullableString(json['alignment']),
+        bucketWidth: _nullableString(json['bucket_width']),
+        exactBudgetWindow: json['exact_budget_window'] is bool
+            ? json['exact_budget_window'] as bool
+            : null,
+        completeThrough: _nullableString(json['complete_through']),
+      );
+
+  final String? startingAt;
+  final String? endingAt;
+  final String? requestedStartingAt;
+  final String? requestedEndingAt;
+  final String? alignment;
+  final String? bucketWidth;
+  final bool? exactBudgetWindow;
+  final String? completeThrough;
+
+  bool get hasData =>
+      startingAt != null ||
+      endingAt != null ||
+      requestedStartingAt != null ||
+      requestedEndingAt != null ||
+      alignment != null ||
+      bucketWidth != null ||
+      exactBudgetWindow != null ||
+      completeThrough != null;
 }
 
 class AdminTelemetrySnapshot {
@@ -877,6 +938,7 @@ class CancelRunResult {
     this.cancellationRequested = false,
     this.cancelled = false,
     this.alreadyDone = false,
+    this.terminalOutcome = '',
     this.providerStopGuaranteed = false,
     this.warning = '',
   });
@@ -888,6 +950,7 @@ class CancelRunResult {
         cancellationRequested: json['cancellation_requested'] == true,
         cancelled: json['cancelled'] == true,
         alreadyDone: json['already_done'] == true,
+        terminalOutcome: json['terminal_outcome']?.toString() ?? '',
         providerStopGuaranteed: json['provider_stop_guaranteed'] == true,
         warning: json['warning']?.toString() ?? '',
       );
@@ -897,6 +960,7 @@ class CancelRunResult {
   final bool cancellationRequested;
   final bool cancelled;
   final bool alreadyDone;
+  final String terminalOutcome;
   final bool providerStopGuaranteed;
   final String warning;
 }
@@ -1348,6 +1412,12 @@ int? _nullableInt(dynamic value) {
 String? _nullableText(dynamic value) {
   if (value == null) return null;
   final text = value.toString().trim();
+  return text.isEmpty ? null : text;
+}
+
+String? _nullableString(dynamic value) {
+  if (value is! String) return null;
+  final text = value.trim();
   return text.isEmpty ? null : text;
 }
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:clage_cook/models.dart';
@@ -183,6 +184,217 @@ void main() {
     client.close();
   });
 
+  test('chatはtext/event-stream以外の成功応答を即座に拒否する', () async {
+    final body = StreamController<List<int>>();
+    addTearDown(body.close);
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: _StreamingClient(
+        (_) async => http.StreamedResponse(
+          body.stream,
+          200,
+          headers: {'content-type': 'application/json'},
+        ),
+      ),
+    );
+
+    await expectLater(
+      client.startChat(message: '質問'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.message,
+          'message',
+          contains('text/event-stream'),
+        ),
+      ),
+    );
+    client.close();
+  });
+
+  test('chatの無応答HTTPエラー本文は上限時間で中断する', () async {
+    final cancelled = Completer<void>();
+    final body = StreamController<List<int>>(
+      onCancel: () {
+        if (!cancelled.isCompleted) cancelled.complete();
+      },
+    );
+    addTearDown(body.close);
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      errorBodyTimeout: const Duration(milliseconds: 35),
+      client: _StreamingClient(
+        (_) async => http.StreamedResponse(body.stream, 503),
+      ),
+    );
+
+    await expectLater(
+      client
+          .startChat(message: '質問')
+          .timeout(const Duration(milliseconds: 300)),
+      throwsA(
+        isA<ApiException>()
+            .having((error) => error.statusCode, 'statusCode', 503)
+            .having((error) => error.message, 'message', contains('タイムアウト')),
+      ),
+    );
+    expect(cancelled.isCompleted, isTrue);
+    client.close();
+  });
+
+  test('chatの巨大なHTTPエラー本文はbyte上限で中断する', () async {
+    final cancelled = Completer<void>();
+    late final StreamController<List<int>> body;
+    body = StreamController<List<int>>(
+      onListen: () {
+        scheduleMicrotask(
+          () => body.add(utf8.encode('prefix-${'x' * 100}-unreachable-tail')),
+        );
+      },
+      onCancel: () {
+        if (!cancelled.isCompleted) cancelled.complete();
+      },
+    );
+    addTearDown(body.close);
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      errorBodyTimeout: const Duration(milliseconds: 100),
+      errorBodyMaxBytes: 24,
+      client: _StreamingClient(
+        (_) async => http.StreamedResponse(body.stream, 502),
+      ),
+    );
+
+    await expectLater(
+      client.startChat(message: '質問'),
+      throwsA(
+        isA<ApiException>()
+            .having(
+              (error) => error.message,
+              'message',
+              contains('24 bytesで打ち切り'),
+            )
+            .having(
+              (error) => error.message,
+              'bounded body',
+              isNot(contains('unreachable-tail')),
+            ),
+      ),
+    );
+    expect(cancelled.isCompleted, isTrue);
+    client.close();
+  });
+
+  test('ChatStreamはUIが使うSSE無通信上限を保持する', () async {
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      sseIdleTimeout: const Duration(milliseconds: 40),
+      client: MockClient(
+        (_) async => http.Response(
+          '',
+          200,
+          headers: {'content-type': 'text/event-stream; charset=utf-8'},
+        ),
+      ),
+    );
+
+    final stream = await client.startChat(message: '質問');
+
+    expect(stream.idleTimeout, const Duration(milliseconds: 40));
+    client.close();
+  });
+
+  test('SSE keepaliveコメントをUI用activity eventとして通知する', () async {
+    final body = StreamController<List<int>>();
+    addTearDown(body.close);
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      sseIdleTimeout: const Duration(milliseconds: 70),
+      client: _StreamingClient(
+        (_) async => http.StreamedResponse(
+          body.stream,
+          200,
+          headers: {'content-type': 'Text/Event-Stream; charset=UTF-8'},
+        ),
+      ),
+    );
+
+    final stream = await client.startChat(message: '質問');
+    final events = stream.events.toList();
+    Timer(
+      const Duration(milliseconds: 35),
+      () => body.add(utf8.encode(': ping 1\n\n')),
+    );
+    Timer(
+      const Duration(milliseconds: 70),
+      () => body.add(utf8.encode(': ping 2\n\n')),
+    );
+    Timer(const Duration(milliseconds: 105), () {
+      body
+        ..add(utf8.encode('id: 1\nevent: done\ndata: {}\n\n'))
+        ..close();
+    });
+
+    final decoded = await events;
+    expect(
+      decoded.where((event) => event.event == SseDecoder.keepAliveEvent),
+      hasLength(2),
+    );
+    expect(
+      decoded
+          .where((event) => event.event != SseDecoder.keepAliveEvent)
+          .single
+          .event,
+      'done',
+    );
+    client.close();
+  });
+
+  test('SSE応答のHTTP EOFはdecoderを完了させる', () async {
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient(
+        (_) async => http.Response(
+          'id: 1\nevent: meta\ndata: {}\n\n',
+          200,
+          headers: {'content-type': 'text/event-stream'},
+        ),
+      ),
+    );
+
+    final stream = await client.startChat(message: '質問');
+
+    expect((await stream.events.toList()).single.event, 'meta');
+    client.close();
+  });
+
+  test('HTTPエラー本文はUnicodeコードポイント単位で安全に切り詰める', () async {
+    final responseBody = '${'a' * 299}😀${'b' * 20}';
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient(
+        (_) async => http.Response.bytes(utf8.encode(responseBody), 500),
+      ),
+    );
+
+    await expectLater(
+      client.health(),
+      throwsA(
+        isA<ApiException>()
+            .having(
+              (error) => error.message.endsWith('😀'),
+              'last rune',
+              isTrue,
+            )
+            .having(
+              (error) => error.message.contains('\uFFFD'),
+              'replacement character',
+              isFalse,
+            ),
+      ),
+    );
+    client.close();
+  });
+
   test('policy scanはマスク済み結果だけをクライアントへ復元する', () async {
     const secret = 'sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
     final client = ApiClient(
@@ -228,6 +440,7 @@ void main() {
           'request_id': 'request-id',
           'cancellation_requested': true,
           'cancelled': true,
+          'terminal_outcome': 'cancelled',
           'provider_stop_guaranteed': false,
           'warning': '外部Provider側の処理停止・課金停止は保証されません',
         });
@@ -239,6 +452,7 @@ void main() {
     expect(result.ok, isTrue);
     expect(result.cancellationRequested, isTrue);
     expect(result.cancelled, isTrue);
+    expect(result.terminalOutcome, 'cancelled');
     expect(result.providerStopGuaranteed, isFalse);
     expect(result.warning, contains('課金停止は保証されません'));
     client.close();
@@ -358,3 +572,14 @@ Map<String, Object> _runPlanJson() => {
   },
   'warnings': <Object>[],
 };
+
+class _StreamingClient extends http.BaseClient {
+  _StreamingClient(this.handler);
+
+  final Future<http.StreamedResponse> Function(http.BaseRequest request)
+  handler;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      handler(request);
+}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -170,7 +171,8 @@ WEB_SEARCH_MAX_USES = _env_int("CLAGE_WEB_SEARCH_MAX_USES", 3, 1, 10)
 WEB_SEARCH_CAPABILITIES = {
     "claude": {
         "supported": True,
-        "tool": "web_search_20250305",
+        "tool": "web_search_20260318",
+        "fallback_tool": "web_search_20250305",
         "hard_max_uses": WEB_SEARCH_MAX_USES,
     },
     "gemini": {
@@ -243,9 +245,14 @@ def secret_values() -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))
 
 
-def model_for(name: str, tier: str) -> str:
+def model_for(
+    name: str,
+    tier: str,
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> str:
     tier = tier if tier in {"low", "balanced", "high"} else "balanced"
-    runtime = runtime_settings.snapshot()
+    runtime = runtime_settings.snapshot() if runtime is None else runtime
     override = (runtime.get("models") or {}).get(name, {}).get(tier)
     if isinstance(override, str) and override:
         return override
@@ -253,11 +260,14 @@ def model_for(name: str, tier: str) -> str:
     return os.getenv(env_name, DEFAULT_MODELS[name][tier]).strip() or DEFAULT_MODELS[name][tier]
 
 
-def provider_status(name: str) -> ProviderStatus:
+def provider_status(
+    name: str,
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> ProviderStatus:
+    runtime = runtime_settings.snapshot() if runtime is None else runtime
     configured = has_key(name)
-    available_as_mock = (
-        not LIVE_API_ENABLED or mode() == "mock" or INCLUDE_MOCKS_WHEN_MIXED
-    )
+    available_as_mock = not LIVE_API_ENABLED or INCLUDE_MOCKS_WHEN_MIXED
     return ProviderStatus(
         name=name,
         label=LABELS[name],
@@ -267,27 +277,32 @@ def provider_status(name: str) -> ProviderStatus:
             if LIVE_API_ENABLED and configured
             else ("mock" if available_as_mock else "disabled")
         ),
-        models={tier: model_for(name, tier) for tier in ("low", "balanced", "high")},
+        models={
+            tier: model_for(name, tier, runtime=runtime)
+            for tier in ("low", "balanced", "high")
+        },
     )
 
 
-def statuses() -> list[dict]:
-    return [provider_status(name).public_dict() for name in WORKERS]
+def statuses(*, runtime: dict[str, Any] | None = None) -> list[dict]:
+    runtime = runtime_settings.snapshot() if runtime is None else runtime
+    return [
+        provider_status(name, runtime=runtime).public_dict()
+        for name in WORKERS
+    ]
 
 
 def mode() -> str:
     if not LIVE_API_ENABLED:
         return "mock"
     keyed = sum(1 for name in WORKERS if has_key(name))
-    if keyed == 0:
-        return "mock"
     if keyed == len(WORKERS):
         return "live"
     return "mixed"
 
 
 def active_workers() -> list[str]:
-    if not LIVE_API_ENABLED or mode() == "mock" or INCLUDE_MOCKS_WHEN_MIXED:
+    if not LIVE_API_ENABLED or INCLUDE_MOCKS_WHEN_MIXED:
         return list(WORKERS)
     return [name for name in WORKERS if has_key(name)]
 
@@ -297,8 +312,14 @@ def get_provider(name: str, tier: str = "balanced") -> Provider:
         raise ValueError(f"不明なプロバイダ: {name}")
     model = model_for(name, tier)
     key = os.getenv(_ENV_KEYS[name], "").strip()
-    if not LIVE_API_ENABLED or not key:
+    if not LIVE_API_ENABLED:
         return MockProvider(name, delay=MOCK_DELAY_SEC)
+    if not key:
+        if INCLUDE_MOCKS_WHEN_MIXED:
+            return MockProvider(name, delay=MOCK_DELAY_SEC)
+        raise RuntimeError(
+            f"{LABELS[name]} APIキーが未設定のためLIVEモードでは利用できません"
+        )
     common = {
         "name": name,
         "model": model,
@@ -314,10 +335,11 @@ def get_provider(name: str, tier: str = "balanced") -> Provider:
     return XAIProvider(**common)
 
 
-def synthesizer_name() -> str:
+def synthesizer_name(*, runtime: dict[str, Any] | None = None) -> str:
     if not LIVE_API_ENABLED:
         return "synthesizer"
-    runtime_requested = runtime_settings.snapshot().get("synthesizer_provider")
+    runtime = runtime_settings.snapshot() if runtime is None else runtime
+    runtime_requested = runtime.get("synthesizer_provider")
     requested = (
         str(runtime_requested).strip().lower()
         if runtime_requested not in {None, "auto"}
@@ -331,38 +353,62 @@ def synthesizer_name() -> str:
     return "synthesizer"
 
 
-def get_synthesizer(tier: str = "balanced") -> Provider:
-    name = synthesizer_name()
+def get_synthesizer(
+    tier: str = "balanced",
+    *,
+    provider_name: str | None = None,
+) -> Provider:
+    """統合役を返す。provider_name指定時はplan確定時の選択を維持する。"""
+    name = provider_name or synthesizer_name()
+    if name not in {*WORKERS, "synthesizer"}:
+        raise RuntimeError("統合Providerの指定が不正です")
     if name == "synthesizer":
+        if LIVE_API_ENABLED and not INCLUDE_MOCKS_WHEN_MIXED:
+            raise RuntimeError(
+                "統合に使えるAPIキーが未設定のためLIVEモードでは実行できません"
+            )
         return MockProvider(name, delay=MOCK_DELAY_SEC)
     provider = get_provider(name, tier)
-    provider.model = synthesizer_model_for(tier)
+    provider.model = (
+        synthesizer_model_for(tier)
+        if provider_name is None
+        else model_for(name, tier)
+    )
     return provider
 
 
-def synthesizer_model_for(tier: str = "balanced") -> str:
+def synthesizer_model_for(
+    tier: str = "balanced",
+    *,
+    runtime: dict[str, Any] | None = None,
+    synthesizer: str | None = None,
+) -> str:
     """統合役が実際に使うモデル名を、APIクライアント生成なしで返す。"""
     tier = tier if tier in {"low", "balanced", "high"} else "balanced"
-    name = synthesizer_name()
+    runtime = runtime_settings.snapshot() if runtime is None else runtime
+    name = synthesizer or synthesizer_name(runtime=runtime)
     if name == "synthesizer":
         return "mock"
-    runtime_override = (runtime_settings.snapshot().get("synthesizer_models") or {}).get(tier)
+    runtime_override = (runtime.get("synthesizer_models") or {}).get(tier)
     if isinstance(runtime_override, str) and runtime_override:
         return runtime_override
     override = os.getenv(f"SYNTHESIZER_MODEL_{tier.upper()}", "").strip()
-    return override or model_for(name, tier)
+    return override or model_for(name, tier, runtime=runtime)
 
 
 def public_settings() -> dict:
     """秘密値を一切含まない設定スナップショット。"""
-    synth = synthesizer_name()
     runtime = runtime_settings.snapshot()
+    synth = synthesizer_name(runtime=runtime)
     catalog = {
         provider: sorted(
             {
                 *DEFAULT_MODELS[provider].values(),
                 *(runtime.get("models") or {}).get(provider, {}).values(),
-                *(model_for(provider, tier) for tier in ("low", "balanced", "high")),
+                *(
+                    model_for(provider, tier, runtime=runtime)
+                    for tier in ("low", "balanced", "high")
+                ),
             }
         )
         for provider in WORKERS
@@ -370,7 +416,7 @@ def public_settings() -> dict:
     return {
         "mode": mode(),
         "live_api_enabled": LIVE_API_ENABLED,
-        "providers": statuses(),
+        "providers": statuses(runtime=runtime),
         "active_workers": active_workers(),
         "include_mock_providers": INCLUDE_MOCKS_WHEN_MIXED,
         "synthesizer": synth,
@@ -379,7 +425,11 @@ def public_settings() -> dict:
             "writable": True,
             "catalog": catalog,
             "effective_synthesizer_models": {
-                tier: synthesizer_model_for(tier)
+                tier: synthesizer_model_for(
+                    tier,
+                    runtime=runtime,
+                    synthesizer=synth,
+                )
                 for tier in ("low", "balanced", "high")
             },
         },

@@ -46,6 +46,10 @@ class ConversationNotFound(KeyError):
     pass
 
 
+class AmbiguousRequestId(RuntimeError):
+    """同じrequest_idがbranch snapshotを含む複数会話に存在する。"""
+
+
 class ConversationStore:
     def __init__(
         self,
@@ -57,6 +61,16 @@ class ConversationStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._sanitizer = sanitizer
+        self._request_index: dict[str, set[str]] = {}
+        self._conversation_requests: dict[str, set[str]] = {}
+        self._revision = 0
+        self._rebuild_request_index()
+
+    @property
+    def revision(self) -> int:
+        """このstore instance経由のsave/delete世代。集計cacheの無効化に使う。"""
+        with self._lock:
+            return self._revision
 
     @staticmethod
     def _validate_id(conversation_id: str) -> str:
@@ -68,11 +82,20 @@ class ConversationStore:
     def _path(self, conversation_id: str) -> Path:
         return self.data_dir / f"{self._validate_id(conversation_id)}.json"
 
-    def create(self, first_message: str = "") -> dict[str, Any]:
+    def create(
+        self,
+        first_message: str = "",
+        *,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
         now = utc_now()
         conversation = {
             "schema_version": 1,
-            "id": str(uuid.uuid4()),
+            "id": (
+                self._validate_id(conversation_id)
+                if conversation_id is not None
+                else str(uuid.uuid4())
+            ),
             "title": self._title(first_message),
             "created_at": now,
             "updated_at": now,
@@ -155,6 +178,8 @@ class ConversationStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temp, path)
+                self._index_conversation_locked(snapshot)
+                self._revision += 1
                 if self._sanitizer is None:
                     conversation["updated_at"] = updated_at
                 else:
@@ -171,19 +196,46 @@ class ConversationStore:
             if not path.is_file():
                 raise ConversationNotFound(conversation_id)
             path.unlink()
+            self._remove_conversation_from_index_locked(
+                self._validate_id(conversation_id)
+            )
+            self._revision += 1
 
-    def list(self) -> list[dict[str, Any]]:
-        summaries: list[dict[str, Any]] = []
+    def load_all(self) -> list[dict[str, Any]]:
+        """保存済み会話を各ファイル1回のparseでsnapshot化する。"""
+        conversations: list[dict[str, Any]] = []
         with self._lock:
             paths = list(self.data_dir.glob("*.json"))
+        # saveは同一filesystem上のos.replaceで公開されるため、列挙後の各read/parseで
+        # store全体のlockを保持する必要はない。大規模scanが通常saveを止めないようにする。
         for path in paths:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(data, dict) or not isinstance(data.get("turns"), list):
+                if not isinstance(data, dict) or not isinstance(
+                    data.get("turns"), list
+                ):
                     continue
-                summaries.append(self.summary(data))
-            except (OSError, json.JSONDecodeError):
+                canonical_id = self._validate_id(str(data.get("id", "")))
+                if path.stem != canonical_id:
+                    continue
+                if not isinstance(data.get("memory"), dict):
+                    data["memory"] = {
+                        "revision": 0,
+                        "text": "",
+                        "updated_at": "",
+                    }
+                conversations.append(data)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ConversationNotFound,
+            ):
                 continue
+        return conversations
+
+    def list(self) -> list[dict[str, Any]]:
+        summaries = [self.summary(data) for data in self.load_all()]
         return sorted(summaries, key=lambda item: item["updated_at"], reverse=True)
 
     def search(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
@@ -191,11 +243,12 @@ class ConversationStore:
         if not terms:
             return []
         results: list[dict[str, Any]] = []
-        for summary in self.list():
-            try:
-                conversation = self.load(summary["id"])
-            except ConversationNotFound:
-                continue
+        conversations = sorted(
+            self.load_all(),
+            key=lambda item: str(item.get("updated_at") or ""),
+            reverse=True,
+        )
+        for conversation in conversations:
             chunks = [str(conversation.get("title", ""))]
             memory = conversation.get("memory")
             if isinstance(memory, dict):
@@ -210,7 +263,7 @@ class ConversationStore:
                     chunks.append(str(synthesis.get("text", "")))
             haystack = "\n".join(chunks).casefold()
             if all(term in haystack for term in terms):
-                results.append(summary)
+                results.append(self.summary(conversation))
                 if len(results) >= max(1, min(limit, 100)):
                     break
         return results
@@ -242,31 +295,38 @@ class ConversationStore:
         return None
 
     def find_conversation_by_request_id(
-        self, request_id: str
+        self,
+        request_id: str,
+        *,
+        preferred_conversation_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """再起動後もrequest_idを既存の保存済みターンへ結び付ける。"""
+        """起動時・保存時indexからrequest_idを既存turnへ結び付ける。"""
         matches: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         with self._lock:
-            for path in self.data_dir.glob("*.json"):
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                    if not isinstance(data, dict) or not isinstance(data.get("turns"), list):
-                        continue
-                    canonical_id = self._validate_id(str(data.get("id", "")))
-                    if path.stem != canonical_id:
-                        continue
-                    turn = self.find_turn_by_request_id(data, request_id)
-                    if turn is not None:
-                        matches.append((str(data.get("updated_at", "")), data, turn))
-                except (
-                    OSError,
-                    UnicodeDecodeError,
-                    json.JSONDecodeError,
-                    ConversationNotFound,
-                ):
-                    continue
+            conversation_ids = tuple(self._request_index.get(request_id, ()))
+        preferred = (
+            self._validate_id(preferred_conversation_id)
+            if preferred_conversation_id is not None
+            else None
+        )
+        if preferred is not None and preferred in conversation_ids:
+            conversation_ids = (preferred,)
+        elif preferred is None and len(conversation_ids) > 1:
+            raise AmbiguousRequestId(request_id)
+        elif preferred is not None and len(conversation_ids) > 1:
+            raise AmbiguousRequestId(request_id)
+        for conversation_id in conversation_ids:
+            try:
+                data = self.load(conversation_id)
+            except ConversationNotFound:
+                continue
+            turn = self.find_turn_by_request_id(data, request_id)
+            if turn is not None:
+                matches.append((str(data.get("updated_at", "")), data, turn))
         if not matches:
             return None
+        if len(matches) > 1:
+            raise AmbiguousRequestId(request_id)
         _, conversation, turn = max(matches, key=lambda item: item[0])
         return conversation, turn
 
@@ -293,7 +353,7 @@ class ConversationStore:
                                 if (
                                     not isinstance(attempt, dict)
                                     or attempt.get("status")
-                                    not in {"running", "dispatching"}
+                                    not in {"reserved", "running", "dispatching"}
                                 ):
                                     continue
                                 attempt["status"] = "interrupted"
@@ -330,6 +390,36 @@ class ConversationStore:
                 ):
                     continue
         return recovered
+
+    def _rebuild_request_index(self) -> None:
+        with self._lock:
+            self._request_index.clear()
+            self._conversation_requests.clear()
+            for conversation in self.load_all():
+                self._index_conversation_locked(conversation)
+
+    def _index_conversation_locked(self, conversation: dict[str, Any]) -> None:
+        conversation_id = self._validate_id(str(conversation.get("id", "")))
+        self._remove_conversation_from_index_locked(conversation_id)
+        request_ids = {
+            request_id
+            for turn in conversation.get("turns") or []
+            if isinstance(turn, dict)
+            and isinstance((request_id := turn.get("request_id")), str)
+            and request_id
+        }
+        self._conversation_requests[conversation_id] = request_ids
+        for request_id in request_ids:
+            self._request_index.setdefault(request_id, set()).add(conversation_id)
+
+    def _remove_conversation_from_index_locked(self, conversation_id: str) -> None:
+        for request_id in self._conversation_requests.pop(conversation_id, set()):
+            conversation_ids = self._request_index.get(request_id)
+            if conversation_ids is None:
+                continue
+            conversation_ids.discard(conversation_id)
+            if not conversation_ids:
+                self._request_index.pop(request_id, None)
 
     @staticmethod
     def _title(message: str) -> str:

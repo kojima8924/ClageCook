@@ -1,15 +1,15 @@
-# Clage Cook OSS — 開発引き継ぎ
+# Clage Cook — 開発引き継ぎ
 
-最終更新: 2026-07-18 / バージョン `0.2.0`
+最終更新: 2026-07-19 / バージョン `0.2.0` + Unreleased
 
 コンセプトは [VISION.md](VISION.md)、利用手順は [README.md](README.md)、安全上の前提は
 [SECURITY.md](SECURITY.md) を参照してください。
 
 ## 現在地
 
-初期のモックUI prototypeから、課金を明示的に武装するBYOK OSS版へ再設計済みです。`0.2.0` は
-後方互換性を保証しません。APIキーを設定しただけでliveへ切り替わる旧挙動は廃止し、既定状態を
-常にSAFE MOCKとしました。
+初期のモックUI prototypeから、課金を明示的に武装する、公開を想定したBYOK版へ再設計済みです。
+repositoryは現在privateの公開準備中です。`0.2.0` は後方互換性を保証しません。APIキーを設定しただけで
+liveへ切り替わる旧挙動は廃止し、既定状態を常にSAFE MOCKとしました。
 
 ### backend
 
@@ -24,14 +24,17 @@
 - `policy.py`: 秘密・個人情報候補の決定論的local scannerとredacted text生成
 - `scrubbing.py`: 設定中secretとblock候補を公開・保存データから非破壊で再帰除去
 - `insights.py`: 外部通信なしのUnicode語彙・文字3-gram比較、共有語、注意表現
-- `telemetry.py`: 保存済みoriginal/再生成attemptのlocal usageとquota観測集計
+- `telemetry.py`: 保存済みoriginal/再生成attemptのlocal usageとquota観測集計（現在はrequestごとに全JSON走査）
 - `admin_telemetry.py`: 別管理資格情報による読み取り専用組織usage/cost/balance、部分失敗、cache
-- `finance.py`: 明示price table、Decimal cost、会議・日次budget、durable予約ledger
-- `attachments.py`: owner固定opaque UUID、stream upload、signature/MIME/容量/TTL、text/PDF抽出
+- `finance.py`: 明示price table、Decimal cost、会議・日次budget、settled額を含むdurable予約ledger
+- `attachments.py`: owner固定opaque UUID、stream upload、signature/MIME/容量/TTL、text抽出と
+  同時2本上限・process内5分/64件TTL/LRU single-flight cache付き隔離PDF subprocess
 - `runtime_settings.py`: revision付きworker/統合model overrideのatomic JSON
 - `exporting.py`: 公開shapeのMarkdownと、元添付を含む一時ZIP
-- `storage.py`: 1会話1 JSON、deepcopy、flush、fsync、atomic replace、全文検索
-- `main.py`: REST/SSE、認証、CORS、live確認、run registry、durable claim、journal、再生、停止
+- `storage.py`: 1会話1 JSON、deepcopy、flush、fsync、atomic replace、全文検索、request ID index
+- `runs.py`: chat/再生成共通のbackground state、terminal outcome、SSE、cancel、conversation claim/lock、rate limit
+- `regeneration.py`: 再生成target、fingerprint、attempt遷移、実行計画の純粋な境界
+- `main.py`: REST/SSEの結線、認証、CORS、live確認、durable claim、journal、停止
 - `config.py`: dotenv、model解決、safe mock/live gate、上限値、秘密を含まない公開設定
 
 `CLAGE_LIVE_API_ENABLED=false` の間はキーの有無にかかわらず4mockです。`true` かつキーありの
@@ -51,6 +54,39 @@ planが返すinput量は、選択conversationの履歴、各answer、DEBATE用pe
 安全側token envelopeから最大金額を算出し、会議・日次budgetを予約します。送信済みusage不明runは
 `reconciliation_pending` として拘束し、0円へ解放しません。再起動は未settle予約を同状態へ昇格し、
 `CLAGE_MAX_UNRECONCILED_RESERVATIONS` 件へ達したbacklogは新しいbillable runを停止します。
+価格換算できたrunは実測額をsettled ledgerへ保存するため、conversation削除後も当日のcommitから消えません。
+応答modelを価格換算できない場合は予約上限を保持します。手動reconciliationも照合待ちを0円へ解放せず、
+完全な既知実測額、または予約上限を `settled_after_manual_reconciliation` としてcommitへ残します。
+active予約の `amount_micros` はgrossとして公開しますが、committedはactual実績に、request IDごとの
+`max(0, gross - observed)` である `active_reservation_top_up` だけを加えます。部分usageが保存済みでも
+actualと予約総額を二重加算しません。Flutterも「有効予約（総額）」と「実績未反映の追加拘束」を分けます。
+実行slotとconversation lockを得た後、送信する履歴・memory・添付・runtime modelから最終planを作り直し、
+予算予約を現在の予算日と金額でatomic refreshします。参加Provider/modelと統合Provider/modelのsnapshotを
+実行完了まで使い、途中のruntime変更で予約外Provider/modelへ切り替わりません。同じrequest IDの
+解放済み予約は再check後だけ再有効化し、照合待ち・確定済みの予約は新規dispatchしません。
+runtime設定は1 planにつき1回だけ読み、SSE metaと全Provider失敗時のsynthesis sourceも同じsnapshotを使います。
+
+実測費用ではProviderごとのcache token契約を区別します。Anthropicの `input_tokens` はcache read/writeとは
+独立したuncached区分であり、他の正規化済みProviderではinput totalからcached inputを差し引きます。
+reasoningは、Gemini Interactionsの `total_thought_tokens` だけをoutput外数として
+`billable_output_tokens` へ加算します。OpenAI/xAI Responsesはoutputがreasoningを内包するため加算しません。
+旧xAI Chat互換shapeのdurable Grok usageはcompletion外数を取りこぼさないよう
+`max(output_tokens, total_tokens - input_tokens)` を使います。
+BudgetGuardのactual-cost snapshotはConversationStore revision、予算日、price versionでcacheします。
+
+現行の `.control/budget-reservations.json` は、idempotencyと日次commitの根拠を失わないため、settled、
+`settled_after_manual_reconciliation`、`released_before_dispatch` を含む全reservationを保持します。
+各更新はtemp fileのflush/fsync/replaceでJSON全体をatomic再書込するため、1操作の台帳I/Oは件数に対してO(N)です。
+個人ローカル想定を超える数千〜数万billable runの長期運用ではI/Oとlock保持が増えます。今回のcorrectness修正とは
+別のscalability課題であり、SQLite化、または過去日aggregateと最小idempotency tombstoneだけを残すcompactionは
+公開規模へ広げる前の実装候補です。現時点ではどちらも未実装です。
+
+live Web検索はserver tool別課金と内部検索回数をtoken price tableだけで上限化できないため、
+`web_search_tool_pricing` をunknown costとします。budget有効時はunknown policyの既定 `block` で停止し、
+`allow` は価格判明済みのtoken小計を会議・日次上限で検査・予約した上で実行します。不明なtool料金は
+local金額上限の外側である旨を警告します。
+model価格がカテゴリ単位で部分定義の場合も、判明済みrateの小計は同じく検査・予約し、未知カテゴリだけを
+unknownとして扱います。実費集計ではmock/skipped entryを未価格requestへ含めません。
 
 各Providerは `completion_status`、`partial`、`incomplete_reason` と、`request_audit` の
 HTTP attempt/retry/outcome/final status/usage不明flagへ正規化します。timeoutや応答喪失後の課金有無を
@@ -62,8 +98,10 @@ Claudeの既知のbilling/credit不足だけはallowlistで固定分類し、一
 ### durable run
 
 `request_id` のclaimは最初の外部呼出より前に `status=running` のpending turnとして保存します。
-各 `meta` / `answer` / `phase` / `insights` / `synthesis` は公開可能な形へsanitizeした後、SSE配信と
-同時に `event_log` へ保存します。成功したProvider出力も信頼せず、設定中のAPI key・Bearer tokenと
+各 `meta` / `answer` / `phase` / `insights` / `synthesis` は公開可能な形へsanitizeしてSSE配信し、
+`answer` / `synthesis` をdurable checkpointとして保存します。終端時はその時点までの非終端生成eventを
+`event_log` へ確定し、`error` / `done` は再生時に保存turnの終端状態から再構成します。eventごとの
+会話全体fsyncは行いません。成功したProvider出力も信頼せず、設定中のAPI key・Bearer tokenと
 block候補を中央scrubberで再帰除去します。同じ防御をconversation保存と既存JSONの一覧・検索・取得・
 exportにも適用します。完了、cancel、一般failureのいずれでも同じturnを置換し、取得済み
 answerとusageを残します。cancel/failure時は `usage_may_be_incomplete=true` です。
@@ -73,20 +111,44 @@ lifespan開始時に前processが残した `running` turnをdurably `interrupted
 保持したまま外部APIを自動再実行しません。異なる
 payloadまたは異なるconversationで同じIDを使うと409です。`Last-Event-ID` がjournal範囲を超える
 場合も409で拒否します。
+保存turn/in-memory stateの照合は新規planより先に行い、同一fingerprintの無課金replay/joinを現在の添付TTL、
+予算、runtime設定、confirmationへ依存させません。添付IDはprompt順をfingerprintへ含めるため、同じIDで
+順序を変えた要求は409です。
 同一conversationの異なるrequestは同時実行せず、後発を `conversation_busy` 409で拒否します。
 
 cancel endpointはlocal asyncio taskをcancelし、永続化の完了を短時間待ちます。ただし送信済み
 HTTP requestを外部Providerが停止したことや、課金停止を保証しません。responseの
-`provider_stop_guaranteed` は常にfalseです。
+`provider_stop_guaranteed` は常にfalseです。Provider結果後はchat/再生成の終端保存、budget settle、
+SSE/JSON結果公開を `_complete_critical` で完走します。この段階で先に確定したcompleted/failedはcancelledで
+上書きせず、cancel responseの `terminal_outcome` へ返します。終端待機は5秒上限のため、その時点で未確定なら
+fieldはnullになり得ます。再生成Provider failureが先に決まった場合もcleanup中のcancelを吸収し、failedの
+terminal outcome、未確定usageのsettle、`cancelled=false` のinterrupted attempt保存を完了します。
 
 完了済みturnのanswer/synthesis再生成は、originalを含むimmutable `attempts` と `active_attempts` pointerを
 使います。同じregeneration ID・fingerprintは保存attemptを再生し、異なる要求でのID再利用は409です。
 answer更新後は既存synthesisを `synthesis_stale=true` にし、synthesis再生成で解消します。起動時に残った
-実行中attemptはinterruptedへ確定し、自動再実行しません。
+実行中attemptはinterruptedへ確定し、自動再実行しません。再生成もchatと同じbackground
+registryとconversation claimを使うため、HTTP切断だけで実行を止めず、同じcancel endpointで停止を要求できます。
+完了した再生成stateはdurable attemptから再生できるため、`_finalize_background_run` 後にregistryから即時removeし、
+conversation全体を含む `state.result` を共通 `RUN_RETENTION_SEC`（既定1時間）へ残しません。待機中handlerは
+手元のstateを読み、後続の同一IDは保存attemptを再生します。endpointは保存済みterminal attemptをrate limiterと
+active conversation claimより前に照合し、同一fingerprintなら新規実行用の429/409を受けず直接返します。
+編集分岐がcopyした未変更の過去turn/attemptはdurable identityが同じため、local usage・費用で二重加算しません。
+再生成時に既存answer/synthesisを包む `original=true` attemptは新しいAPI callではないため、元turnの
+`(request_id, target, provider)` identityへfinanceとlocal usage telemetryの双方で戻します。片側branchだけで
+再生成しても未包装copyとの費用・token二重計上を避け、実際に追加送信した非original attemptだけを
+独立identityにします。
+request ID indexが複数branchを指す場合、明示conversation IDを優先し、未指定の曖昧なreplayは409で拒否します。
 
 `GET /api/telemetry` はlocal実績・budgetを常に外部通信なしで集計します。admin部分は
 `CLAGE_ADMIN_TELEMETRY_ENABLED=true` の場合だけOpenAI/Anthropic/xAIへ別管理資格情報でアクセスし、
-GeminiはAI Studio案内に留めます。admin有効時もBearerなしではserverを起動しません。
+GeminiはAI Studio案内に留めます。Providerが実際に集計したUTC bucketとlocal予算期間は分けて返し、
+完全一致しない期間を同一の「today」と表示しません。admin有効時もBearerなしではserverを起動しません。
+BudgetGuardのactual-cost scanは上記revision cacheを使いますが、`telemetry.local_snapshot` は現在も
+requestごとに `ConversationStore.load_all()` を実行します。大規模保存向けのlocal usage indexは未実装です。
+
+PDF抽出結果cacheはprocess memoryだけにあり、期限切れentryは次のcache access時に除去され、再起動時には
+全entryが消えます。これとは別に、元添付の保存TTLはserver起動時と添付access時にpurgeします。
 
 ### single process
 
@@ -97,6 +159,8 @@ Uvicornは `--workers 1` で起動してください。複数hostから同じ保
 ### Flutter
 
 - `models.dart`: settings、plan/policy、conversation、turn、SSEの型と未知fieldに強いparse
+- `controllers/conversation_selection_controller.dart`: 会話選択の単一generationと古いasync応答の破棄
+- `controllers/live_run_controller.dart`: live run、SSE session、90秒idle watchdog、確実なdispose
 - `services/api_client.dart`: REST、HTTP status、SSE frame解析、event ID再接続
 - `services/settings_store.dart`: URLとBearerをrevision・originで結合するfail-closedな二record保存
 - `screens/home_screen.dart`: 会話、検索、JSON/ZIP export、添付、ローカルメモ、編集分岐、plan/policy、再接続・停止
@@ -113,7 +177,10 @@ price tableがある場合だけ最大金額、price version、会議・日次�
 実行状態は `conversation_id + request_id` で追跡し、SSE切断後は同じID、同じconfirmation、最後の
 event IDで再接続します。切断中は別runを開始できず、停止または再接続を選びます。`done` 後の履歴取得失敗は
 SSEへ戻らず保存済みconversationだけを再読込します。partial、HTTP複数試行、usage不完全、turn終端状態は
-回答・統合cardで警告表示します。検索は350ms debounce、stale response破棄、error/retry表示を備えます。
+回答・統合cardで警告表示します。SSE commentもactivityとして更新し、bodyが90秒完全に沈黙した場合は
+接続切断へ遷移します。検索は350ms debounce、stale response破棄、error/retry表示を備えます。
+cancel APIの `terminal_outcome` がcompleted/failed/cancelledなら、Flutterは停止要求の成否をその状態と
+混同せず、それぞれcheck/error/stopの確定iconと説明へ反映します。未確定なら停止要求済み表示を維持します。
 JSON exportはclipboardへコピーし、ZIPはJSON/Markdown/元添付を保存します。`Ctrl/Cmd+K` と
 `Ctrl/Cmd+N` のshortcutを提供します。
 
@@ -139,7 +206,7 @@ Androidの `app/android/app/build.gradle.kts` はreleaseへdebug signing config�
 - `POST /api/plan`: 外部通信なしのrun plan
 - `POST /api/policy/scan`: 外部通信なしのlocal policy scan
 - `POST /api/chat`: 新規・既存conversationのSSE run、同一run再接続
-- `POST /api/runs/{request_id}/cancel`: local cancellation request
+- `POST /api/runs/{request_id}/cancel`: local cancellation requestと判明済み `terminal_outcome`
 - `GET /api/conversations`: summary一覧
 - `POST /api/search`: URLへ検索語を出さないJSON body形式の保存全文検索
 - `GET /api/conversations/{id}`: conversation取得
@@ -154,7 +221,7 @@ Androidの `app/android/app/build.gradle.kts` はreleaseへdebug signing config�
 - `POST /api/conversations/{id}/turns/{run}/regeneration-plan`: 再生成の無課金plan
 - `POST /api/conversations/{id}/turns/{run}/regenerate`: immutable answer/synthesis attempt
 - `POST /api/conversations/{id}/turns/{run}/fork`: immutable編集分岐
-- `POST /api/budget/reconciliation/{request_id}/release`: 外部請求確認後の予約解放
+- `POST /api/budget/reconciliation/{request_id}/release`: 外部請求確認後に照合待ちを確定し、既知額/予約上限を保持
 
 ### SSE
 
@@ -176,7 +243,7 @@ insights、storage、durable replay、cancel、single-process guardを含みま�
 API payload、SSE decoder、検索/export、shortcut、turn/insights表示を含みます。
 
 ```powershell
-cd C:\code\ClageCookOSS\backend
+cd backend
 python -m pytest -q -p no:cacheprovider
 python -m compileall .
 
@@ -204,6 +271,7 @@ Android releaseの検証ではbuild成功だけでなく、意図したcertifica
 - 同じ `request_id` に異なるpayloadを許可せず、未完了claimを自動再実行しない。
 - client切断だけではProvider taskを止めない。
 - cancelを外部Provider処理・課金の停止保証として表示しない。
+- Provider結果後に確定したcompleted/failedを、cleanup中のcancelでcancelledへ上書きしない。
 - conversationのrename/delete/chatは同じconversation lockを通す。
 - 同じdata dirを複数processで書かない。`--workers 1` を維持する。
 - 部分失敗を会議全体の例外に昇格させない。
@@ -211,20 +279,26 @@ Android releaseの検証ではbuild成功だけでなく、意図したcertifica
 - BLINDを出典消去や匿名性保証として説明しない。
 - insightsの類似度を正しさ、品質、確信度として表示しない。
 - price table未設定のbyte/token envelopeを料金へ変換しない。設定時もlocal guardを請求書として表示しない。
+- tokenと別課金のWeb toolをtoken単価だけで完全見積もりとせず、unknown cost policyを通す。
 - local usage、rate-limit quota、price table推定、admin集計を同一の確定値として混ぜない。
 - 管理APIへ通常推論キーを使わず、read-only境界とBearer必須startup gateを維持する。
 - original/過去の再生成attemptを削除・上書きせず、active pointerだけを更新する。
 - usage不明の送信済みbudget予約を0円として解放しない。
+- settled済み金額をconversation削除や手動reconciliationで当日のcommitから消さない。
+- active予約は観測済み実績との差額top-upだけをcommitへ足し、gross予約とactualを二重加算しない。
+- original再生成attemptを新規call identityとして扱わず、branch copy元と同じturn identityで費用・tokenをdedupする。
+- 保存済みterminal再生成replayをrate limiter・active conversation claimより先に解決し、新規外部送信を行わない。
 - 回答内の命令をsystem instructionとして扱わない。
 - arbitrary path、CLI資格情報、PC操作をAPIへ追加しない。
 - Android releaseへdebug keyを使わず、keystore/passwordをrepositoryへcommitしない。
 
 ## 次に着手する候補
 
-1. search index、encrypted backup/import、conversation/attachment retention UI
-2. Provider請求exportとlocal/admin costのreconciliation差分監査
-3. image input/generationのcapability、予算、保存・export統合
-4. 会話tag、複数会話project、memory sourceの選択的継承
+1. budget ledgerのSQLite化、または過去日aggregate＋最小idempotency tombstone compaction
+2. search index、encrypted backup/import、conversation/attachment retention UI
+3. Provider請求exportとlocal/admin costのreconciliation差分監査
+4. image input/generationのcapability、予算、保存・export統合
+5. 会話tag、複数会話project、memory sourceの選択的継承
 5. Mac/Linux上のnative buildと各platformの実機通信確認
 6. 配布用Android/iOS/Desktop署名と更新経路のend-to-end検証
 7. SQLite等へのstorage migrationとimport検証
@@ -236,6 +310,3 @@ Android releaseの検証ではbuild成功だけでなく、意図したcertifica
 - 既定backend: `127.0.0.1:8000`
 - 既定conversation保存先: `backend/data/`（gitignore対象）
 - オリジナル: `C:\code\ClageCook`
-
-オリジナル側には調査開始前から `server/usage.py` の未commit変更がありました。このOSS作業では
-一切変更していません。

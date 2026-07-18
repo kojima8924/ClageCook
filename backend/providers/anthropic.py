@@ -15,6 +15,38 @@ from .base import (
 )
 
 
+_EFFORT = {"low": "low", "balanced": "medium", "high": "high"}
+_EFFORT_MODEL_PREFIXES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+)
+_EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES = (
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+)
+_DYNAMIC_WEB_SEARCH_MODEL_PREFIXES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    *_EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES,
+)
+
+
+def _matches_model(model: str, prefixes: tuple[str, ...]) -> bool:
+    normalized = model.strip().lower()
+    return any(normalized.startswith(prefix) for prefix in prefixes)
+
+
 class AnthropicProvider(HttpProvider):
     API_URL = "https://api.anthropic.com/v1/messages"
 
@@ -26,10 +58,26 @@ class AnthropicProvider(HttpProvider):
         }
         if request.system:
             payload["system"] = request.system
+        if _matches_model(self.model, _EFFORT_MODEL_PREFIXES):
+            payload["output_config"] = {
+                "effort": _EFFORT.get(request.tier, "medium")
+            }
+        if _matches_model(
+            self.model,
+            _EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES,
+        ):
+            # 現行Opus/Sonnetではbudget_tokensではなくadaptive thinkingを使う。
+            # Fable/Mythosは常時adaptive、Opus 4.5はmanual thinkingのため送らない。
+            payload["thinking"] = {"type": "adaptive"}
         if request.web_search:
+            tool_version = (
+                "web_search_20260318"
+                if _matches_model(self.model, _DYNAMIC_WEB_SEARCH_MODEL_PREFIXES)
+                else "web_search_20250305"
+            )
             payload["tools"] = [
                 {
-                    "type": "web_search_20250305",
+                    "type": tool_version,
                     "name": "web_search",
                     "max_uses": max(1, min(request.web_search_max_uses, 10)),
                 }
@@ -51,8 +99,17 @@ class AnthropicProvider(HttpProvider):
         ]
         text = "\n\n".join(piece for piece in pieces if piece).strip()
         stop_reason = str(data.get("stop_reason") or "") or None
+        if stop_reason == "refusal":
+            # stop_detailsの説明文は将来変更され得るため反射せず、固定文言で
+            # 通常の空レスポンスとは区別する。途中出力も公式推奨どおり破棄する。
+            raise ProviderError(
+                "claude: モデルのポリシー判定により回答を拒否しました",
+                error_code="model_refusal",
+                request_audit={**audit, "usage_may_be_incomplete": True},
+            )
         truncated = stop_reason in {"max_tokens", "model_context_window_exceeded"}
-        if not text and not truncated:
+        paused = stop_reason == "pause_turn"
+        if not text and not truncated and not paused:
             raise ProviderError(
                 "claude: 回答テキストが空です",
                 request_audit={**audit, "usage_may_be_incomplete": True},
@@ -73,8 +130,8 @@ class AnthropicProvider(HttpProvider):
             citations=extract_anthropic_citations(data),
             web_search_requested=request.web_search,
             **completion_metadata(
-                "incomplete" if truncated else "completed",
+                "incomplete" if truncated or paused else "completed",
                 text,
-                stop_reason if truncated else None,
+                stop_reason if truncated or paused else None,
             ),
         )

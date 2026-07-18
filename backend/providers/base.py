@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import random
 import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -18,6 +20,7 @@ import httpx
 
 
 _COMPLETION_STATUSES = {
+    "budget_exceeded",
     "completed",
     "incomplete",
     "failed",
@@ -26,11 +29,14 @@ _COMPLETION_STATUSES = {
     "in_progress",
 }
 _INCOMPLETE_REASONS = {
+    "budget_exceeded",
     "content_filter",
     "max_output_tokens",
     "max_tokens",
     "model_context_window_exceeded",
+    "pause_turn",
 }
+_MAX_RETRY_AFTER_SEC = 60.0
 _AUDIT_OUTCOMES = {
     "http_error",
     "invalid_response",
@@ -39,7 +45,9 @@ _AUDIT_OUTCOMES = {
     "response_received",
     "timeout",
 }
-_PROVIDER_ERROR_CODES = frozenset({"billing_or_credit_required"})
+_PROVIDER_ERROR_CODES = frozenset(
+    {"billing_or_credit_required", "model_refusal"}
+)
 _BILLING_OR_CREDIT_MESSAGE_ALLOWLIST = {
     "claude": (
         "credit balance is too low to access the anthropic api",
@@ -215,7 +223,10 @@ class HttpProvider(Provider):
                         audit,
                     )
 
-                retryable = response.status_code in {408, 409, 429, 500, 502, 503, 504}
+                retryable = (
+                    response.status_code in {408, 409, 429}
+                    or response.status_code >= 500
+                )
                 error_code = self._safe_error_code(response)
                 message = self._safe_api_error(response, error_code=error_code)
                 last_error = ProviderError(
@@ -237,6 +248,10 @@ class HttpProvider(Provider):
                 if not retryable or attempt >= self._retries:
                     raise last_error
                 delay = self._retry_delay(response.headers, attempt)
+                # Retry-Afterを早めて再試行すると429を悪化させる。長すぎる待機を
+                # アプリ内で抱えず、サーバ指定が上限を超える場合は今回の呼び出しを諦める。
+                if delay is None:
+                    raise last_error
             except ProviderError:
                 raise
             except httpx.TimeoutException as exc:
@@ -286,12 +301,36 @@ class HttpProvider(Provider):
         raise last_error or ProviderError(f"{self.name}: API呼び出しに失敗しました")
 
     @staticmethod
-    def _retry_delay(headers: httpx.Headers, attempt: int) -> float:
-        raw = headers.get("retry-after", "")
+    def _retry_delay(
+        headers: httpx.Headers,
+        attempt: int,
+        *,
+        now: datetime | None = None,
+    ) -> float | None:
+        raw = headers.get("retry-after", "").strip()
+        retry_after: float | None = None
         try:
-            return max(0.1, min(float(raw), 10.0))
+            retry_after = float(raw)
         except ValueError:
-            return min(4.0, (2**attempt) + random.random() * 0.25)
+            if raw:
+                try:
+                    target = parsedate_to_datetime(raw)
+                    if target.tzinfo is None:
+                        target = target.replace(tzinfo=timezone.utc)
+                    current = now or datetime.now(timezone.utc)
+                    if current.tzinfo is None:
+                        current = current.replace(tzinfo=timezone.utc)
+                    retry_after = (
+                        target.astimezone(timezone.utc)
+                        - current.astimezone(timezone.utc)
+                    ).total_seconds()
+                except (TypeError, ValueError, OverflowError):
+                    retry_after = None
+        if retry_after is not None and math.isfinite(retry_after):
+            if retry_after > _MAX_RETRY_AFTER_SEC:
+                return None
+            return max(0.1, retry_after)
+        return min(4.0, (2**attempt) + random.random() * 0.25)
 
     def _safe_error_code(self, response: httpx.Response) -> str | None:
         """既知のvendor文言だけを固定分類へ写し、生本文は保持しない。"""
@@ -416,6 +455,8 @@ def completion_metadata(
         candidate = incomplete_details.strip().lower()
         if candidate in _INCOMPLETE_REASONS:
             reason = candidate
+    if reason is None and normalized in _INCOMPLETE_REASONS:
+        reason = normalized
 
     return {
         "completion_status": normalized,
@@ -429,7 +470,7 @@ def opaque_prompt_cache_key(value: str) -> str:
     if re.fullmatch(r"clage-[0-9a-f]{48}", value):
         return value
     digest = hashlib.sha256(
-        f"clage-cook-oss-cache\0{value}".encode("utf-8")
+        f"clage-cook-cache\0{value}".encode("utf-8")
     ).hexdigest()
     return f"clage-{digest[:48]}"
 
@@ -595,6 +636,16 @@ def normalized_usage(raw: Any) -> dict[str, int]:
         ):
             result["reasoning_tokens"] = reasoning
 
+    # Gemini Interactionsはthinkingをoutputと別区分で返し、両方が出力単価の
+    # 対象になる。OpenAI/xAI Responsesのoutputはreasoningを内包する一方、
+    # xAI Chatのcompletionは外数の場合がある。provider非依存のここでは
+    # completion shapeだけで推測せず、finance側がprovider+totalで判別する。
+    if "output_tokens" in result:
+        if "total_thought_tokens" in raw:
+            result["billable_output_tokens"] = (
+                result["output_tokens"] + result.get("reasoning_tokens", 0)
+            )
+
     server_tools = raw.get("server_tool_use")
     if isinstance(server_tools, dict):
         searches = server_tools.get("web_search_requests")
@@ -632,9 +683,6 @@ def normalized_usage(raw: Any) -> dict[str, int]:
         if "cache_read_input_tokens" in raw:
             total += result.get("cached_input_tokens", 0)
         if "total_thought_tokens" in raw:
-            total += result.get("reasoning_tokens", 0)
-        if "completion_tokens" in raw and "output_tokens" not in raw:
-            # xAIの旧shapeではcompletion_tokensとreasoning_tokensが外数。
             total += result.get("reasoning_tokens", 0)
         result["total_tokens"] = total
     return result
