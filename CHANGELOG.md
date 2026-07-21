@@ -91,6 +91,8 @@
 
 ### Fixed
 
+- DEBATE round 2がpartial / failureになった場合も、送信済みcallの実測usageをround 1へ合算し、partial本文と
+  監査metadataを保存するよう修正した。送信済みなのにusageが無い場合は照合済みにせず、予算予約を維持する。
 - HTTP 529を含む全5xxをretry対象にし、数値/HTTP-dateの `Retry-After` を尊重した。60秒を超える指定では
   早すぎる再試行も長時間sleepも行わず、そのcallを失敗として返す。
 - Claudeの `refusal` をallowlist済み固定分類で通知し、`pause_turn` をpartial/incompleteとして保持した。
