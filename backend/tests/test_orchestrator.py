@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 import config
+import finance
 import orchestrator
 from providers import CompletionResult, Provider, ProviderError
 
@@ -44,6 +45,32 @@ class PartialProvider(FakeProvider):
         result.completion_status = "incomplete"
         result.partial = True
         result.incomplete_reason = "max_output_tokens"
+        return result
+
+
+class DebatePartialProvider(FakeProvider):
+    def __init__(self, name, calls, *, omit_debate_usage=False):
+        super().__init__(name, calls)
+        self.omit_debate_usage = omit_debate_usage
+
+    async def complete(self, request):
+        result = await super().complete(request)
+        if request.system != orchestrator.DEBATE_SYSTEM:
+            return result
+        result.text = f"{self.name} partial critique"
+        result.completion_status = "incomplete"
+        result.partial = True
+        result.incomplete_reason = "max_output_tokens"
+        result.request_audit = {
+            "http_attempts": 1,
+            "retry_count": 0,
+            "outcome": "success",
+        }
+        result.usage = (
+            {}
+            if self.omit_debate_usage
+            else {"input_tokens": 7, "output_tokens": 11, "total_tokens": 18}
+        )
         return result
 
 
@@ -157,6 +184,91 @@ async def test_debate_runs_exactly_one_revision_round(monkeypatch):
         "started",
         "completed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_debate_partial_round_two_keeps_text_and_merges_known_usage(monkeypatch):
+    calls = []
+    providers = {
+        name: DebatePartialProvider(name, calls) for name in ("claude", "grok")
+    }
+    monkeypatch.setattr(config, "get_provider", lambda name, _tier: providers[name])
+    monkeypatch.setattr(
+        config,
+        "get_synthesizer",
+        lambda tier, **kwargs: FakeProvider("synth", calls),
+    )
+
+    async def emit(_event, _data):
+        return None
+
+    turn = await orchestrator.run_turn(
+        conversation(),
+        "question",
+        orchestrator.TurnOptions(
+            providers=("claude", "grok"),
+            debate=True,
+        ),
+        "partial-debate-usage",
+        emit,
+    )
+
+    for source in ("claude", "grok"):
+        answer = turn["answers"][source]
+        assert answer["ok"] is True
+        assert answer["round2_partial"] is True
+        assert answer["round2_text"] == f"{source} partial critique"
+        assert answer["round1_model"] == f"{source}-model"
+        assert answer["round2_model"] == f"{source}-model"
+        assert answer["round1_usage"]["total_tokens"] == 15
+        assert answer["round2_usage"]["total_tokens"] == 18
+        assert answer["usage"] == {
+            "input_tokens": 17,
+            "output_tokens": 16,
+            "total_tokens": 33,
+        }
+        assert answer["usage_may_be_incomplete"] is False
+        assert answer["debate_error"] == "相互批評の回答が途中で終了しました"
+    assert finance.turn_usage_reconciled(turn) is True
+
+
+@pytest.mark.asyncio
+async def test_debate_sent_round_without_usage_stays_unreconciled(monkeypatch):
+    calls = []
+    providers = {
+        "claude": DebatePartialProvider(
+            "claude",
+            calls,
+            omit_debate_usage=True,
+        ),
+        "grok": DebatePartialProvider("grok", calls),
+    }
+    monkeypatch.setattr(config, "get_provider", lambda name, _tier: providers[name])
+    monkeypatch.setattr(
+        config,
+        "get_synthesizer",
+        lambda tier, **kwargs: FakeProvider("synth", calls),
+    )
+
+    async def emit(_event, _data):
+        return None
+
+    turn = await orchestrator.run_turn(
+        conversation(),
+        "question",
+        orchestrator.TurnOptions(
+            providers=("claude", "grok"),
+            debate=True,
+        ),
+        "partial-debate-missing-usage",
+        emit,
+    )
+
+    claude = turn["answers"]["claude"]
+    assert claude["round2_usage"] == {}
+    assert claude["usage"]["total_tokens"] == 15
+    assert claude["usage_may_be_incomplete"] is True
+    assert finance.turn_usage_reconciled(turn) is False
 
 
 def test_commands_override_structured_controls():

@@ -318,6 +318,20 @@ def _merge_usage(*items: Any) -> dict[str, int]:
     return merged
 
 
+def _usage_missing_after_attempt(entry: Any) -> bool:
+    """送信済みcallにusageが無いとき、既知usageだけで精算しない。"""
+    if not isinstance(entry, dict):
+        return False
+    audit = entry.get("request_audit")
+    attempts = audit.get("http_attempts") if isinstance(audit, dict) else 0
+    return (
+        isinstance(attempts, int)
+        and not isinstance(attempts, bool)
+        and attempts > 0
+        and not _merge_usage(entry.get("usage"))
+    )
+
+
 async def _run_provider(
     source: str,
     prompt: str,
@@ -687,21 +701,62 @@ async def run_turn(
                     revised["usage_may_be_incomplete"] = bool(
                         round_one[source].get("usage_may_be_incomplete")
                         or revised.get("usage_may_be_incomplete")
+                        or _usage_missing_after_attempt(round_one[source])
+                        or _usage_missing_after_attempt(revised)
                     )
                     answers[source] = revised
                 else:
-                    answers[source]["debate_error"] = revised.get("error")
-                    answers[source]["round"] = 2
-                    answers[source]["round1_text"] = round_one[source].get("text", "")
-                    answers[source]["round2_completion_status"] = revised.get(
+                    answer = answers[source]
+                    answer["debate_error"] = revised.get("error") or (
+                        "相互批評の回答が途中で終了しました"
+                        if revised.get("partial")
+                        else "相互批評を完了できませんでした"
+                    )
+                    answer["round"] = 2
+                    answer["round1_text"] = round_one[source].get("text", "")
+                    answer["round1_model"] = round_one[source].get("model")
+                    answer["round1_elapsed_sec"] = round_one[source].get(
+                        "elapsed_sec"
+                    )
+                    answer["round1_finish_reason"] = round_one[source].get(
+                        "finish_reason"
+                    )
+                    answer["round1_completion_status"] = round_one[source].get(
                         "completion_status"
                     )
-                    answers[source]["round2_request_audit"] = dict(
+                    answer["round1_partial"] = bool(
+                        round_one[source].get("partial")
+                    )
+                    answer["round1_request_audit"] = dict(
+                        round_one[source].get("request_audit") or {}
+                    )
+                    answer["round1_usage"] = dict(
+                        round_one[source].get("usage") or {}
+                    )
+                    answer["round2_text"] = str(revised.get("text") or "")
+                    answer["round2_model"] = revised.get("model")
+                    answer["round2_elapsed_sec"] = revised.get("elapsed_sec")
+                    answer["round2_finish_reason"] = revised.get("finish_reason")
+                    answer["round2_completion_status"] = revised.get(
+                        "completion_status"
+                    )
+                    answer["round2_partial"] = bool(revised.get("partial"))
+                    answer["round2_incomplete_reason"] = revised.get(
+                        "incomplete_reason"
+                    )
+                    answer["round2_request_audit"] = dict(
                         revised.get("request_audit") or {}
                     )
-                    answers[source]["usage_may_be_incomplete"] = bool(
-                        answers[source].get("usage_may_be_incomplete")
+                    answer["round2_usage"] = dict(revised.get("usage") or {})
+                    answer["usage"] = _merge_usage(
+                        answer["round1_usage"],
+                        answer["round2_usage"],
+                    )
+                    answer["usage_may_be_incomplete"] = bool(
+                        answer.get("usage_may_be_incomplete")
                         or revised.get("usage_may_be_incomplete")
+                        or _usage_missing_after_attempt(round_one[source])
+                        or _usage_missing_after_attempt(revised)
                     )
                 await emit("answer", answers[source])
         finally:
