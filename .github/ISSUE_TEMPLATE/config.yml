@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: セキュリティ脆弱性の非公開報告
+    url: https://github.com/kojima8924/ClageCook/security/advisories/new
+    about: APIキーや会話データを含めず、公開IssueではなくPrivate vulnerability reportingを利用してください。

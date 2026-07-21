@@ -64,6 +64,7 @@ class CompletionRequest:
     prompt: str
     system: str = ""
     tier: str = "balanced"
+    reasoning_effort: str | None = None
     max_output_tokens: int = 2400
     timeout_sec: float = 180.0
     prompt_cache_key: str | None = None

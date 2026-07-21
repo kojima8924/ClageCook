@@ -126,6 +126,7 @@ void main() {
           'message': '設計を比較して',
           'conversation_id': 'conversation-id',
           'tier': 'high',
+          'reasoning_mode': 'auto',
           'debate': true,
           'providers': ['claude', 'grok'],
           'synthesize': false,

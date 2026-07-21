@@ -17,28 +17,39 @@ def _warning(code: str, message: str) -> dict[str, str]:
 def _provider_descriptor(
     name: str,
     tier: str,
+    reasoning_mode: str,
     *,
     calls: int,
     runtime: dict[str, Any],
 ) -> dict[str, Any]:
     status = config.provider_status(name, runtime=runtime)
     mode = status.mode
+    model = (
+        config.model_for(name, tier, runtime=runtime)
+        if mode == "live"
+        else "mock"
+    )
+    reasoning = config.resolve_reasoning(
+        name,
+        model,
+        reasoning_mode,
+        mock=mode != "live",
+    )
     return {
         "name": name,
         "label": status.label,
         "mode": mode,
-        "model": (
-            config.model_for(name, tier, runtime=runtime)
-            if mode == "live"
-            else "mock"
-        ),
+        "model": model,
         "billable": mode == "live" and calls > 0,
         "max_calls": calls,
+        "max_output_tokens": config.max_output_tokens_for(name, tier),
+        "reasoning": reasoning.public_dict(),
     }
 
 
 def _synthesizer_descriptor(
     tier: str,
+    reasoning_mode: str,
     *,
     enabled: bool,
     calls: int,
@@ -46,18 +57,27 @@ def _synthesizer_descriptor(
 ) -> dict[str, Any]:
     name = config.synthesizer_name(runtime=runtime)
     mode = "mock" if name == "synthesizer" else "live"
+    model = config.synthesizer_model_for(
+        tier,
+        runtime=runtime,
+        synthesizer=name,
+    )
+    reasoning = config.resolve_reasoning(
+        name,
+        model,
+        reasoning_mode,
+        mock=mode == "mock",
+    )
     return {
         "name": name,
         "label": config.LABELS.get(name, "Local mock synthesizer"),
         "mode": mode,
-        "model": config.synthesizer_model_for(
-            tier,
-            runtime=runtime,
-            synthesizer=name,
-        ),
+        "model": model,
         "enabled": enabled,
         "billable": mode == "live" and calls > 0,
         "max_calls": calls,
+        "max_output_tokens": config.max_output_tokens_for(name, tier),
+        "reasoning": reasoning.public_dict(),
     }
 
 
@@ -70,6 +90,7 @@ def build_run_plan(
     synthesize: bool = True,
     blind: bool = False,
     web_search: bool = False,
+    reasoning_mode: str = "auto",
     history_text: str = "",
     memory_text: str = "",
 ) -> dict[str, Any]:
@@ -86,6 +107,7 @@ def build_run_plan(
             synthesize=synthesize,
             blind=blind,
             web_search=web_search,
+            reasoning_mode=reasoning_mode,
         ),
     )
     active = set(config.active_workers())
@@ -161,6 +183,7 @@ def build_run_plan(
         _provider_descriptor(
             name,
             options.tier,
+            options.reasoning_mode,
             calls=calls_per_participant,
             runtime=runtime,
         )
@@ -168,15 +191,20 @@ def build_run_plan(
     ]
     synthesizer_plan = _synthesizer_descriptor(
         options.tier,
+        options.reasoning_mode,
         enabled=synthesis_effective,
         calls=synthesis_calls,
         runtime=runtime,
     )
 
-    per_call_tokens = config.MAX_OUTPUT_TOKENS[options.tier]
-    answer_tokens = answer_calls * per_call_tokens
-    debate_tokens = debate_calls * per_call_tokens
-    synthesis_tokens = synthesis_calls * per_call_tokens
+    participant_token_ceiling = sum(
+        int(item["max_output_tokens"]) for item in provider_plans
+    )
+    answer_tokens = participant_token_ceiling if answer_calls else 0
+    debate_tokens = participant_token_ceiling if debate_effective else 0
+    synthesis_tokens = (
+        int(synthesizer_plan["max_output_tokens"]) * synthesis_calls
+    )
     total_tokens = answer_tokens + debate_tokens + synthesis_tokens
     live_participant_calls = sum(
         item["max_calls"] for item in provider_plans if item["mode"] == "live"
@@ -184,8 +212,31 @@ def build_run_plan(
     live_calls = live_participant_calls + (
         synthesis_calls if synthesizer_plan["mode"] == "live" else 0
     )
-    live_output_tokens = live_calls * per_call_tokens
+    live_output_tokens = sum(
+        int(item["max_calls"]) * int(item["max_output_tokens"])
+        for item in provider_plans
+        if item["mode"] == "live"
+    ) + (
+        int(synthesizer_plan["max_output_tokens"]) * synthesis_calls
+        if synthesizer_plan["mode"] == "live"
+        else 0
+    )
     billable = live_calls > 0
+    fallback_reasoning = [
+        item["label"]
+        for item in [*provider_plans, synthesizer_plan]
+        if item.get("max_calls", 0) > 0
+        and (item.get("reasoning") or {}).get("source")
+        in {"unknown_model", "model_unsupported"}
+    ]
+    if fallback_reasoning:
+        warnings.append(
+            _warning(
+                "reasoning_provider_default",
+                "指定した思考量を安全に固定できないmodelでは、Provider既定値を使います: "
+                + ", ".join(fallback_reasoning),
+            )
+        )
     web_search_live_providers = [
         item["name"]
         for item in provider_plans
@@ -298,7 +349,9 @@ def build_run_plan(
 
     retry_budget = live_calls * config.HTTP_RETRIES
     calls_with_retries = total_calls + retry_budget
-    output_tokens_with_retries = total_tokens + retry_budget * per_call_tokens
+    output_tokens_with_retries = (
+        total_tokens + live_output_tokens * config.HTTP_RETRIES
+    )
 
     calls_exceeded = calls_with_retries > config.MAX_PROVIDER_CALLS_PER_RUN
     tokens_exceeded = output_tokens_with_retries > config.MAX_OUTPUT_TOKENS_PER_RUN
@@ -362,6 +415,7 @@ def build_run_plan(
         "mode": config.mode(),
         "options": {
             "tier": options.tier,
+            "reasoning_mode": options.reasoning_mode,
             "debate_requested": options.debate,
             "debate_effective": debate_effective,
             "synthesize_requested": options.synthesize,
@@ -441,7 +495,14 @@ def build_run_plan(
             ),
         },
         "max_output_tokens": {
-            "per_call": per_call_tokens,
+            "max_per_call": max(
+                [
+                    int(item["max_output_tokens"])
+                    for item in [*provider_plans, synthesizer_plan]
+                    if int(item.get("max_calls") or 0) > 0
+                ],
+                default=0,
+            ),
             "answers": answer_tokens,
             "debate": debate_tokens,
             "synthesis": synthesis_tokens,

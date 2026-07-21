@@ -1,6 +1,13 @@
 # ===== 秘密情報 =====
 .env
+.env.*
+!.env.example
+!**/.env.example
 *.key
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
 
 # ===== Python (backend) =====
 __pycache__/
@@ -26,6 +33,11 @@ app/.pub/
 
 # ビルド成果物
 build/
+.dist-temp/
+*.apk
+*.aab
+*.idsig
+*.ipa
 
 # ===== OS / editor =====
 .DS_Store
@@ -34,3 +46,4 @@ Thumbs.db
 .vscode/
 *.iml
 .codex-remote-attachments/
+.codex-temp/

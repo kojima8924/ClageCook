@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -19,6 +20,7 @@ class SavedTurnView extends StatelessWidget {
     this.onForkEdit,
     this.actionPending = false,
     this.regenerationPending = false,
+    this.showTokenUsageLedger = true,
   });
 
   final TurnRecord turn;
@@ -29,6 +31,7 @@ class SavedTurnView extends StatelessWidget {
   final VoidCallback? onForkEdit;
   final bool actionPending;
   final bool regenerationPending;
+  final bool showTokenUsageLedger;
 
   @override
   Widget build(BuildContext context) {
@@ -42,6 +45,7 @@ class SavedTurnView extends StatelessWidget {
       liveError: _savedTurnNotice(turn),
       attempts: turn.attempts,
       synthesisStale: turn.synthesisStale,
+      reasoningMode: turn.options['reasoning_mode']?.toString() ?? '',
       regenerationPending: regenerationPending,
       onRegenerateAnswer: turn.status == 'completed'
           ? onRegenerateAnswer
@@ -51,6 +55,10 @@ class SavedTurnView extends StatelessWidget {
           : null,
       onForkEdit: turn.status == 'completed' ? onForkEdit : null,
       attachments: turn.attachments,
+      showTokenUsageLedger: showTokenUsageLedger,
+      usageLedgerStorageKey: PageStorageKey<String>(
+        'usage-ledger-${turn.requestId}',
+      ),
       statusActions: turn.status == 'running'
           ? Wrap(
               spacing: 8,
@@ -82,9 +90,14 @@ class SavedTurnView extends StatelessWidget {
 ///
 /// [LiveTurn] 自体はmutableなので、呼び出し側でイベント受信時に再buildする。
 class LiveTurnView extends StatelessWidget {
-  const LiveTurnView({super.key, required this.turn});
+  const LiveTurnView({
+    super.key,
+    required this.turn,
+    this.showTokenUsageLedger = true,
+  });
 
   final LiveTurn turn;
+  final bool showTokenUsageLedger;
 
   @override
   Widget build(BuildContext context) {
@@ -98,6 +111,11 @@ class LiveTurnView extends StatelessWidget {
       livePhase: turn.phase,
       liveError: turn.error,
       synthesisPending: turn.synthesis == null && turn.error.isEmpty,
+      reasoningMode: turn.reasoningMode,
+      showTokenUsageLedger: showTokenUsageLedger,
+      usageLedgerStorageKey: PageStorageKey<String>(
+        'usage-ledger-${turn.requestId}',
+      ),
     );
   }
 }
@@ -131,11 +149,14 @@ class _TurnView extends StatelessWidget {
     this.statusActions,
     this.attempts = const [],
     this.synthesisStale = false,
+    this.reasoningMode = '',
     this.regenerationPending = false,
     this.onRegenerateAnswer,
     this.onRegenerateSynthesis,
     this.onForkEdit,
     this.attachments = const [],
+    this.showTokenUsageLedger = true,
+    this.usageLedgerStorageKey,
   });
 
   final String message;
@@ -149,11 +170,14 @@ class _TurnView extends StatelessWidget {
   final Widget? statusActions;
   final List<RegenerationAttempt> attempts;
   final bool synthesisStale;
+  final String reasoningMode;
   final bool regenerationPending;
   final ValueChanged<String>? onRegenerateAnswer;
   final VoidCallback? onRegenerateSynthesis;
   final VoidCallback? onForkEdit;
   final List<AttachmentRecord> attachments;
+  final bool showTokenUsageLedger;
+  final Key? usageLedgerStorageKey;
 
   @override
   Widget build(BuildContext context) {
@@ -197,6 +221,14 @@ class _TurnView extends StatelessWidget {
           _AnswerCard(
             provider: provider,
             answer: answers[provider],
+            reasoningMode: reasoningMode,
+            attempts: attempts
+                .where(
+                  (attempt) =>
+                      attempt.target == 'answer' &&
+                      attempt.provider == provider,
+                )
+                .toList(growable: false),
             pending: answers[provider] == null && liveError.isEmpty,
             regenerationPending: regenerationPending,
             onRegenerate: onRegenerateAnswer == null
@@ -205,8 +237,14 @@ class _TurnView extends StatelessWidget {
           ),
           const SizedBox(height: 8),
         ],
-        if (insights?.isNotEmpty == true || usageEntries.isNotEmpty) ...[
-          InsightsPanel(insights: insights, usageEntries: usageEntries),
+        if (insights?.isNotEmpty == true ||
+            (showTokenUsageLedger && usageEntries.isNotEmpty)) ...[
+          InsightsPanel(
+            insights: insights,
+            usageEntries: usageEntries,
+            showUsageLedger: showTokenUsageLedger,
+            usageLedgerStorageKey: usageLedgerStorageKey,
+          ),
           const SizedBox(height: 8),
         ],
         if (attempts.isNotEmpty) ...[
@@ -388,6 +426,8 @@ class _AnswerCard extends StatelessWidget {
   const _AnswerCard({
     required this.provider,
     required this.answer,
+    required this.reasoningMode,
+    required this.attempts,
     required this.pending,
     this.regenerationPending = false,
     this.onRegenerate,
@@ -395,6 +435,8 @@ class _AnswerCard extends StatelessWidget {
 
   final String provider;
   final AnswerRecord? answer;
+  final String reasoningMode;
+  final List<RegenerationAttempt> attempts;
   final bool pending;
   final bool regenerationPending;
   final VoidCallback? onRegenerate;
@@ -415,70 +457,25 @@ class _AnswerCard extends StatelessWidget {
       child: ExpansionTile(
         maintainState: true,
         initiallyExpanded: failed || hasDebateError || current?.partial == true,
-        tilePadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-        childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+        tilePadding: const EdgeInsets.symmetric(horizontal: 10),
+        childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
         leading: Container(
-          width: 4,
-          height: 28,
+          width: 3,
+          height: 26,
           decoration: BoxDecoration(
             color: accent,
             borderRadius: BorderRadius.circular(2),
           ),
         ),
-        title: Row(
-          children: [
-            Expanded(
-              child: Text(
-                _providerLabels[provider] ?? provider,
-                style: theme.textTheme.titleMedium?.copyWith(
-                  color: accent,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-            if (pending)
-              const SizedBox.square(
-                dimension: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            else ...[
-              if (onRegenerate != null && current != null)
-                IconButton(
-                  tooltip: '${_providerLabels[provider] ?? provider}の回答を再生成',
-                  onPressed: regenerationPending ? null : onRegenerate,
-                  icon: regenerationPending
-                      ? const SizedBox.square(
-                          dimension: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.replay_outlined),
-                ),
-              if (failed)
-                Icon(Icons.error_outline, color: colors.error)
-              else if (current?.partial == true ||
-                  current?.usageMayBeIncomplete == true)
-                Icon(Icons.warning_amber_rounded, color: colors.error)
-              else
-                Icon(Icons.check_circle_outline, color: accent),
-            ],
-          ],
+        title: _AnswerHeader(
+          provider: provider,
+          answer: current,
+          reasoningMode: reasoningMode,
+          pending: pending,
+          regenerationPending: regenerationPending,
+          onRegenerate: onRegenerate,
+          accent: accent,
         ),
-        subtitle: current == null
-            ? Text(pending ? '回答待ち…' : '回答なし', style: theme.textTheme.bodySmall)
-            : Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: _Metadata(
-                  model: current.model,
-                  elapsedSec: current.elapsedSec,
-                  mock: current.mock,
-                  debateRound: current.round,
-                  partial: current.partial,
-                  incompleteReason: current.incompleteReason,
-                  usageMayBeIncomplete: current.usageMayBeIncomplete,
-                  requestAudit: current.requestAudit,
-                  webSearchRequested: current.webSearchRequested,
-                ),
-              ),
         children: [
           if (current == null)
             Align(
@@ -491,6 +488,18 @@ class _AnswerCard extends StatelessWidget {
               ),
             )
           else ...[
+            _Metadata(
+              model: current.model,
+              elapsedSec: current.elapsedSec,
+              mock: current.mock,
+              debateRound: current.round,
+              partial: current.partial,
+              incompleteReason: current.incompleteReason,
+              usageMayBeIncomplete: current.usageMayBeIncomplete,
+              requestAudit: current.requestAudit,
+              webSearchRequested: current.webSearchRequested,
+            ),
+            const SizedBox(height: 10),
             if (current.partial) ...[
               _ErrorBox(
                 title: '部分回答',
@@ -505,8 +514,17 @@ class _AnswerCard extends StatelessWidget {
                     ? '回答の生成に失敗しました。'
                     : current.error,
               ),
+            if (hasInitial) ...[
+              const SizedBox(height: 8),
+              _InitialAnswer(answer: current),
+            ],
+            if (attempts.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _ProviderAttemptHistory(provider: provider, attempts: attempts),
+            ],
             if (current.text.trim().isNotEmpty) ...[
-              if (!current.ok) const SizedBox(height: 10),
+              if (!current.ok || hasInitial || attempts.isNotEmpty)
+                const SizedBox(height: 10),
               _Markdown(text: current.text),
               if (current.citations.isNotEmpty) ...[
                 const SizedBox(height: 12),
@@ -525,15 +543,228 @@ class _AnswerCard extends StatelessWidget {
                 warning: true,
               ),
             ],
-            if (hasInitial) ...[
-              const SizedBox(height: 8),
-              _InitialAnswer(answer: current),
-            ],
           ],
         ],
       ),
     );
   }
+}
+
+class _AnswerHeader extends StatelessWidget {
+  const _AnswerHeader({
+    required this.provider,
+    required this.answer,
+    required this.reasoningMode,
+    required this.pending,
+    required this.regenerationPending,
+    required this.onRegenerate,
+    required this.accent,
+  });
+
+  final String provider;
+  final AnswerRecord? answer;
+  final String reasoningMode;
+  final bool pending;
+  final bool regenerationPending;
+  final VoidCallback? onRegenerate;
+  final Color accent;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = _providerLabels[provider] ?? provider;
+    final status = _answerStatus(answer, pending: pending);
+    final metadata = _compactAnswerMetadata(
+      answer,
+      reasoningMode: reasoningMode,
+      pending: pending,
+    );
+    return Semantics(
+      container: true,
+      label: '$label、${status.label}${metadata.isEmpty ? '' : '、$metadata'}',
+      child: Row(
+        children: [
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 74),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: accent,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Tooltip(
+              message: metadata.isEmpty ? status.label : metadata,
+              child: Text(
+                metadata,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ),
+          _AnswerStatusIcon(status: status, accent: accent),
+          if (answer?.text.trim().isNotEmpty == true)
+            _CompactIconButton(
+              tooltip: '$labelの回答をコピー',
+              icon: Icons.content_copy_outlined,
+              onPressed: () => _copyText(context, answer!.text, '$labelの回答'),
+            ),
+          if (onRegenerate != null && answer != null)
+            _CompactIconButton(
+              tooltip: '$labelの回答を再生成',
+              icon: Icons.replay_outlined,
+              onPressed: regenerationPending ? null : onRegenerate,
+              progress: regenerationPending,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CompactIconButton extends StatelessWidget {
+  const _CompactIconButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+    this.progress = false,
+  });
+
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+  final bool progress;
+
+  @override
+  Widget build(BuildContext context) => IconButton(
+    tooltip: tooltip,
+    visualDensity: VisualDensity.compact,
+    constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+    padding: const EdgeInsets.all(5),
+    onPressed: onPressed,
+    icon: progress
+        ? const SizedBox.square(
+            dimension: 15,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          )
+        : Icon(icon, size: 19),
+  );
+}
+
+class _AnswerStatus {
+  const _AnswerStatus(
+    this.label,
+    this.icon, {
+    this.warning = false,
+    this.progress = false,
+  });
+
+  final String label;
+  final IconData icon;
+  final bool warning;
+  final bool progress;
+}
+
+class _AnswerStatusIcon extends StatelessWidget {
+  const _AnswerStatusIcon({required this.status, required this.accent});
+
+  final _AnswerStatus status;
+  final Color accent;
+
+  @override
+  Widget build(BuildContext context) => Tooltip(
+    message: status.label,
+    child: SizedBox.square(
+      dimension: 26,
+      child: status.progress
+          ? Padding(
+              padding: const EdgeInsets.all(4),
+              child: CircularProgressIndicator(strokeWidth: 2, color: accent),
+            )
+          : Icon(
+              status.icon,
+              size: 18,
+              color: status.warning
+                  ? Theme.of(context).colorScheme.error
+                  : accent,
+            ),
+    ),
+  );
+}
+
+_AnswerStatus _answerStatus(AnswerRecord? answer, {required bool pending}) {
+  if (pending) {
+    return const _AnswerStatus('生成中', Icons.pending_outlined, progress: true);
+  }
+  if (answer == null) {
+    return const _AnswerStatus('回答なし', Icons.remove_circle_outline);
+  }
+  if (answer.partial) {
+    return const _AnswerStatus(
+      '部分回答',
+      Icons.warning_amber_rounded,
+      warning: true,
+    );
+  }
+  if (!answer.ok) {
+    return const _AnswerStatus('失敗', Icons.error_outline, warning: true);
+  }
+  if (answer.usageMayBeIncomplete) {
+    return const _AnswerStatus(
+      '利用量を要確認',
+      Icons.warning_amber_rounded,
+      warning: true,
+    );
+  }
+  return const _AnswerStatus('完了', Icons.check_circle_outline);
+}
+
+String _compactAnswerMetadata(
+  AnswerRecord? answer, {
+  required String reasoningMode,
+  required bool pending,
+}) {
+  if (answer == null) return pending ? '回答待ち…' : '回答なし';
+  final model = answer.model.trim();
+  final effectiveEffort =
+      answer.reasoning['effective']?.toString().trim() ?? '';
+  final effort = effectiveEffort.isNotEmpty
+      ? effectiveEffort
+      : reasoningMode.trim();
+  return [
+    if (model.isNotEmpty && !(answer.mock && model.toLowerCase() == 'mock'))
+      model,
+    if (effort.isNotEmpty)
+      effort == 'provider_default'
+          ? 'effort PROVIDER'
+          : 'effort ${effort.toUpperCase()}',
+    if (answer.elapsedSec > 0) _elapsedLabel(answer.elapsedSec),
+    if (answer.round > 1) 'DEBATE R${answer.round}',
+    if (answer.round1Text.trim().isNotEmpty) '批評前あり',
+    if (answer.mock) 'MOCK',
+    if (answer.webSearchRequested) 'WEB',
+  ].join(' · ');
+}
+
+void _copyText(BuildContext context, String text, String label) {
+  unawaited(Clipboard.setData(ClipboardData(text: text)));
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  messenger
+    ?..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        content: Text('$labelをコピーしました'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
 }
 
 class _Metadata extends StatelessWidget {
@@ -682,40 +913,223 @@ class _InitialAnswer extends StatelessWidget {
         ? (answer.debateError.isNotEmpty ? answer.model : '')
         : answer.round1Model;
     final attempts = _auditAttempts(answer.round1RequestAudit);
-    return ExpansionTile(
-      tilePadding: EdgeInsets.zero,
-      childrenPadding: const EdgeInsets.only(bottom: 8),
-      title: const Text('最初の回答（批評前）'),
-      leading: const Icon(Icons.history),
-      children: [
-        if (model.isNotEmpty ||
-            answer.round1ElapsedSec > 0 ||
-            usage.isNotEmpty ||
-            attempts > 1 ||
-            answer.round1Partial)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 5,
-              children: [
-                if (model.isNotEmpty) _MetaChip(label: model),
-                if (answer.round1ElapsedSec > 0)
-                  _MetaChip(label: _elapsedLabel(answer.round1ElapsedSec)),
-                if (usage['total_tokens'] != null)
-                  _MetaChip(label: '初回 ${usage['total_tokens']} token'),
-                if (attempts > 1)
-                  _MetaChip(label: 'HTTP $attempts回', warning: true),
-                if (answer.round1Partial)
-                  const _MetaChip(label: 'PARTIAL', warning: true),
-              ],
+    final colors = Theme.of(context).colorScheme;
+    return Material(
+      color: colors.surfaceContainerLow,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(10),
+        side: BorderSide(color: colors.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        maintainState: true,
+        tilePadding: const EdgeInsets.only(left: 10, right: 6),
+        childrenPadding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+        title: Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '最初の回答（批評前）',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            _CompactIconButton(
+              tooltip: '最初の回答をコピー',
+              icon: Icons.content_copy_outlined,
+              onPressed: () => _copyText(context, answer.round1Text, '最初の回答'),
+            ),
+          ],
+        ),
+        leading: const Icon(Icons.history, size: 20),
+        children: [
+          if (model.isNotEmpty ||
+              answer.round1ElapsedSec > 0 ||
+              usage.isNotEmpty ||
+              attempts > 1 ||
+              answer.round1Partial)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 5,
+                children: [
+                  if (model.isNotEmpty) _MetaChip(label: model),
+                  if (answer.round1ElapsedSec > 0)
+                    _MetaChip(label: _elapsedLabel(answer.round1ElapsedSec)),
+                  if (usage['total_tokens'] != null)
+                    _MetaChip(label: '初回 ${usage['total_tokens']} token'),
+                  if (attempts > 1)
+                    _MetaChip(label: 'HTTP $attempts回', warning: true),
+                  if (answer.round1Partial)
+                    const _MetaChip(label: 'PARTIAL', warning: true),
+                ],
+              ),
+            ),
+          if (answer.round1Partial) ...[
+            const _ErrorBox(
+              title: '最初の回答は部分回答です',
+              message: '批評前の本文が途中で終了しています。完全な回答として扱わないでください。',
+              warning: true,
+            ),
+            const SizedBox(height: 8),
+          ],
+          _Markdown(text: answer.round1Text),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProviderAttemptHistory extends StatelessWidget {
+  const _ProviderAttemptHistory({
+    required this.provider,
+    required this.attempts,
+  });
+
+  final String provider;
+  final List<RegenerationAttempt> attempts;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final regenerated = attempts.where((attempt) => !attempt.original).length;
+    return Material(
+      color: Colors.transparent,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(10),
+        side: BorderSide(color: colors.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        maintainState: true,
+        tilePadding: const EdgeInsets.symmetric(horizontal: 10),
+        childrenPadding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+        leading: const Icon(Icons.account_tree_outlined, size: 20),
+        title: Text(
+          '保存された回答履歴 ${attempts.length}件',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              regenerated == 0
+                  ? '最初の回答をimmutable attemptとして保持しています。'
+                  : '最初の回答を保持したまま、再生成を$regenerated件記録しています。',
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant),
             ),
           ),
-        _Markdown(text: answer.round1Text),
+          const SizedBox(height: 4),
+          for (final attempt in attempts)
+            _AttemptHistoryTile(provider: provider, attempt: attempt),
+        ],
+      ),
+    );
+  }
+}
+
+class _AttemptHistoryTile extends StatelessWidget {
+  const _AttemptHistoryTile({required this.provider, required this.attempt});
+
+  final String provider;
+  final RegenerationAttempt attempt;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final result = attempt.result.isEmpty
+        ? null
+        : AnswerRecord.fromJson(attempt.result);
+    final text = result?.text.trim() ?? '';
+    final title = attempt.original
+        ? '最初の保存回答'
+        : '${_providerLabels[provider] ?? provider} · ${_attemptStatusLabel(attempt.status)}';
+    final leading = Icon(
+      attempt.usageMayBeIncomplete
+          ? Icons.warning_amber_rounded
+          : attempt.original
+          ? Icons.history
+          : attempt.status == 'completed'
+          ? Icons.check_circle_outline
+          : attempt.status == 'failed'
+          ? Icons.error_outline
+          : Icons.pending_outlined,
+      color: attempt.usageMayBeIncomplete ? colors.error : null,
+    );
+    final subtitleParts = [
+      if (result?.model.trim().isNotEmpty == true) result!.model.trim(),
+      if (attempt.createdAt.isNotEmpty) attempt.createdAt,
+    ];
+    if (text.isEmpty) {
+      return ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        visualDensity: VisualDensity.compact,
+        leading: leading,
+        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        subtitle: subtitleParts.isEmpty
+            ? null
+            : Text(
+                subtitleParts.join(' · '),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+      );
+    }
+    return ExpansionTile(
+      key: ValueKey('attempt-${attempt.attemptId}'),
+      maintainState: true,
+      tilePadding: EdgeInsets.zero,
+      childrenPadding: const EdgeInsets.only(left: 8, right: 8, bottom: 10),
+      visualDensity: VisualDensity.compact,
+      leading: leading,
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+          _CompactIconButton(
+            tooltip: '$titleをコピー',
+            icon: Icons.content_copy_outlined,
+            onPressed: () => _copyText(context, text, title),
+          ),
+        ],
+      ),
+      subtitle: subtitleParts.isEmpty
+          ? null
+          : Text(
+              subtitleParts.join(' · '),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+      children: [
+        if (attempt.usageMayBeIncomplete || result?.partial == true) ...[
+          const _ErrorBox(
+            title: '利用量・本文を要確認',
+            message: 'この試行は中断または部分完了の可能性があります。完全な回答として扱わないでください。',
+            warning: true,
+          ),
+          const SizedBox(height: 8),
+        ],
+        _Markdown(text: text),
       ],
     );
   }
 }
+
+String _attemptStatusLabel(String status) => switch (status) {
+  'completed' => '完了',
+  'failed' => '失敗',
+  'running' || 'pending' => '実行中',
+  'partial' => '部分回答',
+  _ => status.isEmpty ? '状態不明' : status,
+};
 
 class _SynthesisCard extends StatelessWidget {
   const _SynthesisCard({

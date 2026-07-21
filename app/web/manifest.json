@@ -5,7 +5,7 @@
     "display": "standalone",
     "background_color": "#101119",
     "theme_color": "#4966A6",
-    "description": "A new Flutter project.",
+    "description": "APIキーだけで使えるローカル保存型のマルチAI会議クライアント。",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

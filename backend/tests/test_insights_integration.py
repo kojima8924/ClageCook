@@ -13,11 +13,12 @@ async def test_turn_emits_and_persists_local_insights(monkeypatch):
         *,
         system,
         tier,
+        reasoning_mode,
         round_number,
         prompt_cache_key=None,
     ):
         del prompt_cache_key
-        del prompt, system, tier
+        del prompt, system, tier, reasoning_mode
         text = {
             "claude": "安全性と暗号化を優先します。",
             "gemini": "安全性と監査ログを優先します。",

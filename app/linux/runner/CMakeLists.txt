@@ -16,6 +16,17 @@ add_executable(${BINARY_NAME}
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
 
+# Harden the native launcher. Provider keys themselves remain in the desktop
+# Secret Service through flutter_secure_storage, never in the executable.
+target_compile_options(${BINARY_NAME} PRIVATE
+  "$<$<NOT:$<CONFIG:Debug>>:-fstack-protector-strong>"
+  "$<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>"
+  "$<$<NOT:$<CONFIG:Debug>>:-D_GLIBCXX_ASSERTIONS>"
+)
+target_link_options(${BINARY_NAME} PRIVATE
+  "$<$<NOT:$<CONFIG:Debug>>:-Wl,-z,relro,-z,now,-z,noexecstack>"
+)
+
 # Add preprocessor definitions for the application ID.
 add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")
 

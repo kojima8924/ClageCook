@@ -97,11 +97,12 @@ def _plan():
                 "model": "claude-test",
                 "billable": True,
                 "max_calls": 1,
+                "max_output_tokens": 1,
             }
         ],
-        "synthesizer": {"billable": False},
+        "synthesizer": {"billable": False, "max_output_tokens": 0},
         "input_envelope": {"answer_per_call": 2, "debate_per_call": 0},
-        "max_output_tokens": {"per_call": 1},
+        "max_output_tokens": {"max_per_call": 1},
         "retry_envelope": {"configured_retries_per_live_call": 0},
     }
 

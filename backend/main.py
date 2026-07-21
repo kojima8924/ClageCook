@@ -252,6 +252,7 @@ def _valid_request_id(value: str) -> bool:
 class PlanRequest(BaseModel):
     message: str = Field(min_length=1)
     tier: Literal["low", "balanced", "high"] = "balanced"
+    reasoning_mode: Literal["auto", "low", "medium", "high"] = "auto"
     debate: bool = False
     providers: list[Literal["claude", "gemini", "chatgpt", "grok"]] | None = None
     synthesize: bool = True
@@ -442,6 +443,7 @@ def _plan_from_snapshot(
     plan = planning.build_run_plan(
         message=req.message + attachment_context,
         tier=req.tier,
+        reasoning_mode=req.reasoning_mode,
         debate=req.debate,
         providers=req.providers,
         synthesize=req.synthesize,
@@ -636,6 +638,7 @@ def _request_fingerprint(req: ChatRequest) -> str:
     payload = {
         "message": req.message,
         "tier": req.tier,
+        "reasoning_mode": req.reasoning_mode,
         "debate": req.debate,
         "providers": sorted(set(req.providers or [])),
         "synthesize": req.synthesize,
@@ -979,6 +982,7 @@ def _new_pending_turn(
         "options": effective.public_dict(),
         "resume_request": {
             "tier": req.tier,
+            "reasoning_mode": req.reasoning_mode,
             "debate": req.debate,
             "providers": req.providers,
             "synthesize": req.synthesize,
@@ -1150,6 +1154,7 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
                 selected_providers = tuple(provider_models)
                 options = orchestrator.TurnOptions(
                     tier=req.tier,
+                    reasoning_mode=req.reasoning_mode,
                     debate=req.debate,
                     providers=selected_providers,
                     synthesize=req.synthesize,
@@ -1161,6 +1166,34 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
                     "providers": provider_models,
                     "synthesizer": synthesizer_model,
                     "synthesizer_provider": synthesizer_provider,
+                    "provider_execution": {
+                        str(item["name"]): {
+                            "model": str(item["model"]),
+                            "max_output_tokens": int(item["max_output_tokens"]),
+                            "reasoning": deepcopy(item.get("reasoning") or {}),
+                        }
+                        for item in final_plan.get("providers") or []
+                        if isinstance(item, dict)
+                        and isinstance(item.get("name"), str)
+                        and isinstance(item.get("model"), str)
+                        and isinstance(item.get("max_output_tokens"), int)
+                    },
+                    "synthesizer_execution": (
+                        {
+                            "model": synthesizer_model,
+                            "max_output_tokens": int(
+                                synthesizer_plan["max_output_tokens"]
+                            ),
+                            "reasoning": deepcopy(
+                                synthesizer_plan.get("reasoning") or {}
+                            ),
+                        }
+                        if isinstance(synthesizer_plan, dict)
+                        and isinstance(
+                            synthesizer_plan.get("max_output_tokens"), int
+                        )
+                        else None
+                    ),
                 }
                 pending = _new_pending_turn(
                     req,
@@ -1746,6 +1779,39 @@ async def _execute_regeneration(
                             and isinstance(plan["synthesizer"].get("name"), str)
                             else None
                         ),
+                        "provider_execution": {
+                            str(item["name"]): {
+                                "model": str(item["model"]),
+                                "max_output_tokens": int(
+                                    item["max_output_tokens"]
+                                ),
+                                "reasoning": deepcopy(
+                                    item.get("reasoning") or {}
+                                ),
+                            }
+                            for item in plan.get("providers") or []
+                            if isinstance(item, dict)
+                            and isinstance(item.get("name"), str)
+                            and isinstance(item.get("model"), str)
+                            and isinstance(item.get("max_output_tokens"), int)
+                        },
+                        "synthesizer_execution": (
+                            {
+                                "model": plan["synthesizer"].get("model"),
+                                "max_output_tokens": int(
+                                    plan["synthesizer"]["max_output_tokens"]
+                                ),
+                                "reasoning": deepcopy(
+                                    plan["synthesizer"].get("reasoning") or {}
+                                ),
+                            }
+                            if isinstance(plan.get("synthesizer"), dict)
+                            and isinstance(
+                                plan["synthesizer"].get("max_output_tokens"),
+                                int,
+                            )
+                            else None
+                        ),
                     },
                     "usage_may_be_incomplete": True,
                 }
@@ -1758,6 +1824,12 @@ async def _execute_regeneration(
                 tier = str((turn.get("options") or {}).get("tier") or "balanced")
                 if tier not in {"low", "balanced", "high"}:
                     tier = "balanced"
+                reasoning_mode = config.normalized_reasoning_mode(
+                    str(
+                        (turn.get("options") or {}).get("reasoning_mode")
+                        or "auto"
+                    )
+                )
                 message = str(turn.get("clean_message") or turn.get("message") or "")
                 model_message = message + attachment_bundle[0]
                 context = deepcopy(conversation_data)
@@ -1797,6 +1869,7 @@ async def _execute_regeneration(
                             + regeneration.ANSWER_REGENERATION_INSTRUCTION
                         ),
                         tier=tier,
+                        reasoning_mode=reasoning_mode,
                         round_number=1,
                         prompt_cache_key=orchestrator._prompt_cache_key(
                             conversation_id,
@@ -1813,6 +1886,7 @@ async def _execute_regeneration(
                         model_message,
                         answers,
                         tier,
+                        reasoning_mode,
                         aliases,
                         conversation_id,
                     )

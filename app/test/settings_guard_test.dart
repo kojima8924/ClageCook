@@ -4,6 +4,9 @@ import 'dart:convert';
 import 'package:clage_cook/models.dart';
 import 'package:clage_cook/screens/home_screen.dart';
 import 'package:clage_cook/services/api_client.dart';
+import 'package:clage_cook/services/direct_byok_client.dart';
+import 'package:clage_cook/services/direct_settings_store.dart';
+import 'package:clage_cook/services/local_conversation_store.dart';
 import 'package:clage_cook/services/settings_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -99,6 +102,46 @@ void main() {
     expect(requestsToA, requestsAfterAConnect);
     expect(find.textContaining('先に設定画面でバックエンドへ接続'), findsOneWidget);
   });
+
+  testWidgets('配布版bootstrapは保存済み開発用modeをDirectへ強制する', (tester) async {
+    var serverFactoryCalls = 0;
+    var directFactoryCalls = 0;
+    final localRepository = SharedPreferencesLocalConversationRepository(
+      namespace: LocalConversationNamespace.directByok,
+      valueStore: MemoryLocalConversationValueStore(),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: _MemoryDirectSettings(
+            const DirectSettings(
+              executionMode: ExecutionMode.referenceServer,
+              claudeApiKey: 'configured-key',
+            ),
+          ),
+          localConversationRepository: localRepository,
+          allowReferenceServer: false,
+          clientFactory: (settings) {
+            serverFactoryCalls++;
+            return ApiClient(settings);
+          },
+          directClientFactory: (settings, conversations) {
+            directFactoryCalls++;
+            return DirectByokClient(
+              settings: settings,
+              conversations: conversations,
+            );
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(serverFactoryCalls, 0);
+    expect(directFactoryCalls, 1);
+    expect(find.text('DIRECT · LOCAL'), findsOneWidget);
+  });
 }
 
 Finder _messageField() => find.byWidgetPredicate(
@@ -117,6 +160,26 @@ class _MemorySettings implements SettingsRepository {
 
   @override
   Future<void> save(ConnectionSettings settings) async => value = settings;
+}
+
+class _MemoryDirectSettings implements DirectSettingsRepository {
+  _MemoryDirectSettings(this.value);
+
+  DirectSettings value;
+
+  @override
+  Future<void> clearAllKeys() async {}
+
+  @override
+  Future<DirectSettings> load() async => value;
+
+  @override
+  Future<void> save(DirectSettings settings) async => value = settings;
+
+  @override
+  Future<void> setShowLiveApiConfirmation(bool enabled) async {
+    value = value.copyWith(showLiveApiConfirmation: enabled);
+  }
 }
 
 http.Response _successResponse(http.Request request) {

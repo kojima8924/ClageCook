@@ -38,6 +38,15 @@ class FakeProvider(Provider):
         )
 
 
+class PartialProvider(FakeProvider):
+    async def complete(self, request):
+        result = await super().complete(request)
+        result.completion_status = "incomplete"
+        result.partial = True
+        result.incomplete_reason = "max_output_tokens"
+        return result
+
+
 def conversation():
     return {
         "id": "00000000-0000-0000-0000-000000000001",
@@ -78,6 +87,42 @@ async def test_parallel_partial_failure_and_synthesis(monkeypatch):
     assert [event for event, _ in events].count("answer") == 3
     assert events[0][0] == "meta"
     assert events[-1][0] == "synthesis"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_answer_is_visible_but_excluded_from_synthesis(monkeypatch):
+    calls = []
+
+    def get_provider(name, _tier):
+        if name == "claude":
+            return PartialProvider(name, calls)
+        return FakeProvider(name, calls)
+
+    monkeypatch.setattr(config, "get_provider", get_provider)
+    monkeypatch.setattr(
+        config,
+        "get_synthesizer",
+        lambda tier, **kwargs: FakeProvider("synth", calls),
+    )
+    events = []
+
+    async def emit(event, data):
+        events.append((event, data))
+
+    turn = await orchestrator.run_turn(
+        conversation(),
+        "question",
+        orchestrator.TurnOptions(providers=("claude", "chatgpt")),
+        "partial-answer-request",
+        emit,
+    )
+
+    assert turn["answers"]["claude"]["text"]
+    assert turn["answers"]["claude"]["partial"] is True
+    assert turn["answers"]["claude"]["ok"] is False
+    synthesis_call = next(call for call in calls if call[0] == "synth")
+    assert "claude answer" not in synthesis_call[2]
+    assert "chatgpt answer" in synthesis_call[2]
 
 
 @pytest.mark.asyncio
@@ -277,6 +322,7 @@ async def test_provider_error_audit_is_saved_without_raw_exception(monkeypatch):
         "question",
         system="system",
         tier="balanced",
+        reasoning_mode="auto",
         round_number=1,
     )
 
@@ -315,12 +361,14 @@ async def test_execution_model_snapshot_overrides_later_runtime_configuration(
             "question",
             system="system",
             tier="balanced",
+            reasoning_mode="auto",
             round_number=1,
         )
         synthesis = await orchestrator._run_synthesis(
             "question",
             {"chatgpt": answer},
             "balanced",
+            "auto",
         )
 
     assert answer["model"] == "planned-worker-model"
@@ -343,6 +391,7 @@ async def test_frozen_synthesizer_provider_is_preserved_on_failure(monkeypatch):
             "question",
             {"chatgpt": {"ok": True, "text": "answer"}},
             "balanced",
+            "auto",
         )
 
     assert result["ok"] is False

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Development-only compatibility for a user-selected LAN/Tailscale
+         reference server. Direct provider endpoints still use HTTPS. -->
+    <base-config cleartextTrafficPermitted="true"/>
+</network-security-config>

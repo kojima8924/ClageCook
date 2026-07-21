@@ -16,7 +16,7 @@ from .base import (
 )
 
 
-_EFFORT = {"low": "low", "balanced": "medium", "high": "high"}
+_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 
 
 class OpenAIProvider(HttpProvider):
@@ -28,8 +28,9 @@ class OpenAIProvider(HttpProvider):
             "input": request.prompt,
             "store": False,
             "max_output_tokens": request.max_output_tokens,
-            "reasoning": {"effort": _EFFORT.get(request.tier, "medium")},
         }
+        if request.reasoning_effort in _EFFORTS:
+            payload["reasoning"] = {"effort": request.reasoning_effort}
         if request.system:
             payload["instructions"] = request.system
         if request.web_search:

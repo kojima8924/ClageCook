@@ -210,7 +210,12 @@ class PolicyScanResult {
 
   factory PolicyScanResult.fromJson(Map<String, dynamic> json) =>
       PolicyScanResult(
-        action: json['action']?.toString() ?? 'block',
+        action: switch (json['action']?.toString()) {
+          'allow' => 'allow',
+          'confirm' => 'confirm',
+          'block' => 'block',
+          _ => 'block',
+        },
         findings: _mapList(json['findings'], PolicyFinding.fromJson),
         redactedText: json['redacted_text']?.toString() ?? '',
         disclaimer: json['disclaimer']?.toString() ?? '',
@@ -989,6 +994,7 @@ class AnswerRecord {
     this.incompleteReason = '',
     this.usageMayBeIncomplete = false,
     this.requestAudit = const {},
+    this.reasoning = const {},
     this.citations = const [],
     this.webSearchRequested = false,
   });
@@ -1030,6 +1036,7 @@ class AnswerRecord {
           json['usage_may_be_incomplete'] == true ||
           audit['usage_may_be_incomplete'] == true,
       requestAudit: audit,
+      reasoning: _dynamicMapOrNull(json['reasoning']) ?? const {},
       citations: _mapList(json['citations'], CitationRecord.fromJson),
       webSearchRequested: json['web_search_requested'] == true,
     );
@@ -1057,6 +1064,7 @@ class AnswerRecord {
   final String incompleteReason;
   final bool usageMayBeIncomplete;
   final Map<String, dynamic> requestAudit;
+  final Map<String, dynamic> reasoning;
   final List<CitationRecord> citations;
   final bool webSearchRequested;
 }
@@ -1132,6 +1140,7 @@ class RegenerationAttempt {
     this.completedAt = '',
     this.original = false,
     this.usageMayBeIncomplete = false,
+    this.result = const {},
   });
 
   factory RegenerationAttempt.fromJson(Map<String, dynamic> json) =>
@@ -1145,6 +1154,11 @@ class RegenerationAttempt {
         completedAt: json['completed_at']?.toString() ?? '',
         original: json['original'] == true,
         usageMayBeIncomplete: json['usage_may_be_incomplete'] == true,
+        result:
+            (json['result'] as Map?)?.map(
+              (key, value) => MapEntry(key.toString(), value),
+            ) ??
+            const {},
       );
 
   final String attemptId;
@@ -1156,6 +1170,7 @@ class RegenerationAttempt {
   final String completedAt;
   final bool original;
   final bool usageMayBeIncomplete;
+  final Map<String, dynamic> result;
 }
 
 class AttachmentRecord {
@@ -1344,6 +1359,7 @@ class LiveTurn {
     required this.message,
     required List<String> providers,
     required this.tier,
+    this.reasoningMode = 'auto',
     required this.debate,
     required this.synthesize,
     this.blind = false,
@@ -1360,6 +1376,7 @@ class LiveTurn {
   final List<String> providers;
   final List<String> attachmentIds;
   final String tier;
+  final String reasoningMode;
   final bool debate;
   final bool synthesize;
   final bool blind;

@@ -15,7 +15,7 @@ from .base import (
 )
 
 
-_EFFORT = {"low": "low", "balanced": "medium", "high": "high"}
+_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _EFFORT_MODEL_PREFIXES = (
     "claude-fable-5",
     "claude-mythos-5",
@@ -58,9 +58,12 @@ class AnthropicProvider(HttpProvider):
         }
         if request.system:
             payload["system"] = request.system
-        if _matches_model(self.model, _EFFORT_MODEL_PREFIXES):
+        if (
+            request.reasoning_effort in _EFFORTS
+            and _matches_model(self.model, _EFFORT_MODEL_PREFIXES)
+        ):
             payload["output_config"] = {
-                "effort": _EFFORT.get(request.tier, "medium")
+                "effort": request.reasoning_effort
             }
         if _matches_model(
             self.model,

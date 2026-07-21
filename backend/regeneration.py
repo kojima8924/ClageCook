@@ -109,6 +109,9 @@ def build_plan(
     tier = str((turn.get("options") or {}).get("tier") or "balanced")
     if tier not in {"low", "balanced", "high"}:
         tier = "balanced"
+    reasoning_mode = cfg.normalized_reasoning_mode(
+        str((turn.get("options") or {}).get("reasoning_mode") or "auto")
+    )
     message = str(turn.get("clean_message") or turn.get("message") or "")
     attachment_context, attachment_refs = (
         attachment_bundle
@@ -137,6 +140,13 @@ def build_plan(
                 "model": model,
                 "billable": mode == "live",
                 "max_calls": 1,
+                "max_output_tokens": cfg.max_output_tokens_for(source, tier),
+                "reasoning": cfg.resolve_reasoning(
+                    source,
+                    model,
+                    reasoning_mode,
+                    mock=mode != "live",
+                ).public_dict(),
             }
         ]
         synthesizer = {
@@ -147,6 +157,13 @@ def build_plan(
             "enabled": False,
             "billable": False,
             "max_calls": 0,
+            "max_output_tokens": 0,
+            "reasoning": cfg.resolve_reasoning(
+                "synthesizer",
+                "mock",
+                reasoning_mode,
+                mock=True,
+            ).public_dict(),
         }
         answer_input = len((prompt + system).encode("utf-8"))
         synthesis_input = 0
@@ -188,6 +205,13 @@ def build_plan(
             "enabled": True,
             "billable": mode == "live",
             "max_calls": 1,
+            "max_output_tokens": cfg.max_output_tokens_for(synth_name, tier),
+            "reasoning": cfg.resolve_reasoning(
+                synth_name,
+                model,
+                reasoning_mode,
+                mock=mode != "live",
+            ).public_dict(),
         }
         source = synth_name
         answer_input = 0
@@ -197,7 +221,9 @@ def build_plan(
     billable = mode == "live"
     attempts = cfg.HTTP_RETRIES + 1
     input_total = (answer_input + synthesis_input) * attempts
-    output_total = cfg.MAX_OUTPUT_TOKENS[tier] * attempts
+    descriptor = providers[0] if providers else synthesizer
+    per_call_output = int(descriptor["max_output_tokens"])
+    output_total = per_call_output * attempts
     block_reasons = []
     web_search_requested = bool(
         target == "answer" and (turn.get("options") or {}).get("web_search") is True
@@ -230,6 +256,16 @@ def build_plan(
                 "message": "再生成でもWeb検索tool分の利用量や料金が追加される場合があります。",
             }
         )
+    if (descriptor.get("reasoning") or {}).get("source") in {
+        "unknown_model",
+        "model_unsupported",
+    }:
+        warnings.append(
+            {
+                "code": "reasoning_provider_default",
+                "message": "思考量を安全に固定できないmodelのため、Provider既定値を使います。",
+            }
+        )
     plan = {
         "allowed": not block_reasons,
         "block_reasons": block_reasons,
@@ -238,6 +274,7 @@ def build_plan(
         "regeneration": {"target": target, "provider": source},
         "options": {
             "tier": tier,
+            "reasoning_mode": reasoning_mode,
             "debate_effective": False,
             "synthesize_effective": target == "synthesis",
             "blind": (turn.get("options") or {}).get("blind") is True,
@@ -283,14 +320,12 @@ def build_plan(
             "disclaimer": "UTF-8 byte量を入力tokenの安全側上限として金額予約に使います。",
         },
         "max_output_tokens": {
-            "per_call": cfg.MAX_OUTPUT_TOKENS[tier],
-            "answers": cfg.MAX_OUTPUT_TOKENS[tier] if target == "answer" else 0,
+            "max_per_call": per_call_output,
+            "answers": per_call_output if target == "answer" else 0,
             "debate": 0,
-            "synthesis": cfg.MAX_OUTPUT_TOKENS[tier]
-            if target == "synthesis"
-            else 0,
-            "total": cfg.MAX_OUTPUT_TOKENS[tier],
-            "live_total": cfg.MAX_OUTPUT_TOKENS[tier] if billable else 0,
+            "synthesis": per_call_output if target == "synthesis" else 0,
+            "total": per_call_output,
+            "live_total": per_call_output if billable else 0,
         },
         "limits": {
             "max_provider_calls_per_run": cfg.MAX_PROVIDER_CALLS_PER_RUN,

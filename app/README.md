@@ -1,153 +1,223 @@
 # Clage Cook Flutter client
 
-Clage Cook backendへREST/SSEで接続する、Web / Windows / macOS / Linux / Android / iOS共通の
-Flutter clientです。vendor API keyは扱いません。保存する秘密情報は、任意のClage Cook用Bearer
-tokenだけです。
+Android / iOS / Windows / macOS / Linux / Webを対象にしたFlutter UIです。既定の **Direct BYOK** では
+端末からClaude、Gemini、ChatGPT、Grokの公式APIへ直接接続し、会話を端末内へ保存します。
+開発・UI照合用の **reference server** へ切り替えることもできます。
 
 ## 起動
 
-先にroot [README](../README.md) の手順でbackendを `--workers 1` で起動します。
-
 ```powershell
-C:\dev\flutter\bin\flutter.bat pub get
-C:\dev\flutter\bin\flutter.bat run -d chrome
+flutter pub get
+flutter run -d windows
 ```
 
-右上の設定画面で次を指定します。
+Android実機では `flutter devices` でdevice IDを確認し、`flutter run -d <device-id>` を使います。
+Direct BYOKならbackendの起動、LAN、Tailscaleは不要です。
 
-- server URL（PC上の既定値は `http://127.0.0.1:8000`）
-- `CLAGE_AUTH_TOKEN` を設定した場合のBearer token
+Web版はAPIキーの安全な保持と各社CORSの制約を避けるためDirect BYOKを無効化しています。
+`flutter run -d chrome` で使う場合はreference serverを先に起動してください。
 
-URLの公開recordはSharedPreferences、Bearerを含む秘密recordは `flutter_secure_storage` に保存します。
-両recordはrevision・正規化origin・base URLがすべて一致した場合だけ結合されます。秘密recordを先に、
-公開recordをcommit pointとして書くため、途中失敗や接続先変更で旧tokenを別serverへ送りません。
-安全なstorageを利用できないHTTP originではtokenをplain storageへ自動降格しません。Web版はlocalhostまたは
-HTTPSで開いてください。Web版の保存先はbrowser storageであり、XSS、悪性拡張機能、共有端末から
-tokenを完全に保護できません。設定画面はWeb上でこの警告を常時表示します。
-会議のpreflight・実行・切断復旧中は接続設定を変更できません。
-server URLはreverse proxy用pathを許可しますが、userinfo、query、fragmentは拒否します。backendが
-Bearer認証必須と返した場合は必須表示になり、空tokenを保存できません。
-入力中のURLまたはtokenが最後に接続testした組合せと異なる間は、旧serverのSAFE MOCK/LIVE・Provider状態を
-現在の接続先の情報として表示せず、再testが必要と明示します。
+## 接続とBYOK設定
 
-設定画面はbackendの公開settingsだけを読み、keyの値を取得しません。backend側で
-`CLAGE_LIVE_API_ENABLED=false` の場合は、keyの有無に関係なく `SAFE MOCK` とlock iconを表示します。
-Flutterの設定だけでlive APIを有効化することはできません。backendはlive gateがtrueなのに
-`CLAGE_AUTH_TOKEN` が空なら起動を拒否するため、live利用時は同じBearer tokenをFlutterへ保存してください。
+右上の設定から実行方式を切り替えます。
+
+### Direct BYOK（既定）
+
+- 使うProviderのAPIキーを1つ以上入力する
+- 任意でProvider別model IDをoverrideする
+- 統合役を自動、または設定済みProviderから選ぶ
+- 既定の推論エフォートをAUTO / LOW / MEDIUM / HIGHから選ぶ
+
+APIキーは `flutter_secure_storage`、実行方式・reasoning・model override・統合役は
+SharedPreferencesへ分離保存します。秘密recordを先に書き、同じrevisionの公開recordをcommit pointにするため、
+途中失敗やrevision不一致ではAPIキーを読み込まないfail-closed設計です。secure storageが使えなくても
+平文storageへ自動降格しません。
+
+保存済みAPIキーは設定画面の入力欄へ読み戻しません。空欄なら既存キーを維持し、入力したProviderだけを
+更新します。Provider単位の削除予定と、4社すべてのキー削除を用意しています。キーは実行中のmemoryには
+存在するため、root化・debugger・侵害済みOSから保護する仕組みではありません。
+
+### Reference server（開発用）
+
+server URLと任意のBearer tokenを保存し、本リポジトリのFastAPIへREST/SSEで接続します。
+URLの公開recordとBearerの秘密recordはrevision・正規化originで結合し、別originへ旧tokenを送らないように
+しています。userinfo、query、fragmentは拒否し、reverse proxy用pathだけを許可します。
+
+この切替は開発中のUI比較を目的とします。現在のclientはClage Cook OSS FastAPI契約に対応しており、
+旧Clage Cookのサブスクリプションserver固有APIを完全に変換するadapterではありません。
+
+Reference toggleはnativeのdebug/profile buildと、Directを無効化しているWebでだけ表示します。Android / iOS /
+Desktopのrelease buildはDirect BYOK専用です。
+
+## LOW / BALANCED / HIGHと推論エフォート
+
+composerは、model・最大出力枠のtierと推論エフォートを別々に選びます。
+
+| モデル・出力枠 | tier |
+| --- | --- |
+| LOW | low |
+| BALANCED | balanced |
+| HIGH | high |
+
+直下のエフォート行は `設定値 / LOW / MEDIUM / HIGH` です。`設定値` は設定画面で保存した
+`AUTO / LOW / MEDIUM / HIGH` を使い、他の3つはそのターンだけ上書きします。wire contractは
+`reasoning_mode=auto|low|medium|high` です。
+
+AUTOは質問内容を分類したりpromptへ「結論優先」「簡潔」などを追加したりしません。Providerとmodel familyの
+固定policyから推奨思考量を決め、実行前に固定します。未知・非対応modelではreasoning fieldを推測せず、
+Provider既定値へ委ねます。
+
+Directの1 call上限はClaude / ChatGPT / Grokが4,096 / 8,192 / 16,384、Geminiが
+8,192 / 16,384 / 32,768（LOW / BALANCED / HIGH）です。会議全体は196,608 tokenまでです。
+これは最大envelopeで、生成量や料金の保証ではありません。
 
 ## 送信前の安全flow
 
-送信時は `/api/plan` と `/api/policy/scan` を並列に実行してから `/api/chat` を開始します。
+Directとreferenceのどちらも、planとpolicy scanを実行してから会議を開始します。
 
-1. secret候補がある場合は送信せず、検出分類とmask済みtextを表示する。
-2. call、output token、input UTF-8 byte、retryの上限超過があれば開始しない。
-3. billable planの場合だけ、Provider/modelと最大実行量をdialogで表示する。
-4. 利用者が承認したrunへ `confirm_live_api=true` を送る。
-5. email address・電話番号候補があるlive runは `confirm_sensitive_data=true` も送る。
+1. APIキー・秘密鍵らしいblock候補があれば送信しない。
+2. Provider、model、最大call、最大output tokenをplanで確認する。
+3. billable runは既定で確認dialogを表示する。利用者は「実行して次回から表示しない」または設定画面で、
+   通常の課金可能性の確認だけをOFFにできる。
+4. メールアドレス・電話番号らしい文字列は、通常確認がOFFでも追加確認を求める。
+5. 確認後にだけ各社APIまたはreference serverへ実行を依頼する。
 
-表示するinputはUTF-8 byteの安全側envelope、outputは設定上の最大tokenです。backendへ正確なprice tableが
-設定されている場合だけ、確認dialogへ安全側の最大金額、価格版、会議・日次残額を表示します。未登録単価を
-推測しません。token台帳はProvider responseの実測usageだけを表示し、欠損値を0へ置換しません。
-reasoning tokenもProviderが返した値だけを表示します。金額換算ではbackendが、Gemini Interactionsの明示的な
-thought外数、OpenAI/xAI Responsesのreasoning内包output、旧xAI Chat互換Grok usageのfallbackを区別します。
-live Web検索をunknown-cost policyの `allow` で実行する場合も、backendは価格が判明しているtoken小計を
-会議・日次上限で検査・予約します。不明なWeb tool料金はlocal上限外であり、完全な最大金額は表示できません。
+送信本文はpreflightと実行開始を受理するまで消しません。policy scanは決定論的patternであり、秘密や
+個人情報の完全検出を保証しません。
+
+Directは同じ生成HTTP要求を自動retryせず、partial/incomplete後の自動継続もしません。途中本文は警告付きで
+保存しますが、完了回答としてDEBATE・統合へ混ぜません。Reference serverも既定retryは0で、自動継続は
+行いません。
+
+Directの待機上限はProvider・tier・effort・Web検索に応じた有限の2〜15分です。Androidでは有料POST前に
+`dataSync` foreground serviceの開始完了を待ち、実行中通知を出します。Direct streamは20秒ごとにactivityを
+通知するため、HIGHの正常な長時間待機をUIの無通信判定で誤って切断しません。
 
 ## 主なUI
 
-- responsiveなconversation一覧、title変更、delete、新規conversation
-- backendのtitle・question・answer・synthesisを対象にした全文検索
-- 350ms debounce、古いsearch responseの破棄、error表示とretry
-- backend契約と同じ200文字の検索入力上限
-- conversation JSONのclipboard exportと、JSON/Markdown/元添付を含むZIP保存
-- 会話ごとのrevision付きローカルメモと、親を壊さないturn編集分岐
-- opaque添付の選択・upload・削除・prompt取込状態表示
-- 保存済みturnと実行中turnの分離
-- Claude / Gemini / ChatGPT / Grokの完了順answer card
-- 選択可能Markdownのsynthesis
-- tier、DEBATE、BLIND、WEB、synthesis、参加AIの操作
-- 4社Web検索の構造化URL引用と、外部browserで開く出典chip
-- worker/統合modelを変更するrevision付きruntime設定UI
-- 回答間のlocal語彙比較、共有語、固有語、注意表現
-- Provider、model、phase別の実測token ledger
-- 保存済み全attemptのlocal usage、rate-limit header観測、local budgetを分離した利用状況画面
-- 有効予約のgross額と、観測実績との差額だけを示す「実績未反映の追加拘束」の分離表示
-- 任意の読み取り専用組織管理telemetryと、Provider別の部分失敗・取得時刻・cache状態・実効期間
-- 外部請求を確認済みのreconciliation pendingだけを確定状態へ移す確認UI。既知実測額または予約上限は
-  当日のbudget commitへ保持
-- 回答・統合の再生成、immutable revision履歴、active attempt、stale統合の警告
-- partial/incomplete、HTTP複数試行、usage不完全、cancel/failure/interruptedの警告表示
-- SSE切断後の同一run・event ID再接続
-- app再読込後に保存済みrunning turnから行う同一run再接続または停止
-- 実行中会議へのcancel request
-- cancel responseの `terminal_outcome` に基づく完了・失敗・停止の確定文言とcheck/error/stop icon
-- SAFE MOCK / live / mixedとProvider設定状態の表示
-- `Ctrl/Cmd+K` のsearch focus、`Ctrl/Cmd+N` の新規conversation shortcut
+- responsiveな会話一覧、新規会話、タイトル変更、削除
+- タイトル・メモ・質問・回答・統合を対象にした全文検索
+- 350 ms debounce、古い検索responseの破棄、error/retry表示
+- 会話JSONのclipboard exportとZIP保存
+- revision付き会話メモと、親を壊さないturn編集分岐
+- Claude / Gemini / ChatGPT / Grokの完了順answer card。1行headerから本文を開き、現在回答をコピー可能
+- selectable Markdown、引用URL、partial/request audit表示
+- 既定で閉じた実測usage台帳と、usage保存を止めずに台帳だけを非表示にする設定
+- 2段の横スクロールstripへ圧縮したLOW / BALANCED / HIGH、DEBATE、独立エフォート、WEB ON / OFF、
+  統合、BLIND、参加AIの操作
+- DEBATE前の最初の回答と、回答・統合のimmutable再生成履歴、active attempt、stale統合警告
+- キー状態とmodel要約を閉じたheaderで確認できる、Provider別設定accordion
+- `Ctrl/Cmd+K` の検索focus、`Ctrl/Cmd+N` の新規会話shortcut
 
-BLINDはDEBATE・統合へ渡すAI名を回答A、回答Bのようなaliasへ置換します。利用者が出典を監査できる
-answer cardや保存JSONからProvider名を消す機能ではありません。語彙insightsも正しさ、品質、modelの
-確信度を評価するものではありません。
+### モバイルcomposerとrun snapshot
 
-## 再接続と停止
+1段目は品質とDEBATE、2段目はエフォート、Web、統合、BLIND、参加Providerです。どちらも横scrollで、
+狭いAndroid画面でも項目を削りません。AUTOは設定画面にだけ置き、composerの「既定」は保存済みの
+AUTO / LOW / MEDIUM / HIGHを参照します。
 
-実行状態は `conversation_id + request_id` で追跡します。SSE切断後は同じpayload、confirmation、run ID、
-最後のevent IDで再接続し、backendに保存された非終端event journalと、保存turn状態から再構成された
-`error` / `done` を続きから受け取ります。切断中は別runを
-開始できず、再接続または停止を選びます。`done` 後にconversation取得だけが失敗した場合はSSEを再開せず、
-保存結果だけを再読込します。keepalive commentを含むactivityが90秒間ない場合は沈黙した接続と判定し、
-再接続/停止を選べる状態へ移ります。送信textはpreflightとserverのHTTP responseを受理するまでclearしません。
-SSE開始前の非2xx応答本文は10秒・64 KiBで打ち切り、サーバーがerror bodyを閉じない場合もUIを
-永久に送信中のままにしません。
+送信開始時に質問、全option、参加Provider、添付IDを現在runのsnapshotへ固定します。実行が受理されると入力欄を
+次回用へ戻し、生成中も下書きと次回のoptionを編集できます。同じ位置の送信buttonは停止buttonへ替わるため、
+現在runへ重ねて送信しません。plan / 確認 / 開始受理までの短い準備中は入力とoptionをlockし、生成中は添付の
+追加・削除だけを禁止します。次回用下書きは自動実行queueではありません。
 
-会話選択のasync世代は `ConversationSelectionController`、実行中runとstreamの所有権は
-`LiveRunController` / `LiveStreamSession` が管理します。選択先の読込中は前会話を送信対象として保持せず、
-古いrefresh/upload応答を表示へcommitしません。
+回答cardはProvider、model、実効effort、経過時間、DEBATE / WEB、完了・部分回答・失敗を1行headerへ集約します。
+headerから本文を開き、DEBATE前の「最初の回答（批評前）」とimmutable attemptの監査履歴を内側のaccordionで
+個別に確認できます。現在回答、最初の回答、本文を持つ各attemptにはそれぞれcopy操作があります。partial / failure cardは警告を
+見落としにくくするため初期状態で開きます。
 
-Flutter自体を再読込した場合も、backendが保持するrunning turnに「実行へ再接続」「停止を要求」を表示します。
-再接続はpending claimに保存した元の生request条件・確認flagと同じ `request_id` を使い、新しいrunとして
-実行しません。backendを再起動した場合、前processのrunning turnは起動時に `interrupted` へ確定されます。
-backendは保存済み結果または実行中runとの同一fingerprint照合を新規planより先に行うため、再接続だけを
-現在の添付TTL・予算・runtime設定・confirmationで拒否しません。添付の並び順を変えたpayloadは同一ではありません。
-完了済み再生成の同一ID replayも保存attemptを直接返し、新規実行向けのrate limitや別runの会話claimを消費せず、
-外部APIを再送信しません。
+この密度、同位置の停止操作、批評前回答accordionはオリジナル版とのUI照合を反映しています。run snapshot、
+partial / request audit、immutable attempt履歴はClage CookのDirect / reference契約に合わせた追加情報です。
+ただし、次回用下書きの自動queue、生成中の添付編集、process再起動後の復旧は未実装です。Android Directは
+foreground serviceでbackground実行を保護しますが、利用者・OSによる停止やprocess終了後の復旧を保証しません。
+Android以外のDirect runはbackground継続を保証しません。
 
-全文検索は検索語をURLへ出さない `POST /api/search` を使います。同じconversationへ別runが進行中なら
-backendの `conversation_busy` 409を表示し、先行run完了後に再試行します。
+トークン利用量台帳は各ターンで閉じた状態から始まります。設定画面の「トークン利用量台帳を表示」をOFFにすると
+台帳だけを描画しません。Provider usageの取得、端末内会話への保存、JSON/ZIP exportはそのまま継続します。
 
-停止buttonはbackendのlocal taskへcancelを要求します。Provider結果が未確定なら、停止までに取得できたanswerと
-usageを不完全なcancelled turnとして保存・表示する場合があります。一方、Provider結果後の終端保存・予算settle・
-結果公開が先に確定した場合、cancel APIは `terminal_outcome=completed` または `failed` を返し、Flutterは
-cancelledと誤表示せず、完了・失敗・停止を別の確定iconで表示します。終端がまだ判明しない応答では停止要求済み
-表示を維持します。再生成Provider failure後のcleanup中に停止してもfailed表示を維持します。
-すでに送信済みのrequestについて、外部Providerの処理停止や課金停止は保証しません。
+BLINDはDEBATE・統合promptへ渡すProvider名だけを回答A、回答Bのようなaliasへ変えます。利用者向けcard、
+保存JSON、network接続先を匿名化しません。AI回答、DEBATE、統合も正しさを保証しません。
+
+## Directの端末内保存
+
+会話はSharedPreferencesのmode専用namespaceに、immutable recordとmanifest commit pointで保存します。
+同じisolate・namespace内の操作を直列化し、revision競合を検出します。保存対象は会話、turn、回答、統合、
+再生成attempt、メモ、分岐metadataです。
+
+- 1会話: 16 MiBまで
+- 会話メモ: 20,000文字まで
+- 検索結果: 最大100件（UIは50件を要求）
+- JSON export: 端末内recordの整形JSON
+- ZIP export: `conversation.json` と `README.txt`。APIキー・添付bytes・Markdownは含めない
+
+会話本文は暗号化していません。app sandbox、端末の画面lock/full-disk encryption、backup policyへ依存します。
+Direct履歴とreference server履歴は別の正本で、mode切替時に自動mergeしません。暗号化backup/import、
+cross-device同期、retention UIは未実装です。
+
+Androidはapp data全体をcloud backupとdevice transferから除外します。iOS/macOSはKeychain entitlementを明示し、
+Windowsはsecure storage namespaceを固定しています。ただし、各platformのOS accountやkey store自体が侵害された
+場合まで保護するものではありません。
+
+## 添付
+
+file pickerは共通UIのためPDF・画像も候補に表示しますが、Direct BYOKが現在受理するのは次だけです。
+
+- 1件512 KiB以下、1会話8件以下、合計512 KiB以下
+- UTF-8 text
+- `txt` / `md` / `markdown` / `csv` / `json`
+- file名と本文にNULを含まない
+
+Directの添付bytes/textは実行中のmemoryだけにあり、会話storeへ保存しません。app再起動後の再利用、download、
+ZIP同梱はできません。Reference serverでは別実装によりtext/PDF抽出、画像の原本保存、TTL、download、
+元添付入りZIPを提供しますが、画像をmodel入力には使いません。
+
+## Web検索
+
+Web検索は既定OFFで、`検索あり` を明示したターンの初回回答だけへProviderのserver toolを追加します。DEBATE・統合へは
+自動適用しません。Claudeへは最大3回、xAIへは最大3 turnを指定しますが、すべてのProviderで厳密な総検索回数を
+保証するものではありません。tool料金・対応model・引用shapeは各社仕様に依存します。
+
+DirectにはWeb tool料金を含むlocal金額guardがありません。Reference serverのprice tableもtoken単価だけなので、
+tool料金はunknown-cost policyの対象です。
+
+## 実行、停止、再接続
+
+Directはアプリprocess内で4社callを管理します。停止時はHTTP clientをcloseしますが、すでに届いたrequestの
+Provider側処理・課金停止を保証しません。アプリ終了、process kill、network切断後のdurable再接続は未実装です。
+会話turnは処理終了時に端末storeへcommitします。
+
+Reference serverは `conversation_id + request_id`、event journal、pending claimを使い、SSE切断後の同一run再接続、
+app再読込後の復帰・停止、server再起動時のinterrupted確定を提供します。これらをDirectの保証として扱わないで
+ください。
+
+## 利用量
+
+DirectはProvider responseに含まれた実測tokenだけを各answerへ保存します。credit残高、請求額、spend limit、
+組織usageは取得せず、各社consoleで確認します。Reference serverだけがlocal usage集計、利用者設定price table、
+budget予約、任意のread-only admin telemetryを提供します。
 
 ## 検証
 
 ```powershell
-C:\dev\flutter\bin\dart.bat format --output=none --set-exit-if-changed lib test
-C:\dev\flutter\bin\flutter.bat analyze
-C:\dev\flutter\bin\flutter.bat test
-C:\dev\flutter\bin\flutter.bat build web --release
-C:\dev\flutter\bin\flutter.bat build windows --release
-C:\dev\flutter\bin\flutter.bat build apk --release
+dart format --output=none --set-exit-if-changed lib test
+flutter analyze
+flutter test
+flutter build web --release
+flutter build windows --release
+flutter build apk --release
 ```
 
-test件数は追加で変わるため固定しません。release時は実行結果を記録してください。iOS / macOS / Linuxは
-対応scaffoldとnetwork permissionを含みますが、それぞれのOSでnative buildと実機通信を最終確認する必要が
-あります。通常testはreal vendor API keyや課金APIを使いません。
-
-launcher iconを再生成する場合は、root `icon/icon_color.png` を編集してから次を実行します。
-
-```powershell
-C:\dev\flutter\bin\dart.bat run flutter_launcher_icons
-```
+通常testはHTTP mockを使い、real API keyや課金APIを呼びません。iOS / macOS / Linuxは各OSでnative buildと
+実機通信を確認してください。
 
 ## Android release署名
 
-release buildはFlutterの共通debug keyで署名しません。配布用APK/AABを作る場合は
-`android/key.properties.example` を `android/key.properties` へcopyし、自分のrelease/upload keystoreの
-path、alias、passwordへ置き換えてください。real `key.properties`、`*.jks`、`*.keystore` はgitignore対象です。
+release buildは共通debug keyへfallbackしません。配布用APK/AABでは
+`android/key.properties.example` をprivateな `android/key.properties` へcopyし、配布者自身のkeystore、alias、
+passwordを設定してください。代わりに `CLAGE_ANDROID_KEYSTORE`、`CLAGE_ANDROID_STORE_PASSWORD`、
+`CLAGE_ANDROID_KEY_ALIAS`、`CLAGE_ANDROID_KEY_PASSWORD` の4環境変数をすべて設定できます。部分設定や不完全な
+propertiesはbuildを停止します。`key.properties`、`*.jks`、`*.keystore` はgitignore対象です。
 
-`android/key.properties` がないrelease outputは配布用署名済みとは扱えません。公開前に自分のkeyで署名し、
-意図したcertificateで署名されていることを確認してください。keystoreとpasswordをrepository、Issue、chat、
-build logへ含めないでください。
+propertiesがないrelease outputを配布用署名済みと見なさず、公開前に意図したcertificateを確認してください。
+keystoreとpasswordをrepository、Issue、chat、build logへ含めないでください。
+
+root [README](../README.md) と [SECURITY](../SECURITY.md) も参照してください。

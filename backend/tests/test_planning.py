@@ -51,11 +51,11 @@ def test_mock_debate_plan_is_free_and_uses_safe_upper_bound(monkeypatch):
         "total": 9,
     }
     assert plan["max_output_tokens"] == {
-        "per_call": 2400,
-        "answers": 9600,
-        "debate": 9600,
-        "synthesis": 2400,
-        "total": 21600,
+        "max_per_call": 16384,
+        "answers": 40960,
+        "debate": 40960,
+        "synthesis": 16384,
+        "total": 98304,
         "live_total": 0,
     }
 
@@ -105,10 +105,18 @@ def test_inline_controls_and_disabled_provider_match_runtime(monkeypatch):
             "label": "ChatGPT",
             "mode": "live",
             "model": "test-high-model",
-            "billable": True,
-            "max_calls": 1,
-        }
-    ]
+                "billable": True,
+                "max_calls": 1,
+                "max_output_tokens": 16384,
+                "reasoning": {
+                    "requested": "auto",
+                    "effective": "provider_default",
+                    "source": "unknown_model",
+                    "pinned": False,
+                    "policy_version": 1,
+                },
+            }
+        ]
     assert plan["calls"]["total"] == 1
     assert plan["billable"] is True
     assert {
@@ -134,7 +142,7 @@ def test_live_synthesizer_makes_mock_participant_plan_billable(monkeypatch):
     assert plan["synthesizer"]["mode"] == "live"
     assert plan["calls"]["total"] == 3
     assert plan["billable"] is True
-    assert plan["max_output_tokens"]["live_total"] == 2400
+    assert plan["max_output_tokens"]["live_total"] == 8192
 
 
 def test_plan_uses_one_atomic_runtime_settings_snapshot(monkeypatch):
@@ -249,7 +257,7 @@ def test_chat_rejects_output_token_budget(monkeypatch):
     assert response.status_code == 200
     plan = response.json()
     assert plan["calls"]["total"] == 3
-    assert plan["max_output_tokens"]["total"] == 7_200
+    assert plan["max_output_tokens"]["total"] == 32_768
     assert plan["limits"]["output_tokens_exceeded"] is True
     assert "output_token_limit_exceeded" in _warning_codes(plan)
 

@@ -11,7 +11,10 @@ class _Config:
     WORKERS = ("claude", "chatgpt")
     LABELS = {"claude": "Claude"}
     HTTP_RETRIES = 1
-    MAX_OUTPUT_TOKENS = {"low": 50, "balanced": 100, "high": 200}
+    MAX_OUTPUT_TOKENS = {
+        "claude": {"low": 50, "balanced": 100, "high": 200},
+        "chatgpt": {"low": 50, "balanced": 100, "high": 200},
+    }
     MAX_PROVIDER_CALLS_PER_RUN = 8
     MAX_OUTPUT_TOKENS_PER_RUN = 1_000
     MAX_INPUT_BYTES_PER_RUN = 20_000
@@ -37,6 +40,28 @@ class _Config:
     @staticmethod
     def mode():
         return "mock"
+
+    @staticmethod
+    def normalized_reasoning_mode(value):
+        return value if value in {"auto", "low", "medium", "high"} else "auto"
+
+    @staticmethod
+    def max_output_tokens_for(source, tier):
+        if source == "synthesizer":
+            return 200 if tier == "high" else (50 if tier == "low" else 100)
+        return _Config.MAX_OUTPUT_TOKENS[source][tier]
+
+    @staticmethod
+    def resolve_reasoning(_source, _model, requested, *, mock=False):
+        return SimpleNamespace(
+            public_dict=lambda: {
+                "requested": requested,
+                "effective": "none" if mock else "medium",
+                "source": "mock" if mock else "model_policy",
+                "pinned": True,
+                "policy_version": 1,
+            }
+        )
 
 
 class _Orchestrator:
@@ -120,6 +145,44 @@ def test_build_plan_uses_explicit_dependencies_and_attachment_bundle():
         ).encode("utf-8")
     )
     assert plan["input_envelope"]["answer_per_call"] == expected_input
+
+
+@pytest.mark.parametrize(
+    ("stored_mode", "expected_mode"),
+    [
+        ("auto", "auto"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("deep", "auto"),
+        ("invalid", "auto"),
+    ],
+)
+def test_regeneration_validates_and_preserves_saved_reasoning_mode(
+    stored_mode,
+    expected_mode,
+):
+    turn = _completed_turn()
+    turn["options"]["reasoning_mode"] = stored_mode
+    dependencies = regeneration.PlanDependencies(
+        config=_Config,
+        orchestrator=_Orchestrator,
+        runtime_snapshot=lambda: {},
+        scan_text=lambda text: {"action": "allow", "scanned": text},
+        attachment_context=lambda *_args: ("", []),
+        decorate_plan=lambda plan: plan,
+    )
+
+    plan = regeneration.build_plan(
+        {"id": "conversation", "turns": [turn]},
+        0,
+        target="answer",
+        provider="claude",
+        dependencies=dependencies,
+    )
+
+    assert plan["options"]["reasoning_mode"] == expected_mode
+    assert plan["providers"][0]["reasoning"]["requested"] == expected_mode
 
 
 def test_synthesis_plan_uses_one_runtime_snapshot_for_provider_and_model():

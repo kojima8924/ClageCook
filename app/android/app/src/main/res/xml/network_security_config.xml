@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- The user chooses an arbitrary LAN or Tailscale IP, so it cannot be
-         restricted to a fixed domain here. Keep the backend LAN/Tailscale-only. -->
-    <base-config cleartextTrafficPermitted="true"/>
+    <!-- Direct BYOK and release reference-server traffic must use HTTPS. -->
+    <base-config cleartextTrafficPermitted="false"/>
 </network-security-config>
