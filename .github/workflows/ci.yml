@@ -24,7 +24,7 @@ jobs:
       CLAGE_LIVE_API_ENABLED: "false"
       CLAGE_ADMIN_TELEMETRY_ENABLED: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -47,7 +47,7 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install official Flutter stable SDK
         shell: bash
         run: |
