@@ -16,7 +16,8 @@ class AppSettingsScreen extends StatefulWidget {
     required this.initialServer,
     this.initialServerSettings,
     this.allowReferenceServer = !kReleaseMode || kIsWeb,
-  });
+    this.allowDirectByok = !kIsWeb,
+  }) : assert(allowReferenceServer || allowDirectByok);
 
   final DirectSettingsRepository directRepository;
   final SettingsRepository serverRepository;
@@ -24,6 +25,7 @@ class AppSettingsScreen extends StatefulWidget {
   final ConnectionSettings initialServer;
   final ServerSettings? initialServerSettings;
   final bool allowReferenceServer;
+  final bool allowDirectByok;
 
   @override
   State<AppSettingsScreen> createState() => _AppSettingsScreenState();
@@ -45,9 +47,11 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _mode =
-        !widget.allowReferenceServer &&
-            widget.initialDirect.executionMode == ExecutionMode.referenceServer
+    _mode = !widget.allowDirectByok
+        ? ExecutionMode.referenceServer
+        : !widget.allowReferenceServer &&
+              widget.initialDirect.executionMode ==
+                  ExecutionMode.referenceServer
         ? ExecutionMode.directByok
         : widget.initialDirect.executionMode;
     _reasoningMode = widget.initialDirect.reasoningMode;
@@ -90,7 +94,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
       setState(() => _error = '配布版では開発用サーバーへ切り替えられません。');
       return;
     }
-    if (kIsWeb && _mode == ExecutionMode.directByok) {
+    if (!widget.allowDirectByok && _mode == ExecutionMode.directByok) {
       setState(() {
         _error = 'Web版はAPIキーを安全に保持できないためDirect BYOKを有効化できません。';
       });
@@ -99,7 +103,9 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
     final keys = <DirectProvider, String>{};
     for (final provider in DirectProvider.values) {
       final replacement = _keyControllers[provider]!.text.trim();
-      keys[provider] = _clearedKeys.contains(provider)
+      keys[provider] = !widget.allowDirectByok
+          ? ''
+          : _clearedKeys.contains(provider)
           ? ''
           : replacement.isNotEmpty
           ? replacement
@@ -208,7 +214,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
         children: [
           Text('実行方式', style: theme.textTheme.titleLarge),
           const SizedBox(height: 12),
-          if (widget.allowReferenceServer)
+          if (widget.allowReferenceServer && widget.allowDirectByok)
             SegmentedButton<ExecutionMode>(
               segments: const [
                 ButtonSegment(
@@ -230,11 +236,18 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                       _error = '';
                     }),
             )
-          else
+          else if (widget.allowDirectByok)
             _SettingsNotice(
               icon: Icons.verified_user_outlined,
               color: theme.colorScheme.secondaryContainer,
               text: '配布版はDirect BYOK専用です。開発用サーバー切替はDebug/Profileビルドだけで利用できます。',
+            )
+          else
+            _SettingsNotice(
+              icon: Icons.web_asset_off_outlined,
+              color: theme.colorScheme.errorContainer,
+              text:
+                  'Web版はAPIキーを保存せず、開発用サーバーだけを利用します。Direct BYOKはAndroid・iOS・Desktopで使用してください。',
             ),
           const SizedBox(height: 12),
           _SettingsNotice(
@@ -246,15 +259,6 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                 ? 'APIキーだけで各社へ直接接続します。会話はこの端末だけに保存されます。'
                 : 'UI比較・検証用です。このリポジトリのOSS FastAPIサーバーへ接続します。',
           ),
-          if (kIsWeb && direct) ...[
-            const SizedBox(height: 12),
-            _SettingsNotice(
-              icon: Icons.warning_amber_rounded,
-              color: theme.colorScheme.errorContainer,
-              text:
-                  'Web版のDirect BYOKは、ブラウザからのキー抽出と各社CORS制約を避けられないため無効です。Android・iOS・Desktopを使用してください。',
-            ),
-          ],
           ..._conferenceDefaultFields(theme),
           if (direct) ..._directFields(theme) else ..._serverFields(theme),
           if (_error.isNotEmpty) ...[

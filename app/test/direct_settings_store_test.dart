@@ -236,6 +236,49 @@ void main() {
       expect(loaded.hasAnyKey, isFalse);
     });
 
+    test('Direct無効platformではsecretを読まず旧recordを削除して公開設定だけを保存する', () async {
+      final publicStore = _MemoryValueStore();
+      final secretStore = _MemoryValueStore();
+      final nativeRepository = DirectSettingsStore(
+        publicStore: publicStore,
+        secretStore: secretStore,
+        revisionFactory: () => 'native-revision',
+        allowDirectByok: true,
+      );
+      await nativeRepository.save(
+        const DirectSettings(
+          claudeApiKey: 'existing-secret',
+          chatGptApiKey: 'another-secret',
+        ),
+      );
+      expect(secretStore.values, isNotEmpty);
+
+      final webRepository = DirectSettingsStore(
+        publicStore: publicStore,
+        secretStore: secretStore,
+        revisionFactory: () => 'web-revision',
+        allowDirectByok: false,
+      );
+      final loaded = await webRepository.load();
+      expect(loaded.executionMode, ExecutionMode.referenceServer);
+      expect(loaded.hasAnyKey, isFalse);
+      expect(secretStore.values, isEmpty);
+
+      await webRepository.save(
+        const DirectSettings(
+          executionMode: ExecutionMode.directByok,
+          claudeApiKey: 'must-never-be-written',
+          geminiApiKey: 'must-also-be-removed',
+        ),
+      );
+
+      expect(secretStore.values, isEmpty);
+      expect(publicStore.values.values.single, isNot(contains('must-never')));
+      final saved = await webRepository.load();
+      expect(saved.executionMode, ExecutionMode.referenceServer);
+      expect(saved.hasAnyKey, isFalse);
+    });
+
     test('revision不一致や不明な設定値をfail-closedで処理する', () async {
       final publicStore = _MemoryValueStore()
         ..values['direct_settings_public_v1'] = '''

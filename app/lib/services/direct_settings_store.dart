@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -185,9 +186,11 @@ class DirectSettingsStore implements DirectSettingsRepository {
     DirectSettingsValueStore? publicStore,
     DirectSettingsValueStore? secretStore,
     String Function()? revisionFactory,
+    bool? allowDirectByok,
   }) : _publicStore = publicStore ?? _PreferencesDirectValueStore(),
        _secretStore = secretStore ?? _SecureDirectValueStore(),
-       _revisionFactory = revisionFactory ?? _newRevision;
+       _revisionFactory = revisionFactory ?? _newRevision,
+       _allowDirectByok = allowDirectByok ?? !kIsWeb;
 
   static const _publicRecordKey = 'direct_settings_public_v1';
   static const _secretRecordKey = 'direct_settings_secret_v1';
@@ -196,6 +199,7 @@ class DirectSettingsStore implements DirectSettingsRepository {
   final DirectSettingsValueStore _publicStore;
   final DirectSettingsValueStore _secretStore;
   final String Function() _revisionFactory;
+  final bool _allowDirectByok;
 
   @override
   Future<DirectSettings> load() => _mutex.protect(_load);
@@ -205,6 +209,21 @@ class DirectSettingsStore implements DirectSettingsRepository {
       await _publicStore.read(_publicRecordKey),
     );
     final publicSettings = _settingsFromPublicRecord(publicRecord);
+    if (!_allowDirectByok) {
+      // Webでは既存versionが残したsecretも読み込まず、可能なら物理削除する。
+      try {
+        await _secretStore.delete(_secretRecordKey);
+      } catch (_) {
+        // 読み込みは常に拒否するため、削除失敗でsecretをmemoryへ戻さない。
+      }
+      return publicSettings.copyWith(
+        executionMode: ExecutionMode.referenceServer,
+        claudeApiKey: '',
+        chatGptApiKey: '',
+        geminiApiKey: '',
+        grokApiKey: '',
+      );
+    }
     final revision = _recordString(publicRecord, 'revision');
     if (revision.isEmpty) return publicSettings;
 
@@ -234,9 +253,28 @@ class DirectSettingsStore implements DirectSettingsRepository {
 
   Future<void> _save(DirectSettings settings) async {
     final revision = _requiredRevision();
-    final normalized = _normalized(settings);
+    final normalized = _allowDirectByok
+        ? _normalized(settings)
+        : _normalized(settings).copyWith(
+            executionMode: ExecutionMode.referenceServer,
+            claudeApiKey: '',
+            chatGptApiKey: '',
+            geminiApiKey: '',
+            grokApiKey: '',
+          );
     final secretRecord = _encodeSecretRecord(normalized, revision);
     final publicRecord = _encodePublicRecord(normalized, revision);
+
+    if (!_allowDirectByok) {
+      try {
+        // Webではsecret recordを書かない。旧recordを先に消してから公開設定だけをcommitする。
+        await _secretStore.delete(_secretRecordKey);
+        await _publicStore.write(_publicRecordKey, publicRecord);
+        return;
+      } catch (_) {
+        throw StateError('Web版ではAPIキーを保存できません。安全な設定更新にも失敗しました。');
+      }
+    }
 
     try {
       await _secretStore.write(_secretRecordKey, secretRecord);

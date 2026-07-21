@@ -50,7 +50,8 @@ secretを先にwriteし、同revisionのpublic recordをcommit pointにします
 破損recordでは公開設定だけを返し、keyを空にします。secure storage失敗時の平文fallbackはありません。
 
 設定UIは保存済みkeyをTextFieldへ読み戻しません。空欄は既存維持、入力したProviderだけ更新、個別削除予定と
-全社一括削除を提供します。Directを保存するには1社以上のkeyが必要です。WebではDirectの保存を拒否します。
+全社一括削除を提供します。Directを保存するには1社以上のkeyが必要です。WebではDirectをreferenceへ強制し、
+設定storeもsecretを読み書きせず、旧Web secret recordは読み込まずに削除を試みます。
 
 Native releaseはDirect専用です。Reference toggleはnative debug/profileとWebだけで表示します。Android releaseは
 cleartextを拒否し、app data全体をcloud backup/device transferから除外します。iOS/macOSはKeychain entitlement、

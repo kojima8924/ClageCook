@@ -40,7 +40,8 @@
 
 - repositoryの位置付けを「公開準備中のprivate」から、制限を明示した公開ベータ／AI支援開発ポートフォリオへ
   更新し、READMEと開発文書から個人環境固有のpathを除去した。
-- CIへjob timeoutとtoolchain表示を追加し、pytest cacheを書かずに実行するよう統一した。
+- CIへjob timeoutとtoolchain表示を追加し、pytest cacheを書かずに実行するよう統一した。feature branchは
+  Pull request eventだけで検証し、main以外のpushとの二重実行を避ける。
 - Provider実測トークン利用量台帳をターンごとの既定折りたたみaccordionへ変更した。設定画面から台帳だけを
   非表示にでき、OFFでもusageの取得・端末保存・エクスポートは継続する。
 - モバイルcomposerを2段の横スクロールstripへ圧縮した。1段目はLOW / BALANCED / HIGHとDEBATE、2段目は
@@ -152,7 +153,8 @@
 - Direct APIキーをSharedPreferencesへ平文fallbackせず、secret-first/public-commitのrevision不一致時は
   fail-closedにした。保存済みkeyを設定画面へ再表示せず、JSON/ZIP exportにも含めない。
 - Web版はbrowser key extractionとProvider CORSのriskを避けるためDirect BYOKの有効化を拒否し、
-  reference serverだけを利用可能にした。
+  reference serverだけを利用可能にした。mode切替経由でもAPIキーを保存しないようUIと設定storeの双方で
+  secretを消去し、旧Web recordも読み込まず削除を試みる。
 - Directの新規質問と選択済み添付本文をProvider送信前に合わせてpolicy scanし、保存済みmemory/historyも
   後続promptへ入れる前にredactするようにした。
 - Directの通信失敗をDNS、TLS、接続拒否、途中切断、network到達不能、client終了、timeoutなどの固定codeへ

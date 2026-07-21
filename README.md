@@ -154,7 +154,8 @@ Android実機なら、接続済みdeviceを `flutter devices` で確認してか
 キーを全削除する操作も用意しています。APIキーはsource、repository、会話JSONへ保存しないでください。
 
 Web buildでは、ブラウザからのキー抽出riskと各社CORS制約を避けるためDirect BYOKを有効化できません。
-Webで使う場合はreference serverへ切り替えてください。
+設定storeもvendor APIキーを読み書きせず、旧recordは読み込まずに削除を試みます。Webで使う場合は
+reference serverへ切り替えてください。
 
 ### Reference server（任意・開発用）
 

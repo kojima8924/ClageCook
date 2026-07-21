@@ -53,7 +53,8 @@ Linux release launcherにはstack protector、FORTIFY、RELRO/NOW、non-executab
 これらは多層防御であり、OS accountやsecret service自体の侵害を防ぐ境界ではありません。
 
 Web版ではブラウザからのkey抽出riskと各社CORS制約を避けるため、Direct BYOKの保存・有効化をUIで拒否します。
-Webでvendor APIキーをlocalStorage、JavaScript source、build argumentへ埋め込まないでください。
+設定storeもWebではvendor APIキーを読み書きせず、旧secret recordは読み込まずに削除を試みます。Webでvendor
+APIキーをlocalStorage、JavaScript source、build argumentへ埋め込まないでください。
 
 ### Reference server
 
