@@ -152,7 +152,8 @@
 - Direct APIキーをSharedPreferencesへ平文fallbackせず、secret-first/public-commitのrevision不一致時は
   fail-closedにした。保存済みkeyを設定画面へ再表示せず、JSON/ZIP exportにも含めない。
 - Web版はbrowser key extractionとProvider CORSのriskを避けるためDirect BYOKの有効化を拒否し、
-  reference serverだけを利用可能にした。
+  reference serverだけを利用可能にした。mode切替経由でもAPIキーを保存しないようUIと設定storeの双方で
+  secretを消去し、旧Web recordも読み込まず削除を試みる。
 - Directの新規質問と選択済み添付本文をProvider送信前に合わせてpolicy scanし、保存済みmemory/historyも
   後続promptへ入れる前にredactするようにした。
 - Directの通信失敗をDNS、TLS、接続拒否、途中切断、network到達不能、client終了、timeoutなどの固定codeへ

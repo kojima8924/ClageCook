@@ -37,6 +37,44 @@ void main() {
     expect(direct.value.claudeApiKey, 'never-render-this-key');
   });
 
+  testWidgets('Direct無効platformはreference専用にして保持済み・入力済みキーを保存しない', (
+    tester,
+  ) async {
+    final direct = _MemoryDirectRepository(
+      const DirectSettings(
+        executionMode: ExecutionMode.directByok,
+        claudeApiKey: 'must-be-cleared',
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AppSettingsScreen(
+          directRepository: direct,
+          serverRepository: _MemoryServerRepository(),
+          initialDirect: await direct.load(),
+          initialServer: const ConnectionSettings(),
+          allowReferenceServer: true,
+          allowDirectByok: false,
+        ),
+      ),
+    );
+
+    expect(find.byType(SegmentedButton<ExecutionMode>), findsNothing);
+    expect(find.textContaining('Web版はAPIキーを保存せず'), findsOneWidget);
+    expect(find.byKey(const ValueKey('direct-provider-claude')), findsNothing);
+
+    await tester.scrollUntilVisible(
+      find.text('実行方式を保存'),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.text('実行方式を保存'));
+    await tester.pumpAndSettle();
+
+    expect(direct.value.executionMode, ExecutionMode.referenceServer);
+    expect(direct.value.hasAnyKey, isFalse);
+  });
+
   testWidgets('Providerは高密度の概要表示で閉じ、保存済みキーを展開後も読み戻さない', (tester) async {
     const secret = 'never-render-this-key';
     final direct = _MemoryDirectRepository(

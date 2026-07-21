@@ -14,8 +14,9 @@ flutter run -d windows
 Android実機では `flutter devices` でdevice IDを確認し、`flutter run -d <device-id>` を使います。
 Direct BYOKならbackendの起動、LAN、Tailscaleは不要です。
 
-Web版はAPIキーの安全な保持と各社CORSの制約を避けるためDirect BYOKを無効化しています。
-`flutter run -d chrome` で使う場合はreference serverを先に起動してください。
+Web版はAPIキーの安全な保持と各社CORSの制約を避けるためDirect BYOKを無効化しています。設定storeも
+vendor APIキーを読み書きせず、旧secret recordは読み込まずに削除を試みます。`flutter run -d chrome` で
+使う場合はreference serverを先に起動してください。
 
 ## 接続とBYOK設定
 

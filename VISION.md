@@ -76,6 +76,7 @@ Reference serverは有用な開発基盤ですが、公開版の必須runtimeに
 
 - APIキーをsource、Git、conversation、export、log、serverへ送らない。
 - DirectのAPIキーはsecure storage失敗時にSharedPreferencesへ平文fallbackしない。
+- WebではDirectを無効化し、設定storeもvendor APIキーを読み書きせず既存secretの削除を試みる。
 - 保存済みキーを設定UIへ再表示しない。更新入力と設定済み状態だけを扱う。
 - Directの会話本文は現在暗号化しない。app sandbox、OS暗号化、backup policyの限界を明示する。
 - Directとreferenceのsecret record、会話namespace、接続先を混ぜない。
