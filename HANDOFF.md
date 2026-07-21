@@ -1,246 +1,264 @@
 # Clage Cook — 開発引き継ぎ
 
-最終更新: 2026-07-19 / バージョン `0.2.0` + Unreleased
-
-コンセプトは [VISION.md](VISION.md)、利用手順は [README.md](README.md)、安全上の前提は
-[SECURITY.md](SECURITY.md) を参照してください。
+最終更新: 2026-07-21 / バージョン `0.2.0` + Unreleased
 
 ## 現在地
 
-初期のモックUI prototypeから、課金を明示的に武装する、公開を想定したBYOK版へ再設計済みです。
-repositoryは現在privateの公開準備中です。`0.2.0` は後方互換性を保証しません。APIキーを設定しただけで
-liveへ切り替わる旧挙動は廃止し、既定状態を常にSAFE MOCKとしました。
+公開版の既定architectureを、PC backend前提から **Direct BYOK + 端末内会話保存** へ変更しました。
+Flutter appから4社の公式HTTPS APIへ直接接続でき、LAN / Tailscale / 常駐serverは不要です。
 
-### backend
+開発中のUI照合と高度なserver機能の検証用に、従来のOSS FastAPIへ接続するreference server modeを
+toggleで維持しています。Directとreferenceはsecret、履歴の正本、復旧・課金保証が異なります。
 
-- `providers/base.py`: Provider契約、timeout、限定retry、安全化されたerror、usage正規化
-- `providers/anthropic.py`: Anthropic Messages API
-- `providers/openai.py`: OpenAI Responses API（`store=false`）
-- `providers/gemini.py`: Gemini Interactions API（`store=false`）
-- `providers/xai.py`: xAI Responses API（`store=false`）
-- `providers/mock.py`: 課金なしでfan-out、DEBATE、統合を確認するlocal mock
-- `orchestrator.py`: 並列fan-out、部分失敗、DEBATE、BLIND、統合、tier、履歴、先頭command
-- `planning.py`: Providerを生成せず、input/call/output/retry envelopeと実行可否を算出
-- `policy.py`: 秘密・個人情報候補の決定論的local scannerとredacted text生成
-- `scrubbing.py`: 設定中secretとblock候補を公開・保存データから非破壊で再帰除去
-- `insights.py`: 外部通信なしのUnicode語彙・文字3-gram比較、共有語、注意表現
-- `telemetry.py`: 保存済みoriginal/再生成attemptのlocal usageとquota観測集計（現在はrequestごとに全JSON走査）
-- `admin_telemetry.py`: 別管理資格情報による読み取り専用組織usage/cost/balance、部分失敗、cache
-- `finance.py`: 明示price table、Decimal cost、会議・日次budget、settled額を含むdurable予約ledger
-- `attachments.py`: owner固定opaque UUID、stream upload、signature/MIME/容量/TTL、text抽出と
-  同時2本上限・process内5分/64件TTL/LRU single-flight cache付き隔離PDF subprocess
-- `runtime_settings.py`: revision付きworker/統合model overrideのatomic JSON
-- `exporting.py`: 公開shapeのMarkdownと、元添付を含む一時ZIP
-- `storage.py`: 1会話1 JSON、deepcopy、flush、fsync、atomic replace、全文検索、request ID index
-- `runs.py`: chat/再生成共通のbackground state、terminal outcome、SSE、cancel、conversation claim/lock、rate limit
-- `regeneration.py`: 再生成target、fingerprint、attempt遷移、実行計画の純粋な境界
-- `main.py`: REST/SSEの結線、認証、CORS、live確認、durable claim、journal、停止
-- `config.py`: dotenv、model解決、safe mock/live gate、上限値、秘密を含まない公開設定
+現在のreference clientは本repositoryのFastAPI契約向けです。非公開のオリジナル版が使う
+サブスクリプションserver固有APIへ完全対応するadapterは未実装です。
 
-`CLAGE_LIVE_API_ENABLED=false` の間はキーの有無にかかわらず4mockです。`true` かつキーありの
-Providerだけがliveになり、未設定Providerは既定でdisabledです。`INCLUDE_MOCK_PROVIDERS=true` の
-ときだけliveとmockを混在させます。API障害をmock成功へ差し替えません。live gateがtrueなのに
-`CLAGE_AUTH_TOKEN` が空なら、lifespanのstartup safety checkがserver起動を拒否します。SAFE MOCKでは
-Bearer認証は任意です。
+## Flutter / Direct BYOK
 
-`POST /api/chat` はplanの上限を再検証し、billable runには `confirm_live_api=true` を要求します。
-メールアドレス・電話番号候補をliveへ送る場合は `confirm_sensitive_data=true` も必要です。秘密鍵、
-API key、GitHub/AWS token、Basic/Bearer、秘密変数などのblock候補は、conversation作成やProvider呼出
-より前に422で拒否します。
+### 主なsource
 
-planが返すinput量は、選択conversationの履歴、各answer、DEBATE用peer text、統合、live retryを
-含むUTF-8 byteの安全側envelopeです。出力は各tierの `max_output_tokens`、呼出はDEBATE・統合・retry
-まで含めて上限判定します。price table未設定時は金額を推定しません。設定時は完全一致するmodel単価と
-安全側token envelopeから最大金額を算出し、会議・日次budgetを予約します。送信済みusage不明runは
-`reconciliation_pending` として拘束し、0円へ解放しません。再起動は未settle予約を同状態へ昇格し、
-`CLAGE_MAX_UNRECONCILED_RESERVATIONS` 件へ達したbacklogは新しいbillable runを停止します。
-価格換算できたrunは実測額をsettled ledgerへ保存するため、conversation削除後も当日のcommitから消えません。
-応答modelを価格換算できない場合は予約上限を保持します。手動reconciliationも照合待ちを0円へ解放せず、
-完全な既知実測額、または予約上限を `settled_after_manual_reconciliation` としてcommitへ残します。
-active予約の `amount_micros` はgrossとして公開しますが、committedはactual実績に、request IDごとの
-`max(0, gross - observed)` である `active_reservation_top_up` だけを加えます。部分usageが保存済みでも
-actualと予約総額を二重加算しません。Flutterも「有効予約（総額）」と「実績未反映の追加拘束」を分けます。
-実行slotとconversation lockを得た後、送信する履歴・memory・添付・runtime modelから最終planを作り直し、
-予算予約を現在の予算日と金額でatomic refreshします。参加Provider/modelと統合Provider/modelのsnapshotを
-実行完了まで使い、途中のruntime変更で予約外Provider/modelへ切り替わりません。同じrequest IDの
-解放済み予約は再check後だけ再有効化し、照合待ち・確定済みの予約は新規dispatchしません。
-runtime設定は1 planにつき1回だけ読み、SSE metaと全Provider失敗時のsynthesis sourceも同じsnapshotを使います。
+- `lib/main.dart`: productionではDirect設定storeとDirect会話storeを注入
+- `lib/services/direct_settings_store.dart`: execution mode、reasoning、4社key、model override、統合役
+- `lib/services/local_conversation_store.dart`: immutableな端末内conversation repository
+- `lib/services/direct_provider_client.dart`: 4社公式APIのrequest/response adapter
+- `lib/services/direct_byok_client.dart`: 既存 `ApiClient` 契約へ合わせた端末内orchestrator
+- `lib/screens/app_settings_screen.dart`: Direct / reference切替、折りたたみProvider key/model、reasoning/統合役
+- `lib/screens/home_screen.dart`: 共通会話UI、2段composer、run snapshot、prompt template、会議実行
+- `lib/widgets/turn_view.dart`: 1行回答header、本文 / 批評前回答 / immutable attempt accordion
+- `lib/services/api_client.dart`: reference server REST/SSE client
+- `lib/services/settings_store.dart`: reference URL + Bearerのorigin-bound保存
 
-実測費用ではProviderごとのcache token契約を区別します。Anthropicの `input_tokens` はcache read/writeとは
-独立したuncached区分であり、他の正規化済みProviderではinput totalからcached inputを差し引きます。
-reasoningは、Gemini Interactionsの `total_thought_tokens` だけをoutput外数として
-`billable_output_tokens` へ加算します。OpenAI/xAI Responsesはoutputがreasoningを内包するため加算しません。
-旧xAI Chat互換shapeのdurable Grok usageはcompletion外数を取りこぼさないよう
-`max(output_tokens, total_tokens - input_tokens)` を使います。
-BudgetGuardのactual-cost snapshotはConversationStore revision、予算日、price versionでcacheします。
+### 起動とmode選択
 
-現行の `.control/budget-reservations.json` は、idempotencyと日次commitの根拠を失わないため、settled、
-`settled_after_manual_reconciliation`、`released_before_dispatch` を含む全reservationを保持します。
-各更新はtemp fileのflush/fsync/replaceでJSON全体をatomic再書込するため、1操作の台帳I/Oは件数に対してO(N)です。
-個人ローカル想定を超える数千〜数万billable runの長期運用ではI/Oとlock保持が増えます。今回のcorrectness修正とは
-別のscalability課題であり、SQLite化、または過去日aggregateと最小idempotency tombstoneだけを残すcompactionは
-公開規模へ広げる前の実装候補です。現時点ではどちらも未実装です。
+`DirectSettings` の既定は `executionMode=directByok`、`reasoningMode=auto`、
+`showTokenUsageLedger=true` です。`HomeScreen._bootstrap()` は
+Direct設定を先に読み、Directなら `DirectByokClient`、referenceなら通常 `ApiClient` を生成します。
+初期Directにkeyがなければhealth自体は成功しますが、active workerが0件なので設定画面へ誘導します。
 
-live Web検索はserver tool別課金と内部検索回数をtoken price tableだけで上限化できないため、
-`web_search_tool_pricing` をunknown costとします。budget有効時はunknown policyの既定 `block` で停止し、
-`allow` は価格判明済みのtoken小計を会議・日次上限で検査・予約した上で実行します。不明なtool料金は
-local金額上限の外側である旨を警告します。
-model価格がカテゴリ単位で部分定義の場合も、判明済みrateの小計は同じく検査・予約し、未知カテゴリだけを
-unknownとして扱います。実費集計ではmock/skipped entryを未価格requestへ含めません。
+mode切替中に会議を実行している場合は拒否します。新modeのbootstrapが失敗した場合、旧clientへ黙って
+戻らず接続を破棄するfail-closed動作です。
 
-各Providerは `completion_status`、`partial`、`incomplete_reason` と、`request_audit` の
-HTTP attempt/retry/outcome/final status/usage不明flagへ正規化します。timeoutや応答喪失後の課金有無を
-捏造せず、ベンダー本文と生例外は外へ反射しません。xAIの `prompt_cache_key` はconversation IDの生値でなく
-安定SHA-256 aliasです。pending/running turnは履歴から除外し、今回の質問を履歴として二重送信しません。
-Claudeの既知のbilling/credit不足だけはallowlistで固定分類し、一般400や本文中の任意文字列は分類・反射
-しません。FastAPIの入力検証失敗も入力値を含まない固定422です。
+Directとreferenceのhistoryは自動mergeしません。Directは
+`LocalConversationNamespace.directByok`、referenceはserver側 `CLAGE_DATA_DIR` が正本です。
 
-### durable run
+### Direct settingsとAPIキー
 
-`request_id` のclaimは最初の外部呼出より前に `status=running` のpending turnとして保存します。
-各 `meta` / `answer` / `phase` / `insights` / `synthesis` は公開可能な形へsanitizeしてSSE配信し、
-`answer` / `synthesis` をdurable checkpointとして保存します。終端時はその時点までの非終端生成eventを
-`event_log` へ確定し、`error` / `done` は再生時に保存turnの終端状態から再構成します。eventごとの
-会話全体fsyncは行いません。成功したProvider出力も信頼せず、設定中のAPI key・Bearer tokenと
-block候補を中央scrubberで再帰除去します。同じ防御をconversation保存と既存JSONの一覧・検索・取得・
-exportにも適用します。完了、cancel、一般failureのいずれでも同じturnを置換し、取得済み
-answerとusageを残します。cancel/failure時は `usage_may_be_incomplete=true` です。
+`DirectSettingsStore` は公開recordをSharedPreferences、API key recordを `flutter_secure_storage` へ保存します。
+台帳の表示設定 `show_token_usage_ledger` と通常の実API確認設定 `show_live_api_confirmation` は公開recordに入り、
+API key recordには入りません。後者のdialog内変更は公開recordだけを部分更新し、APIキーを再保存しません。
+secretを先にwriteし、同revisionのpublic recordをcommit pointにします。revision不一致、secure read失敗、
+破損recordでは公開設定だけを返し、keyを空にします。secure storage失敗時の平文fallbackはありません。
 
-同じ `request_id` と同じfingerprintはin-memory runへ合流し、再起動後は保存turnを再生します。
-lifespan開始時に前processが残した `running` turnをdurably `interrupted` へ置換し、取得済みanswer/usageを
-保持したまま外部APIを自動再実行しません。異なる
-payloadまたは異なるconversationで同じIDを使うと409です。`Last-Event-ID` がjournal範囲を超える
-場合も409で拒否します。
-保存turn/in-memory stateの照合は新規planより先に行い、同一fingerprintの無課金replay/joinを現在の添付TTL、
-予算、runtime設定、confirmationへ依存させません。添付IDはprompt順をfingerprintへ含めるため、同じIDで
-順序を変えた要求は409です。
-同一conversationの異なるrequestは同時実行せず、後発を `conversation_busy` 409で拒否します。
+設定UIは保存済みkeyをTextFieldへ読み戻しません。空欄は既存維持、入力したProviderだけ更新、個別削除予定と
+全社一括削除を提供します。Directを保存するには1社以上のkeyが必要です。WebではDirectの保存を拒否します。
 
-cancel endpointはlocal asyncio taskをcancelし、永続化の完了を短時間待ちます。ただし送信済み
-HTTP requestを外部Providerが停止したことや、課金停止を保証しません。responseの
-`provider_stop_guaranteed` は常にfalseです。Provider結果後はchat/再生成の終端保存、budget settle、
-SSE/JSON結果公開を `_complete_critical` で完走します。この段階で先に確定したcompleted/failedはcancelledで
-上書きせず、cancel responseの `terminal_outcome` へ返します。終端待機は5秒上限のため、その時点で未確定なら
-fieldはnullになり得ます。再生成Provider failureが先に決まった場合もcleanup中のcancelを吸収し、failedの
-terminal outcome、未確定usageのsettle、`cancelled=false` のinterrupted attempt保存を完了します。
+Native releaseはDirect専用です。Reference toggleはnative debug/profileとWebだけで表示します。Android releaseは
+cleartextを拒否し、app data全体をcloud backup/device transferから除外します。iOS/macOSはKeychain entitlement、
+Windowsは固定storage prefixと非昇格manifest、Linux releaseはcompiler/linker hardening、WebはCSP、
+Trusted Types、`no-referrer` を設定しています。
 
-完了済みturnのanswer/synthesis再生成は、originalを含むimmutable `attempts` と `active_attempts` pointerを
-使います。同じregeneration ID・fingerprintは保存attemptを再生し、異なる要求でのID再利用は409です。
-answer更新後は既存synthesisを `synthesis_stale=true` にし、synthesis再生成で解消します。起動時に残った
-実行中attemptはinterruptedへ確定し、自動再実行しません。再生成もchatと同じbackground
-registryとconversation claimを使うため、HTTP切断だけで実行を止めず、同じcancel endpointで停止を要求できます。
-完了した再生成stateはdurable attemptから再生できるため、`_finalize_background_run` 後にregistryから即時removeし、
-conversation全体を含む `state.result` を共通 `RUN_RETENTION_SEC`（既定1時間）へ残しません。待機中handlerは
-手元のstateを読み、後続の同一IDは保存attemptを再生します。endpointは保存済みterminal attemptをrate limiterと
-active conversation claimより前に照合し、同一fingerprintなら新規実行用の429/409を受けず直接返します。
-編集分岐がcopyした未変更の過去turn/attemptはdurable identityが同じため、local usage・費用で二重加算しません。
-再生成時に既存answer/synthesisを包む `original=true` attemptは新しいAPI callではないため、元turnの
-`(request_id, target, provider)` identityへfinanceとlocal usage telemetryの双方で戻します。片側branchだけで
-再生成しても未包装copyとの費用・token二重計上を避け、実際に追加送信した非original attemptだけを
-独立identityにします。
-request ID indexが複数branchを指す場合、明示conversation IDを優先し、未指定の曖昧なreplayは409で拒否します。
+### Direct Provider adapter
 
-`GET /api/telemetry` はlocal実績・budgetを常に外部通信なしで集計します。admin部分は
-`CLAGE_ADMIN_TELEMETRY_ENABLED=true` の場合だけOpenAI/Anthropic/xAIへ別管理資格情報でアクセスし、
-GeminiはAI Studio案内に留めます。Providerが実際に集計したUTC bucketとlocal予算期間は分けて返し、
-完全一致しない期間を同一の「today」と表示しません。admin有効時もBearerなしではserverを起動しません。
-BudgetGuardのactual-cost scanは上記revision cacheを使いますが、`telemetry.local_snapshot` は現在も
-requestごとに `ConversationStore.load_all()` を実行します。大規模保存向けのlocal usage indexは未実装です。
+Endpointは次の4つです。
 
-PDF抽出結果cacheはprocess memoryだけにあり、期限切れentryは次のcache access時に除去され、再起動時には
-全entryが消えます。これとは別に、元添付の保存TTLはserver起動時と添付access時にpurgeします。
+- Claude: `https://api.anthropic.com/v1/messages`
+- ChatGPT: `https://api.openai.com/v1/responses`
+- Gemini: `https://generativelanguage.googleapis.com/v1/interactions`
+- Grok: `https://api.x.ai/v1/responses`
 
-### single process
+OpenAI/Gemini/xAIには `store=false` を渡します。API error本文は公開せず、HTTP statusと
+DNS / TLS / connection refused / reset / network unreachable / client closed / timeoutなどの固定codeだけを返します。
+HTTP timeoutはProvider・tier・実効effort・Web検索別の2〜15分、attemptは常に1回で、自動retryしません。
+responseは共通answer shapeへ正規化し、text、model、elapsed、usage、completion、partial、reasoning、citations、
+request auditを保存します。
 
-rate limiter、conversation lock、run registryはprocess-localです。`main.py` のlifespanは
-`CLAGE_DATA_DIR/.server.lock` を排他的に取得し、同じdata dirを使う2つ目のprocessを起動時に拒否します。
-Uvicornは `--workers 1` で起動してください。複数hostから同じ保存directoryを共有する構成は対象外です。
+partial/incompleteは `ok=false` です。本文は表示・保存しますが、DEBATE参加者と統合材料へ含めません。
+自動継続は実装していません。
 
-### Flutter
+### tier、推論エフォート、上限
 
-- `models.dart`: settings、plan/policy、conversation、turn、SSEの型と未知fieldに強いparse
-- `controllers/conversation_selection_controller.dart`: 会話選択の単一generationと古いasync応答の破棄
-- `controllers/live_run_controller.dart`: live run、SSE session、90秒idle watchdog、確実なdispose
-- `services/api_client.dart`: REST、HTTP status、SSE frame解析、event ID再接続
-- `services/settings_store.dart`: URLとBearerをrevision・originで結合するfail-closedな二record保存
-- `screens/home_screen.dart`: 会話、検索、JSON/ZIP export、添付、ローカルメモ、編集分岐、plan/policy、再接続・停止
-- `screens/settings_screen.dart`: URL、Bearer、接続test、SAFE MOCK/live gate、key非公開のProvider状態
-- `screens/usage_screen.dart`: local usage、予算、quota観測、任意admin集計を別系統として表示
-- `widgets/turn_view.dart`: 選択可能Markdown、4回答、統合、引用link、添付、DEBATE初稿、insights/usage panel
-- `widgets/insights_panel.dart`: 語彙類似度とProvider実測token台帳。欠損値やpriceを推計しない
+composerの「モデル・出力枠」は `LOW / BALANCED / HIGH` をそれぞれ
+`tier=low|balanced|high` として送ります。その下の「推論エフォート」は `設定値 / LOW / MEDIUM / HIGH` です。
+設定値は `DirectSettings.reasoningMode` の `auto|low|medium|high` を使い、他の3つはそのターンだけ上書きします。
 
-送信本文はpreflightとHTTP応答を通過するまで消しません。Flutterは `/api/plan` と
-`/api/policy/scan` を並列に実行し、秘密候補はredacted textへの置換だけを提示します。billable planは
-Provider/model、最大call、最大output token、input byte、retry envelopeを表示してから明示承認します。
-price tableがある場合だけ最大金額、price version、会議・日次残額も表示します。
+AUTOは設定画面だけにあり、質問を分類せずProvider/model prefixの固定policyから
+medium/high/provider-defaultを解決します。明示LOW/MEDIUM/HIGHも対応modelだけへ同名effortを送り、
+未知・非対応modelではreasoning fieldを省略します。tierとeffortは互いを変更しません。
 
-実行状態は `conversation_id + request_id` で追跡し、SSE切断後は同じID、同じconfirmation、最後の
-event IDで再接続します。切断中は別runを開始できず、停止または再接続を選びます。`done` 後の履歴取得失敗は
-SSEへ戻らず保存済みconversationだけを再読込します。partial、HTTP複数試行、usage不完全、turn終端状態は
-回答・統合cardで警告表示します。SSE commentもactivityとして更新し、bodyが90秒完全に沈黙した場合は
-接続切断へ遷移します。検索は350ms debounce、stale response破棄、error/retry表示を備えます。
-cancel APIの `terminal_outcome` がcompleted/failed/cancelledなら、Flutterは停止要求の成否をその状態と
-混同せず、それぞれcheck/error/stopの確定iconと説明へ反映します。未確定なら停止要求済み表示を維持します。
-JSON exportはclipboardへコピーし、ZIPはJSON/Markdown/元添付を保存します。`Ctrl/Cmd+K` と
-`Ctrl/Cmd+N` のshortcutを提供します。
+### モバイルUIとrun snapshot
 
-pending claimはfingerprintに使った生tier/DEBATE/provider/BLIND/統合条件と確認flagを `resume_request` に
-保存します。Flutterだけを再読込した場合、保存済みrunning turnから同一runへ復帰または停止できます。
-実行・preflight中は接続設定を開けず、接続切替後のbootstrap失敗は旧clientへ戻らずfail-closedに切断します。
-接続URLはuserinfo/query/fragmentを拒否し、reverse proxy pathだけを許可します。検索欄はbackend契約と同じ
-200文字へ制限し、SSE `done` 後に遅れて届くstream errorは終端状態を上書きしません。
+composerは高さを固定した2本の横scroll stripです。1段目はLOW / BALANCED / HIGHとDEBATE、2段目は
+既定 / LOW / MEDIUM / HIGHのeffort、WEB ON / OFF、統合、BLIND、active Providerを表示します。
+狭いAndroid幅でもoptionを非表示にせず横scrollで到達させます。AUTOは設定画面だけにあります。
 
-Androidの `app/android/app/build.gradle.kts` はreleaseへdebug signing configを流用しません。
-`app/android/key.properties` が存在するときだけrelease signing configを作り、同fileと `*.jks` / `*.keystore`
-はgitignore対象です。`key.properties.example` はplaceholderだけを持ちます。propertiesがないbuild outputは
-配布用署名済みと見なさず、配布者自身のkeystoreで署名・検証してください。
+`_send()` はpreflightより前にmessage、conversation ID、tier、reasoning、DEBATE、統合、BLIND、Web、
+Provider順、添付IDをlocal snapshotへ取り、`LiveTurn` に同じ値を保持します。plan / policy scan / 確認 /
+`startChat()`受理までのpreparing中はdraftとoptionをlockします。受理後は元のdraftが未変更の場合だけ消去し、
+生成中の入力とoption編集を次回用として許可します。現在runのsnapshotは変えません。
 
-## API / SSE契約
+送信buttonはrun active中に同位置の停止buttonへ置換し、controller側のactive run guardと合わせて二重送信を
+防ぎます。添付の追加・削除は生成中もlockします。次回draftはqueueではなく、現在run完了後の手動送信用です。
+
+Provider回答は外側のaccordionを閉じると、Provider / model / 実効effort / elapsed / DEBATE / WEB、status、copy、
+再生成を1行で確認できます。本文内にはDEBATE前の最初の回答とProvider別immutable attempt監査履歴を別々の
+accordionで置き、本文を持つ各attemptと最初の回答にもcopy操作を提供します。failure、partial、DEBATE errorは初期状態で開きます。
+Provider設定もstatusとmodel要約をheaderへ残す折りたたみcardです。
+
+Provider実測トークン利用量台帳もターンごとのaccordionで、既定は閉じています。
+`DirectSettings.showTokenUsageLedger=false` は台帳の描画だけを止め、usage収集、会話record、JSON/ZIP export、
+利用状況画面には影響しません。回答比較insightsは台帳を非表示にしても残します。
+
+2段の密度、同位置の停止、批評前回答accordionはオリジナル版の操作感を照合して反映しました。一方、
+run snapshot、partial / request audit、immutable attempt監査はこのrepositoryのDirect / reference契約です。
+Android DirectはProvider POST前に `dataSync` foreground serviceの開始ackを待ち、20秒heartbeatでUIのidle期限を
+延長します。開始失敗は送信前に中止し、全終了経路でserviceを解放します。利用者・OSによるservice停止、
+process再起動後の復旧、Android以外のbackground継続、次回draftの自動queue、生成中の添付編集は未実装です。
+
+Direct既定model:
+
+| Provider | low | balanced | high |
+| --- | --- | --- | --- |
+| Claude | `claude-haiku-4-5-20251001` | `claude-sonnet-5` | `claude-opus-4-8` |
+| ChatGPT | `gpt-5.6-luna` | `gpt-5.6-terra` | `gpt-5.6-sol` |
+| Gemini | `gemini-3.1-flash-lite` | `gemini-3.5-flash` | `gemini-3.5-flash` |
+| Grok | `grok-4.3` | `grok-4.3` | `grok-4.5` |
+
+Directの1 call出力上限:
+
+| Provider | low | balanced | high |
+| --- | ---: | ---: | ---: |
+| Claude | 4,096 | 8,192 | 16,384 |
+| ChatGPT | 4,096 | 8,192 | 16,384 |
+| Gemini | 8,192 | 16,384 | 32,768 |
+| Grok | 4,096 | 8,192 | 16,384 |
+
+run全体のoutput envelopeは196,608です。planはanswer、DEBATE、synthesisのcall/tokenを加算し、0 retryを
+明示します。Direct input envelopeは初回promptのmessage、添付snapshot、memory、履歴、worker systemを
+UTF-8 byteで積算し、1 call 1 MiBを超える送信を遮断します。生成回答に依存するDEBATE/統合入力は未加算と
+明示します。金額見積、price table、daily budgetはありません。
+
+### Direct会議flow
+
+1. Homeが質問と全optionをsnapshotし、`planChat()` と `scanPolicy()` を行う。
+2. billable確認後だけ `confirmLiveApi=true` で `startChat()` を呼ぶ。
+3. Direct clientはmessage、選択添付snapshotを再検査し、key/secret候補をblockする。
+4. 設定済み・選択済みProviderを並列callし、完了順で`answer` eventを出す。
+5. DEBATE時は完了回答者が互いを検証する。BLINDではpeer名だけalias化する。
+6. 統合は完了回答だけを材料にし、設定済み統合Providerを1回callする。
+7. turnを端末storeへcommitし、`done` eventを出す。
+
+worker/debate/synthesis system promptへ「結論優先」「簡潔」を追加していません。AUTOもprompt rewriteを行いません。
+Webは初回answer callだけにtoolを追加し、DEBATE/synthesisでは再検索しません。
+
+Direct run stateはprocess memoryだけです。Androidではforeground serviceと固定通知でbackground中の実行を
+保護しますが、app kill後のdurable再接続とevent journalはありません。iOS / Desktopのbackground継続も
+保証しません。stopはprovider clientをcloseしますが、Provider側処理/課金停止を保証しません。
+
+### Direct conversation store
+
+`SharedPreferencesLocalConversationRepository` は1 namespaceにつき1 manifestと、conversation revisionごとの
+immutable recordを使います。recordを書いてからmanifestをcommitし、古い/孤立recordは `compact()` で除去します。
+同じisolate/namespace内のoperationはmutexで直列化し、expected storage/memory revisionの競合を拒否します。
+
+実装済み:
+
+- create/read/save/list/search/rename/delete
+- memory revision更新
+- 対象turn直前までをcopyするimmutable fork
+- JSON export
+- 1会話16 MiB、memory 20,000文字の上限
+- title/memory/question/answer/synthesisの端末内全文検索
+
+会話JSONはapplication-level暗号化をしていません。Direct ZIPは `conversation.json` と `README.txt` を含み、
+API key、添付bytes、Markdown版は含みません。
+
+### Direct添付
+
+現在は1件512 KiB以下、1会話8件以下、合計512 KiB以下のUTF-8
+`txt` / `md` / `markdown` / `csv` / `json`だけです。NULを含む名前・本文は拒否します。添付snapshotをrun開始時に
+固定し、messageと合わせてpolicy再scanします。添付text/bytesはprocess memoryだけで、conversation recordへ
+保存しません。app再起動後の再利用、download、ZIP同梱は不可です。
+
+共通file pickerはPDF/画像も表示するため、Directではupload時に明示errorになります。Reference serverだけが
+PDF抽出、画像原本保存、TTL、download、元添付入りZIPを提供します。
+
+### Direct再生成・分岐・usage
+
+完了answerまたはsynthesisを1 callで再生成し、originalと新結果をimmutable `attempts` へ記録し、
+`active_attempts` pointerだけを更新します。answer再生成後はsynthesisをstale、synthesis再生成後は解除します。
+turn編集は親を破壊せずbranchを作ります。
+
+Direct usage画面は残高/請求を取得しません。Provider responseのusageだけをanswer/turnへ保存し、各社consoleを
+残高・請求の正とします。offline lexical insightsはDirect pathでは現在空です。
+
+## Reference server
+
+Reference serverはDirectの必須componentではありません。以下は開発・SAFE MOCK・高度なserver機能のために
+維持します。
+
+### Backend module map
+
+- `main.py`: FastAPI routes、認証、rate/concurrency、run lifecycle
+- `config.py`: dotenv、model/reasoning解決、Provider別上限、公開settings
+- `planning.py`: call/output/input/retry/cost/budget plan
+- `orchestrator.py`: 並列回答、DEBATE、BLIND、統合
+- `providers/`: 4社API、mock、usage/completion/rate-limit正規化
+- `storage.py`: 1会話1JSON、atomic replace、会話lock
+- `runs.py`: background run、SSE replay、cancel、retention
+- `regeneration.py`: immutable regeneration state
+- `finance.py`: price snapshot、budget reservation/settle/reconciliation
+- `attachments.py`: owner固定upload、MIME/signature/TTL、PDF subprocess
+- `telemetry.py` / `admin_telemetry.py`: local usageとopt-in管理集計
+- `scrubbing.py` / `policy.py`: 公開pathの再帰scrub、送信前policy
+
+`CLAGE_LIVE_API_ENABLED=false` は4 mockです。live=trueではBearer必須、設定済み実Providerだけが参加し、
+未設定を暗黙mockへしません。`INCLUDE_MOCK_PROVIDERS=true` だけが明示混在です。
+
+Backendも `reasoning_mode=auto|low|medium|high` を受理します。AUTO policyは質問を分類しません。
+BackendのLOW/BALANCED/HIGH上限はClaude/ChatGPT/Grokが4,096/8,192/16,384、
+Geminiが8,192/16,384/32,768、run上限196,608です。Flutterも3つのtierをすべて公開します。
+
+Reference固有の主な保証:
+
+- external call前のdurable pending claim
+- answer/synthesis checkpointと終端event journal
+- same request ID/fingerprintのjoin/replay、SSE event ID再接続
+- startup時のorphan run/attemptをinterrupted確定し、自動再実行しない
+- conversation claim、single-process data-dir lock、`--workers 1`
+- optional price table、per-run/daily budget reservation、manual reconciliation
+- optional read-only admin telemetryとlocal usageの分離
+- owner固定添付、PDF抽出、元添付入りZIP
+
+ReferenceのHTTP retry既定値は0ですがenvで変更可能です。partial後の自動継続はありません。
+Web tool料金はtoken price tableで完全見積できず、budget時はunknown-cost policyを通します。
+
+## Reference REST / SSE契約
+
+Directは同じDart methodを端末adapterで実装するため、以下のHTTP routeを呼びません。
 
 ### REST
 
-- `GET /api/health`: version、mode、active worker、single-process強制
-- `GET /api/settings`: keyを含まないProvider状態と上限値
-- `PATCH /api/settings/runtime`: revision付きmodel override
-- `GET /api/telemetry`: local usage/budget/quotaと任意のread-only admin集計
-- `POST /api/plan`: 外部通信なしのrun plan
-- `POST /api/policy/scan`: 外部通信なしのlocal policy scan
-- `POST /api/chat`: 新規・既存conversationのSSE run、同一run再接続
-- `POST /api/runs/{request_id}/cancel`: local cancellation requestと判明済み `terminal_outcome`
-- `GET /api/conversations`: summary一覧
-- `POST /api/search`: URLへ検索語を出さないJSON body形式の保存全文検索
-- `GET /api/conversations/{id}`: conversation取得
-- `GET /api/conversations/{id}/export`: JSON export
-- `GET /api/conversations/{id}/export.md`: Markdown export
-- `GET /api/conversations/{id}/export.zip`: JSON/Markdown/元添付archive
-- `PATCH /api/conversations/{id}/memory`: revision付きローカルメモ
-- `GET/POST /api/conversations/{id}/attachments`: 添付一覧/upload
-- `GET/DELETE /api/conversations/{id}/attachments/{attachment}`: 添付取得/delete
-- `PATCH /api/conversations/{id}`: rename
-- `DELETE /api/conversations/{id}`: delete
-- `POST /api/conversations/{id}/turns/{run}/regeneration-plan`: 再生成の無課金plan
-- `POST /api/conversations/{id}/turns/{run}/regenerate`: immutable answer/synthesis attempt
-- `POST /api/conversations/{id}/turns/{run}/fork`: immutable編集分岐
-- `POST /api/budget/reconciliation/{request_id}/release`: 外部請求確認後に照合待ちを確定し、既知額/予約上限を保持
+- `GET /api/health`, `GET /api/settings`, `PATCH /api/settings/runtime`
+- `GET /api/telemetry`, `POST /api/plan`, `POST /api/policy/scan`
+- `POST /api/chat`, `POST /api/runs/{request_id}/cancel`
+- conversation list/search/get/rename/delete/export/memory
+- attachment list/upload/get/delete
+- regeneration plan/run、turn fork
+- manual budget reconciliation
 
 ### SSE
 
-- `meta`: run metadata
-- `answer`: 初回またはDEBATE後のProvider answerとpartial/request audit metadata
-- `phase`: `debate` / `synthesis` の状態
+- `meta`: run、Provider、model、tier、reasoning snapshot
+- `answer`: 初回/DEBATE回答、partial、usage、request audit
+- `phase`: debate / synthesis
 - `insights`: deterministic lexical overlap
-- `synthesis`: 統合、skip、または安全化されたfailure
-- `error`: run-level failure/cancel
+- `synthesis`: 統合またはskip/failure
+- `error`: safe run-level error
 - `done`: terminal summary
-
-SSEの `id` は1始まりのjournal indexです。keep-aliveはcomment frameで、event IDを消費しません。
 
 ## 検証
 
-課金を伴うlive smoke testは通常の検証に含めません。Provider testは `httpx.MockTransport` で
-URL、header、payload、response parse、usage正規化を検査します。backend testはplanning上限、policy、
-insights、storage、durable replay、cancel、single-process guardを含みます。Flutter testはmodel parse、
-API payload、SSE decoder、検索/export、shortcut、turn/insights表示を含みます。
+実APIkeyを使うsmoke testは通常検証へ含めません。
 
 ```powershell
 cd backend
@@ -248,65 +266,58 @@ python -m pytest -q -p no:cacheprovider
 python -m compileall .
 
 cd ..\app
-C:\dev\flutter\bin\dart.bat format --output=none --set-exit-if-changed lib test
-C:\dev\flutter\bin\flutter.bat analyze
-C:\dev\flutter\bin\flutter.bat test
-C:\dev\flutter\bin\flutter.bat build web --release
-C:\dev\flutter\bin\flutter.bat build windows --release
-C:\dev\flutter\bin\flutter.bat build apk --release
+dart format --output=none --set-exit-if-changed lib test
+flutter analyze
+flutter test
+flutter build web --release
+flutter build windows --release
+flutter build apk --release
 ```
 
-件数はテスト追加で変わるため、この文書には固定しません。リリースhandoffでは実行したcommand、
-成功・失敗、未検証platformをその時点の結果として報告してください。iOS / macOSはMac、Linuxは
-Linuxでのnative buildが必要です。Starlette由来のwarningは失敗と混同せず、内容を都度確認します。
-Android releaseの検証ではbuild成功だけでなく、意図したcertificateで署名されていることも確認します。
+release handoffでは実際に実行したcommand、結果、未検証platform、Android署名状態を別途記録してください。
+iOS/macOSはMac、LinuxはLinuxでnative buildが必要です。
+
+Android signingはprivateな `app/android/key.properties`、または
+`CLAGE_ANDROID_KEYSTORE` / `CLAGE_ANDROID_STORE_PASSWORD` / `CLAGE_ANDROID_KEY_ALIAS` /
+`CLAGE_ANDROID_KEY_PASSWORD` の4環境変数をすべて使えます。部分設定と不完全propertiesはGradleが拒否します。
+署名後はcertificate fingerprintを検証してください。
 
 ## 重要な不変条件
 
-- API keyをresponse、SSE、log、conversation JSON、Flutter storageへ含めない。
-- 公開・保存経路の中央scrubberを迂回してProvider出力や既存conversationを返さない。
-- live gateとrunごとの明示confirmationを回避する別endpointを作らない。
-- live gateがtrueのserverをBearer tokenなしで起動させない。
-- planとchatで同じhistory、option、上限判定を使う。
-- 同じ `request_id` に異なるpayloadを許可せず、未完了claimを自動再実行しない。
-- client切断だけではProvider taskを止めない。
-- cancelを外部Provider処理・課金の停止保証として表示しない。
-- Provider結果後に確定したcompleted/failedを、cleanup中のcancelでcancelledへ上書きしない。
-- conversationのrename/delete/chatは同じconversation lockを通す。
-- 同じdata dirを複数processで書かない。`--workers 1` を維持する。
-- 部分失敗を会議全体の例外に昇格させない。
-- partial live構成で未設定Providerを暗黙のmockとして実行しない。
-- BLINDを出典消去や匿名性保証として説明しない。
-- insightsの類似度を正しさ、品質、確信度として表示しない。
-- price table未設定のbyte/token envelopeを料金へ変換しない。設定時もlocal guardを請求書として表示しない。
-- tokenと別課金のWeb toolをtoken単価だけで完全見積もりとせず、unknown cost policyを通す。
-- local usage、rate-limit quota、price table推定、admin集計を同一の確定値として混ぜない。
-- 管理APIへ通常推論キーを使わず、read-only境界とBearer必須startup gateを維持する。
-- original/過去の再生成attemptを削除・上書きせず、active pointerだけを更新する。
-- usage不明の送信済みbudget予約を0円として解放しない。
-- settled済み金額をconversation削除や手動reconciliationで当日のcommitから消さない。
-- active予約は観測済み実績との差額top-upだけをcommitへ足し、gross予約とactualを二重加算しない。
-- original再生成attemptを新規call identityとして扱わず、branch copy元と同じturn identityで費用・tokenをdedupする。
-- 保存済みterminal再生成replayをrate limiter・active conversation claimより先に解決し、新規外部送信を行わない。
-- 回答内の命令をsystem instructionとして扱わない。
-- arbitrary path、CLI資格情報、PC操作をAPIへ追加しない。
-- Android releaseへdebug keyを使わず、keystore/passwordをrepositoryへcommitしない。
+- Direct API keyをSharedPreferences、conversation、export、log、reference serverへ含めない。
+- secure storage失敗時に平文fallbackしない。保存済みkeyをUIへ再表示しない。
+- Direct/referenceのhistoryとsecretを暗黙mergeしない。
+- billable会議・再生成の通常確認は既定ONとし、OFFは保存済み利用者設定からだけ適用する。通常確認OFFでも
+  秘密候補をblockし、個人情報候補の追加確認を省略しない。
+- AUTOで質問を分類・rewriteせず、回答の方向や簡潔さを誘導しない。
+- partialを完了回答としてDEBATE・統合へ混ぜず、自動継続しない。
+- DirectでHTTP retryを追加しない。Referenceのretry既定0を変更するときはplan envelopeも更新する。
+- Provider error生body、API key、BearerをUI/JSONへ反射しない。
+- cancelをProvider処理・課金の停止保証として表示しない。
+- 生成中のcomposer変更を現在runへ混ぜず、開始時のmessage / option / Provider / 添付snapshotを維持する。
+- original regeneration attemptを削除・上書きせず、active pointerだけを更新する。
+- turn編集で親会話を破壊しない。
+- WebでDirect API key保存を有効にしない。
+- Reference live serverをBearerなしで起動させず、同じdata dirを複数processで書かない。
+- Android releaseへdebug keyを使わず、keystore/passwordをcommitしない。
+- Native releaseへreference toggleを戻さず、Androidのcleartext拒否とapp data backup除外を外さない。
 
 ## 次に着手する候補
 
-1. budget ledgerのSQLite化、または過去日aggregate＋最小idempotency tombstone compaction
-2. search index、encrypted backup/import、conversation/attachment retention UI
-3. Provider請求exportとlocal/admin costのreconciliation差分監査
-4. image input/generationのcapability、予算、保存・export統合
-5. 会話tag、複数会話project、memory sourceの選択的継承
-5. Mac/Linux上のnative buildと各platformの実機通信確認
-6. 配布用Android/iOS/Desktop署名と更新経路のend-to-end検証
-7. SQLite等へのstorage migrationとimport検証
+1. 生成結果に依存するDEBATE/統合input envelopeのより明確なpreview
+2. Direct添付の永続化、download、PDF抽出、画像input capability、ZIP統合
+3. Direct会話の暗号化backup/import、retention、migration test
+4. Direct app/process終了後のrun復旧と、Android以外のbackground継続
+5. Direct local usage集計と任意price/budget guard
+6. 旧subscription server専用adapter、またはreference対象の明確な整理
+7. local storeのSQLite化と全文検索index
+8. Mac/Linux/iOS/Android/Desktopの実機、署名、更新経路検証
 
 ## 環境メモ
 
-- Flutter SDK: `C:\dev\flutter`（調査環境）
-- 対応Python: 3.10以降
-- 既定backend: `127.0.0.1:8000`
-- 既定conversation保存先: `backend/data/`（gitignore対象）
-- オリジナル: `C:\code\ClageCook`
+- Flutter SDK: stable channel
+- Python: 3.10以降
+- Reference backend既定: `http://127.0.0.1:8000`
+- Reference conversation: `backend/data/`（gitignore対象）
+- Direct conversation: platform app storageのSharedPreferences namespace
+- オリジナル版: 非公開、本repositoryには含めない

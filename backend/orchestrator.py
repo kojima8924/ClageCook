@@ -111,6 +111,7 @@ class TurnOptions:
     synthesize: bool = True
     blind: bool = False
     web_search: bool = False
+    reasoning_mode: str = "auto"
 
     def public_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -125,6 +126,7 @@ def parse_controls(message: str, options: TurnOptions) -> tuple[str, TurnOptions
     synthesize = options.synthesize
     blind = options.blind
     web_search = options.web_search
+    reasoning_mode = config.normalized_reasoning_mode(options.reasoning_mode)
     providers = [name for name in options.providers if name in config.WORKERS]
     selected: list[str] = []
     help_requested = False
@@ -170,12 +172,13 @@ def parse_controls(message: str, options: TurnOptions) -> tuple[str, TurnOptions
     return (
         cleaned,
         TurnOptions(
-            tier,
-            debate,
-            tuple(dict.fromkeys(providers)),
-            synthesize,
-            blind,
-            web_search,
+            tier=tier,
+            debate=debate,
+            providers=tuple(dict.fromkeys(providers)),
+            synthesize=synthesize,
+            blind=blind,
+            web_search=web_search,
+            reasoning_mode=reasoning_mode,
         ),
         help_requested,
     )
@@ -248,7 +251,12 @@ def _safe_outbound_text(text: str, *, redact_confirm: bool = False) -> str:
 def _public_answer(result: Any, source: str, round_number: int) -> dict[str, Any]:
     data = result.public_dict()
     has_text = bool(str(data.get("text") or "").strip())
-    data.update({"source": source, "ok": has_text, "round": round_number})
+    completed = data.get("completion_status") == "completed"
+    # 途中回答は利用者へ表示・保存するが、相互批評や統合の根拠へ混ぜない。
+    # 欠けた文章を完了回答として扱うと、統合役が欠落を事実と誤認し得る。
+    data.update(
+        {"source": source, "ok": has_text and completed, "round": round_number}
+    )
     if not has_text:
         data["error"] = "プロバイダは表示可能な回答本文を返しませんでした"
     data.pop("provider", None)
@@ -316,11 +324,14 @@ async def _run_provider(
     *,
     system: str,
     tier: str,
+    reasoning_mode: str,
     round_number: int,
     prompt_cache_key: str | None = None,
     redact_confirm: bool = False,
     web_search: bool = False,
 ) -> dict[str, Any]:
+    reasoning: config.ReasoningResolution | None = None
+    max_output_tokens = config.max_output_tokens_for(source, tier)
     try:
         provider = config.get_provider(source, tier)
         frozen = _EXECUTION_MODELS.get()
@@ -328,6 +339,12 @@ async def _run_provider(
             model = frozen[0].get(source)
             if isinstance(model, str) and model:
                 provider.model = model
+        reasoning = config.resolve_reasoning(
+            source,
+            provider.model,
+            reasoning_mode,
+            mock=provider.is_mock,
+        )
         result = await provider.complete(
             CompletionRequest(
                 prompt=_safe_outbound_text(
@@ -336,18 +353,26 @@ async def _run_provider(
                 ),
                 system=system,
                 tier=tier,
-                max_output_tokens=config.MAX_OUTPUT_TOKENS[tier],
+                reasoning_effort=reasoning.api_effort,
+                max_output_tokens=max_output_tokens,
                 timeout_sec=config.HTTP_TIMEOUT_SEC,
                 prompt_cache_key=prompt_cache_key,
                 web_search=web_search,
                 web_search_max_uses=config.WEB_SEARCH_MAX_USES,
             )
         )
-        return _public_answer(result, source, round_number)
+        data = _public_answer(result, source, round_number)
+        data["reasoning"] = reasoning.public_dict()
+        data["max_output_tokens"] = max_output_tokens
+        return data
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        return _failure_result(exc, source=source, round_number=round_number)
+        data = _failure_result(exc, source=source, round_number=round_number)
+        data["max_output_tokens"] = max_output_tokens
+        if reasoning is not None:
+            data["reasoning"] = reasoning.public_dict()
+        return data
 
 
 def _blind_aliases(sources: list[str], request_id: str) -> dict[str, str]:
@@ -415,11 +440,14 @@ async def _run_synthesis(
     question: str,
     answers: dict[str, dict[str, Any]],
     tier: str,
+    reasoning_mode: str,
     aliases: dict[str, str] | None = None,
     conversation_id: str = "",
 ) -> dict[str, Any]:
     frozen = _EXECUTION_MODELS.get()
     frozen_provider = frozen[2] if frozen is not None else None
+    reasoning: config.ReasoningResolution | None = None
+    max_output_tokens = 0
     try:
         provider = config.get_synthesizer(
             tier,
@@ -433,6 +461,18 @@ async def _run_synthesis(
             model = frozen[1]
             if isinstance(model, str) and model:
                 provider.model = model
+        generation_name = (
+            provider.name
+            if provider.name in {*config.WORKERS, "synthesizer"}
+            else "synthesizer"
+        )
+        reasoning = config.resolve_reasoning(
+            generation_name,
+            provider.model,
+            reasoning_mode,
+            mock=provider.is_mock or generation_name == "synthesizer",
+        )
+        max_output_tokens = config.max_output_tokens_for(generation_name, tier)
         result = await provider.complete(
             CompletionRequest(
                 prompt=_safe_outbound_text(
@@ -441,7 +481,8 @@ async def _run_synthesis(
                 ),
                 system=SYNTH_SYSTEM,
                 tier=tier,
-                max_output_tokens=config.MAX_OUTPUT_TOKENS[tier],
+                reasoning_effort=reasoning.api_effort,
+                max_output_tokens=max_output_tokens,
                 timeout_sec=config.HTTP_TIMEOUT_SEC,
                 prompt_cache_key=_prompt_cache_key(
                     conversation_id,
@@ -451,9 +492,16 @@ async def _run_synthesis(
         )
         data = result.public_dict()
         has_text = bool(str(data.get("text") or "").strip())
+        completed = data.get("completion_status") == "completed"
         data.update(
-            {"source": result.provider, "ok": has_text, "skipped": False}
+            {
+                "source": result.provider,
+                "ok": has_text and completed,
+                "skipped": False,
+            }
         )
+        data["reasoning"] = reasoning.public_dict()
+        data["max_output_tokens"] = max_output_tokens
         if not has_text:
             data["error"] = "統合プロバイダは表示可能な回答本文を返しませんでした"
         data.pop("provider", None)
@@ -472,6 +520,10 @@ async def _run_synthesis(
         )
         data.pop("round", None)
         data["skipped"] = False
+        if max_output_tokens:
+            data["max_output_tokens"] = max_output_tokens
+        if reasoning is not None:
+            data["reasoning"] = reasoning.public_dict()
         return data
 
 
@@ -509,6 +561,7 @@ async def run_turn(
             "debate": options.debate,
             "blind": options.blind,
             "web_search": options.web_search,
+            "reasoning_mode": options.reasoning_mode,
             "synthesizer": _execution_synthesizer_name(),
             "provider_status": _execution_provider_status(options.tier),
         },
@@ -547,6 +600,7 @@ async def run_turn(
         kwargs = {
             "system": WORKER_SYSTEM,
             "tier": options.tier,
+            "reasoning_mode": options.reasoning_mode,
             "round_number": 1,
             "prompt_cache_key": _prompt_cache_key(
                 str(conversation["id"]),
@@ -586,6 +640,7 @@ async def run_turn(
                     _debate_prompt(source, round_one, aliases),
                     system=DEBATE_SYSTEM,
                     tier=options.tier,
+                    reasoning_mode=options.reasoning_mode,
                     round_number=2,
                     prompt_cache_key=_prompt_cache_key(
                         str(conversation["id"]),
@@ -690,6 +745,7 @@ async def run_turn(
             model_message,
             answers,
             options.tier,
+            options.reasoning_mode,
             aliases,
             str(conversation["id"]),
         )

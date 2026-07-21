@@ -108,14 +108,66 @@ HTTP_TIMEOUT_SEC = _env_float("HTTP_TIMEOUT_SEC", 180.0, 5.0, 900.0)
 HTTP_RETRIES = _env_int("HTTP_RETRIES", 0, 0, 4)
 MOCK_DELAY_SEC = _env_float("MOCK_DELAY_SEC", 0.08, 0.0, 5.0)
 MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 50_000, 1_000, 500_000)
+TIERS = ("low", "balanced", "high")
+REASONING_MODES = ("auto", "low", "medium", "high")
+REASONING_POLICY_VERSION = 1
+
+# Reasoning modelでは内部思考も生成上限を消費する。全Provider共通の小さな
+# 上限では本文がほとんど残らないため、Provider特性ごとに十分な余白を持つ。
+# 値は契約上の保証ではなく、このアプリが1 callへ許可する安全上限である。
+_DEFAULT_MAX_OUTPUT_TOKENS = {
+    "claude": {"low": 4_096, "balanced": 8_192, "high": 16_384},
+    "gemini": {"low": 8_192, "balanced": 16_384, "high": 32_768},
+    "chatgpt": {"low": 4_096, "balanced": 8_192, "high": 16_384},
+    "grok": {"low": 4_096, "balanced": 8_192, "high": 16_384},
+}
+
+# AUTOは質問文を分類せず、model familyごとの推奨値だけを使う。これにより
+# 回答内容へ文体・結論の方向性を加えず、plan時に決定論的に解決できる。
+_AUTO_REASONING_POLICIES = {
+    "claude": (
+        (
+            (
+                "claude-fable-5",
+                "claude-mythos-5",
+                "claude-mythos-preview",
+                "claude-opus-4-5",
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-sonnet-5",
+            ),
+            "high",
+        ),
+        (("claude-haiku-",), None),
+        (
+            ("claude-sonnet-", "claude-opus-", "claude-fable-", "claude-mythos-"),
+            None,
+        ),
+    ),
+    "gemini": ((("gemini-",), "medium"),),
+    "chatgpt": ((("gpt-", "o1", "o3", "o4"), "medium"),),
+    "grok": (
+        (("grok-4.5", "grok-4.20"), "high"),
+        (("grok-",), "medium"),
+    ),
+}
 MAX_OUTPUT_TOKENS = {
-    "low": _env_int("MAX_OUTPUT_TOKENS_LOW", 1200, 128, 32_000),
-    "balanced": _env_int("MAX_OUTPUT_TOKENS_BALANCED", 2400, 128, 32_000),
-    "high": _env_int("MAX_OUTPUT_TOKENS_HIGH", 4000, 128, 32_000),
+    provider: {
+        tier: _env_int(
+            f"{provider.upper()}_MAX_OUTPUT_TOKENS_{tier.upper()}",
+            default,
+            128,
+            128_000,
+        )
+        for tier, default in tiers.items()
+    }
+    for provider, tiers in _DEFAULT_MAX_OUTPUT_TOKENS.items()
 }
 MAX_PROVIDER_CALLS_PER_RUN = _env_int("MAX_PROVIDER_CALLS_PER_RUN", 9, 1, 100)
 MAX_OUTPUT_TOKENS_PER_RUN = _env_int(
-    "MAX_OUTPUT_TOKENS_PER_RUN", 36_000, 128, 1_000_000
+    "MAX_OUTPUT_TOKENS_PER_RUN", 196_608, 128, 1_000_000
 )
 MAX_INPUT_BYTES_PER_RUN = _env_int(
     "MAX_INPUT_BYTES_PER_RUN", 3_200_000, 1_024, 100_000_000
@@ -229,6 +281,24 @@ class ProviderStatus:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ReasoningResolution:
+    requested: str
+    effective: str
+    api_effort: str | None
+    source: str
+    pinned: bool
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "requested": self.requested,
+            "effective": self.effective,
+            "source": self.source,
+            "pinned": self.pinned,
+            "policy_version": REASONING_POLICY_VERSION,
+        }
+
+
 def has_key(name: str) -> bool:
     key_name = _ENV_KEYS.get(name)
     return bool(key_name and os.getenv(key_name, "").strip())
@@ -245,13 +315,79 @@ def secret_values() -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))
 
 
+def normalized_tier(value: str) -> str:
+    return value if value in TIERS else "balanced"
+
+
+def normalized_reasoning_mode(value: str) -> str:
+    return value if value in REASONING_MODES else "auto"
+
+
+def max_output_tokens_for(name: str, tier: str) -> int:
+    """Provider/tierに対応する1 callの生成上限を返す。"""
+    resolved_tier = normalized_tier(tier)
+    if name == "synthesizer":
+        return max(values[resolved_tier] for values in MAX_OUTPUT_TOKENS.values())
+    try:
+        return MAX_OUTPUT_TOKENS[name][resolved_tier]
+    except KeyError as exc:
+        raise ValueError(f"不明なプロバイダ: {name}") from exc
+
+
+def resolve_reasoning(
+    name: str,
+    model: str,
+    requested: str,
+    *,
+    mock: bool = False,
+) -> ReasoningResolution:
+    """UIのreasoning modeを、外部APIへ渡す固定effortへ解決する。"""
+    mode = normalized_reasoning_mode(requested)
+    if mock or name == "synthesizer":
+        return ReasoningResolution(mode, "none", None, "mock", True)
+    normalized_model = model.strip().lower()
+    matched_policy = False
+    auto_effort: str | None = None
+    for prefixes, effort in _AUTO_REASONING_POLICIES.get(name, ()):
+        if any(normalized_model.startswith(prefix) for prefix in prefixes):
+            matched_policy = True
+            auto_effort = effort
+            break
+    if matched_policy:
+        if auto_effort is None:
+            return ReasoningResolution(
+                mode,
+                "provider_default",
+                None,
+                "model_unsupported",
+                True,
+            )
+        effort = auto_effort if mode == "auto" else mode
+        return ReasoningResolution(
+            mode,
+            effort,
+            effort,
+            "model_policy" if mode == "auto" else "explicit",
+            True,
+        )
+    # runtime設定では任意の安全なmodel IDを許可するため、未知modelへ未確認の
+    # reasoning fieldを送らない。planへ警告可能なunpinned状態として公開する。
+    return ReasoningResolution(
+        mode,
+        "provider_default",
+        None,
+        "unknown_model",
+        False,
+    )
+
+
 def model_for(
     name: str,
     tier: str,
     *,
     runtime: dict[str, Any] | None = None,
 ) -> str:
-    tier = tier if tier in {"low", "balanced", "high"} else "balanced"
+    tier = normalized_tier(tier)
     runtime = runtime_settings.snapshot() if runtime is None else runtime
     override = (runtime.get("models") or {}).get(name, {}).get(tier)
     if isinstance(override, str) and override:
@@ -279,7 +415,7 @@ def provider_status(
         ),
         models={
             tier: model_for(name, tier, runtime=runtime)
-            for tier in ("low", "balanced", "high")
+            for tier in TIERS
         },
     )
 
@@ -384,7 +520,7 @@ def synthesizer_model_for(
     synthesizer: str | None = None,
 ) -> str:
     """統合役が実際に使うモデル名を、APIクライアント生成なしで返す。"""
-    tier = tier if tier in {"low", "balanced", "high"} else "balanced"
+    tier = normalized_tier(tier)
     runtime = runtime_settings.snapshot() if runtime is None else runtime
     name = synthesizer or synthesizer_name(runtime=runtime)
     if name == "synthesizer":
@@ -407,7 +543,7 @@ def public_settings() -> dict:
                 *(runtime.get("models") or {}).get(provider, {}).values(),
                 *(
                     model_for(provider, tier, runtime=runtime)
-                    for tier in ("low", "balanced", "high")
+                    for tier in TIERS
                 ),
             }
         )
@@ -430,7 +566,7 @@ def public_settings() -> dict:
                     runtime=runtime,
                     synthesizer=synth,
                 )
-                for tier in ("low", "balanced", "high")
+                for tier in TIERS
             },
         },
         "auth_required": bool(AUTH_TOKEN),
@@ -447,7 +583,12 @@ def public_settings() -> dict:
         },
         "limits": {
             "max_message_chars": MAX_MESSAGE_CHARS,
-            "max_output_tokens": dict(MAX_OUTPUT_TOKENS),
+            "max_output_tokens": {
+                provider: dict(values)
+                for provider, values in MAX_OUTPUT_TOKENS.items()
+            },
+            "reasoning_modes": list(REASONING_MODES),
+            "reasoning_policy_version": REASONING_POLICY_VERSION,
             "max_provider_calls_per_run": MAX_PROVIDER_CALLS_PER_RUN,
             "max_output_tokens_per_run": MAX_OUTPUT_TOKENS_PER_RUN,
             "max_input_bytes_per_run": MAX_INPUT_BYTES_PER_RUN,

@@ -15,7 +15,7 @@ from .base import (
 )
 
 
-_THINKING = {"low": "low", "balanced": "medium", "high": "high"}
+_THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 
 
 class GeminiProvider(HttpProvider):
@@ -28,9 +28,12 @@ class GeminiProvider(HttpProvider):
             "store": False,
             "generation_config": {
                 "max_output_tokens": request.max_output_tokens,
-                "thinking_level": _THINKING.get(request.tier, "medium"),
             },
         }
+        if request.reasoning_effort in _THINKING_LEVELS:
+            payload["generation_config"]["thinking_level"] = (
+                request.reasoning_effort
+            )
         if request.system:
             payload["system_instruction"] = request.system
         if request.web_search:

@@ -1,0 +1,31 @@
+name: 機能提案
+description: 利用場面と期待する価値から改善を提案します
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題
+      description: 現在どのような場面で困るかを記載してください。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する動作
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 代替案・トレードオフ
+      description: 課金、秘密情報、ローカル保存、複数プラットフォームへの影響があれば記載してください。
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: スコープ確認
+      options:
+        - label: Clage Cookが実装済みの機能と、提案・計画中の機能を区別して記載しました
+          required: true

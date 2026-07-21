@@ -16,6 +16,7 @@ jobs:
   backend:
     name: Backend / Python 3.10
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: backend
@@ -36,11 +37,12 @@ jobs:
       - name: Compile
         run: python -m compileall -q .
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -q -p no:cacheprovider
 
   flutter:
     name: Flutter / stable
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     defaults:
       run:
         working-directory: app
@@ -53,6 +55,8 @@ jobs:
           echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
       - name: Resolve dependencies
         run: flutter pub get
+      - name: Show toolchain
+        run: flutter --version
       - name: Check formatting
         run: dart format --output=none --set-exit-if-changed lib test
       - name: Analyze

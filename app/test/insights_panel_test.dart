@@ -34,6 +34,11 @@ void main() {
     expect(find.text('claude · 強い断定表現 · 1件'), findsOneWidget);
     expect(find.textContaining('内容の正否は判定'), findsOneWidget);
     expect(find.text('トークン利用量台帳'), findsOneWidget);
+    expect(find.text('1,234'), findsNothing);
+    expect(find.textContaining('実測値 1件'), findsOneWidget);
+
+    await _expandUsageLedger(tester);
+
     expect(find.text('1,234'), findsOneWidget);
     expect(find.text('1,690'), findsOneWidget);
     expect(find.text('200'), findsOneWidget);
@@ -53,6 +58,10 @@ void main() {
       ),
       findsOneWidget,
     );
+
+    await tester.tap(find.text('トークン利用量台帳'));
+    await tester.pumpAndSettle();
+    expect(find.text('1,234'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -83,6 +92,7 @@ void main() {
 
     expect(find.text('回答間の語彙比較'), findsOneWidget);
     expect(find.text('トークン利用量台帳'), findsOneWidget);
+    await _expandUsageLedger(tester);
     expect(find.text('Input'), findsOneWidget);
     expect(find.text('Tool'), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -118,6 +128,7 @@ void main() {
     );
 
     expect(find.text('比較不能'), findsOneWidget);
+    await _expandUsageLedger(tester);
     expect(find.text('このProviderからトークン値は返されていません。'), findsOneWidget);
     expect(find.text('—'), findsAtLeastNWidgets(6));
     expect(find.textContaining('推計や課金額ではありません'), findsOneWidget);
@@ -141,6 +152,8 @@ void main() {
         },
       ],
     );
+
+    await _expandUsageLedger(tester);
 
     expect(find.text('chatgpt'), findsOneWidget);
     expect(find.text('synthesis'), findsOneWidget);
@@ -179,6 +192,25 @@ void main() {
     expect(find.text('回答間の語彙比較'), findsNothing);
     expect(find.text('トークン利用量台帳'), findsNothing);
   });
+
+  testWidgets('設定で台帳だけを非表示にしても回答比較は残す', (tester) async {
+    await _pumpPanel(
+      tester,
+      insights: _fullInsights,
+      showUsageLedger: false,
+      usageEntries: const [
+        {
+          'source': 'claude',
+          'usage': {'input_tokens': 1234},
+        },
+      ],
+    );
+
+    expect(find.text('回答間の語彙比較'), findsOneWidget);
+    expect(find.text('トークン利用量台帳'), findsNothing);
+    expect(find.text('1,234'), findsNothing);
+    expect(find.bySemanticsLabel('回答比較インサイト'), findsOneWidget);
+  });
 }
 
 const _fullInsights = <String, dynamic>{
@@ -216,6 +248,7 @@ Future<void> _pumpPanel(
   WidgetTester tester, {
   Map<String, dynamic>? insights,
   List<Map<String, dynamic>> usageEntries = const [],
+  bool showUsageLedger = true,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
@@ -226,6 +259,7 @@ Future<void> _pumpPanel(
             child: InsightsPanel(
               insights: insights,
               usageEntries: usageEntries,
+              showUsageLedger: showUsageLedger,
             ),
           ),
         ),
@@ -233,4 +267,12 @@ Future<void> _pumpPanel(
     ),
   );
   await tester.pump();
+}
+
+Future<void> _expandUsageLedger(WidgetTester tester) async {
+  final title = find.text('トークン利用量台帳');
+  await tester.ensureVisible(title);
+  await tester.pumpAndSettle();
+  await tester.tap(title);
+  await tester.pumpAndSettle();
 }

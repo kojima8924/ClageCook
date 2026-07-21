@@ -8,30 +8,46 @@ import 'package:flutter/material.dart';
 /// [usageEntries] は `{source, model, phase, usage: {...}}` 形式の項目を受け取る。
 /// 未知のキーや不正な値は無視し、欠損したトークン値を推計しない。
 class InsightsPanel extends StatelessWidget {
-  const InsightsPanel({super.key, this.insights, this.usageEntries = const []});
+  const InsightsPanel({
+    super.key,
+    this.insights,
+    this.usageEntries = const [],
+    this.showUsageLedger = true,
+    this.usageLedgerStorageKey,
+  });
 
   final Map<String, dynamic>? insights;
   final List<Map<String, dynamic>> usageEntries;
+  final bool showUsageLedger;
+  final Key? usageLedgerStorageKey;
 
   @override
   Widget build(BuildContext context) {
     final hasInsights = insights?.isNotEmpty == true;
-    final hasUsage = usageEntries.isNotEmpty;
+    final hasUsage = showUsageLedger && usageEntries.isNotEmpty;
     if (!hasInsights && !hasUsage) return const SizedBox.shrink();
 
     final insightData = hasInsights ? _InsightData.from(insights!) : null;
-    final ledger = usageEntries.indexed
-        .map((entry) => _UsageData.from(entry.$2, entry.$1))
-        .toList(growable: false);
+    final ledger = hasUsage
+        ? usageEntries.indexed
+              .map((entry) => _UsageData.from(entry.$2, entry.$1))
+              .toList(growable: false)
+        : const <_UsageData>[];
+    final semanticsLabel = hasInsights && hasUsage
+        ? '回答比較インサイトとトークン利用量台帳'
+        : hasInsights
+        ? '回答比較インサイト'
+        : 'トークン利用量台帳';
 
     return Semantics(
       container: true,
-      label: '回答比較インサイトとトークン利用量台帳',
+      label: semanticsLabel,
       child: LayoutBuilder(
         builder: (context, constraints) {
           final children = <Widget>[
             if (insightData != null) _InsightsSection(data: insightData),
-            if (ledger.isNotEmpty) _UsageSection(entries: ledger),
+            if (ledger.isNotEmpty)
+              _UsageSection(entries: ledger, storageKey: usageLedgerStorageKey),
           ];
           if (constraints.maxWidth >= 840 && children.length == 2) {
             return Row(
@@ -414,35 +430,58 @@ class _Limitations extends StatelessWidget {
 }
 
 class _UsageSection extends StatelessWidget {
-  const _UsageSection({required this.entries});
+  const _UsageSection({required this.entries, this.storageKey});
 
   final List<_UsageData> entries;
+  final Key? storageKey;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return _PanelCard(
-      semanticLabel: 'Provider実測トークン利用量台帳',
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const _SectionHeader(
-            icon: Icons.receipt_long_outlined,
-            title: 'トークン利用量台帳',
+    return Semantics(
+      container: true,
+      label: 'Provider実測トークン利用量台帳',
+      child: Card(
+        margin: EdgeInsets.zero,
+        clipBehavior: Clip.antiAlias,
+        child: ExpansionTile(
+          key: storageKey,
+          initiallyExpanded: false,
+          maintainState: false,
+          leading: const ExcludeSemantics(
+            child: Icon(Icons.receipt_long_outlined),
           ),
-          const SizedBox(height: 6),
-          Text(
-            'Provider応答に含まれる実測値だけを表示します。欠損値は「—」で、推計や課金額ではありません。',
+          title: Semantics(
+            header: true,
+            child: Text('トークン利用量台帳', style: theme.textTheme.titleMedium),
+          ),
+          subtitle: Text(
+            '実測値 ${entries.length}件・推計や課金額ではありません',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 12),
-          for (var index = 0; index < entries.length; index++) ...[
-            if (index > 0) const SizedBox(height: 8),
-            _UsageEntry(entry: entries[index]),
+          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'Provider応答に含まれる実測値だけを表示します。欠損値は「—」で、'
+                  'OFFにしてもusageの取得・端末保存・エクスポートは続きます。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                for (var index = 0; index < entries.length; index++) ...[
+                  if (index > 0) const SizedBox(height: 8),
+                  _UsageEntry(entry: entries[index]),
+                ],
+              ],
+            ),
           ],
-        ],
+        ),
       ),
     );
   }

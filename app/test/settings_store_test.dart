@@ -140,7 +140,7 @@ void main() {
 
   test('reverse proxy pathだけを許可しuserinfo query fragmentを拒否する', () async {
     expect(validateServerBaseUrl('https://example.test/clage'), isNull);
-    expect(validateServerBaseUrl('http://100.92.38.91:8000/base/'), isNull);
+    expect(validateServerBaseUrl('http://100.64.0.42:8000/base/'), isNull);
     expect(
       validateServerBaseUrl('https://user:secret@example.test/clage'),
       contains('ユーザー名やパスワード'),

@@ -8,6 +8,24 @@
 
 ### Added
 
+- 公開ベータ向けのContributing guide、行動規範、Issue / Pull request template、Dependabot設定、
+  AI支援開発の役割と検証方法を説明する文書を追加した。
+- pytestがローカルのlive `.env` を継承しても、課金API、管理telemetry、Bearer、4社APIキーをimport前に
+  無効化するtest-suite安全設定と回帰testを追加した。
+- FlutterからAnthropic Messages、OpenAI Responses、Gemini Interactions、xAI Responsesへ直接接続する
+  `DirectByokClient` / `DirectProviderClient` と、Direct BYOKを既定にするexecution modeを追加した。
+- Direct BYOKと開発用reference serverを切り替える設定画面を追加した。APIキー、Provider別model override、
+  統合役、AUTO / LOW / MEDIUM / HIGHの既定推論エフォートを端末で管理できる。
+- APIキーをsecure storage、公開設定をSharedPreferencesへrevision付きで分離する `DirectSettingsStore` を追加した。
+  保存済みkeyはUIへ読み戻さず、Provider単位または全社一括で削除できる。
+- Direct専用namespace、immutable conversation record、manifest commit point、revision競合検出を備えた
+  `SharedPreferencesLocalConversationRepository` を追加した。端末内の一覧、検索、rename、delete、memory、
+  immutable fork、JSON exportを提供する。
+- Direct会話の `conversation.json` と説明用 `README.txt` を含み、APIキーとmemory-only添付bytesを除外する
+  ZIP exportを追加した。
+- Directの並列回答、部分成功、DEBATE、BLIND、統合、Provider選択、Web tool、immutable回答/統合再生成を
+  既存Flutter UIへ接続した。
+- composerへ、品質を誘導しない比較・反証・発想・事実確認のprompt templateを追加した。
 - chatと再生成が共有する `runs.py` のbackground run state machine、cancel handshake、会話lock pool、
   自動回収するrate limiterと、その単体回帰test。
 - 再生成target、fingerprint、attempt遷移、確認判定を純粋関数として分離した `regeneration.py`。
@@ -15,14 +33,46 @@
   `LiveRunController` / `LiveStreamSession`。
 - 組織管理telemetryへProvider別の実効window、予算windowとの一致状態、Anthropicの最終完全UTC bucketを追加し、
   Flutter利用状況画面でも不一致を常時表示。
+- Android Direct実行中のprocess凍結を抑える `dataSync` foreground service、固定文言の実行中通知、
+  Provider送信前の開始ack、Direct streamの20秒heartbeatを追加した。
 
 ### Changed
 
+- repositoryの位置付けを「公開準備中のprivate」から、制限を明示した公開ベータ／AI支援開発ポートフォリオへ
+  更新し、READMEと開発文書から個人環境固有のpathを除去した。
+- CIへjob timeoutとtoolchain表示を追加し、pytest cacheを書かずに実行するよう統一した。
+- Provider実測トークン利用量台帳をターンごとの既定折りたたみaccordionへ変更した。設定画面から台帳だけを
+  非表示にでき、OFFでもusageの取得・端末保存・エクスポートは継続する。
+- モバイルcomposerを2段の横スクロールstripへ圧縮した。1段目はLOW / BALANCED / HIGHとDEBATE、2段目は
+  設定値 / LOW / MEDIUM / HIGHのeffort、WEB ON / OFF、統合、BLIND、参加Providerを扱う。
+- 会議条件を開始時snapshotへ固定し、生成中の入力欄とoptionを次回用として編集可能にした。添付操作は生成中も
+  lockし、送信buttonを同位置の停止buttonへ切り替えて現在runへの二重送信を防ぐ。次回下書きは自動queueしない。
+- Provider設定をキー状態とmodel要約付きの折りたたみcardへ変更した。回答cardもProvider、model、実効effort、状態を
+  1行headerへ集約し、本文、DEBATE前の最初の回答、immutable attempt監査履歴を段階的に開けるようにした。
+  現在回答、最初の回答、保存済み各attemptの本文には個別のcopy操作を追加した。
+- composerを、model・出力枠のLOW / BALANCED / HIGH、独立した設定値 / LOW / MEDIUM / HIGHの推論エフォート、
+  検索なし / 検索ありへ分離した。AUTOは設定画面の既定エフォートとして保存し、質問本文を分類・書換せず
+  model familyの固定policyで実効effortを決める。
+- 1 call出力上限をProvider別へ拡張した。Backend既定はClaude / ChatGPT / Grokが
+  4,096 / 8,192 / 16,384、Geminiが8,192 / 16,384 / 32,768（LOW / BALANCED / HIGH）。Directも
+  3 tierを同じmodel・上限で実装し、両modeの会議全体上限を196,608 tokenとした。
+- `reasoning_mode=auto|low|medium|high` をtierから独立したrequest identity、plan、SSE metadata、保存turnへ追加した。
+  未知・非対応modelでは未確認のreasoning fieldを送らずProvider defaultを使う。
+- Direct planは初回promptの質問、添付、memory、履歴、systemをUTF-8 byteで積算し、1 call 1 MiBを超える送信を
+  Provider呼出前に拒否するようにした。生成結果に依存するDEBATE/統合入力は未知として明示する。
+- Direct BYOKを製品の既定runtimeとし、PC backend、LAN、Tailscaleを必須構成から外した。Reference serverは
+  SAFE MOCK、durable run、予算、telemetry、UI比較を行う開発用経路として維持した。
+- Directのpartial/incomplete本文は表示・保存する一方、完了回答としてDEBATE・統合へ含めないようにした。
+  同一HTTP要求の自動retryと途中回答の自動継続は行わない。
+- 通常の「実APIを使用します」確認を既定ONの公開設定にした。dialogの「実行して次回から表示しない」または
+  設定画面で通常警告だけをOFFにできるが、秘密候補のblockと個人情報候補の追加確認は常に維持する。
+- Directの応答待ち上限をProvider・tier・実効effort・Web検索別の2〜15分へ変更した。Grok HIGHは最大15分、
+  全要求のHTTP attemptは1回のままで自動retryしない。
 - 公開上の製品名を `Clage Cook` へ統一し、README、設計・運用文書、OpenAPIタイトル、CLIヘルプ、
   Flutter package説明、User-Agent、内部alias/cache namespaceから製品名としての `OSS` 接尾辞を削除した。
 - `CLAGE_LIVE_API_ENABLED=true` でAPIキーが0件の場合は暗黙のMockへ移行せず、参加Providerなしとして
   fail-closedにした。Mock混在は `INCLUDE_MOCK_PROVIDERS=true` の明示時だけ許可する。
-- 対応Claude modelへtier別 `output_config.effort` とadaptive thinkingを反映し、Web検索toolを
+- 対応Claude modelへ独立reasoning modeの `output_config.effort` とadaptive thinkingを反映し、Web検索toolを
   `web_search_20260318` へ更新した。非対応・未知modelはbasic版へ安全にfallbackする。
 - Anthropic管理telemetryは任意offsetの予算windowを同一期間と見せず、UTC日次bucketの問い合わせ期間と
   `complete_through` を別metadataとして返す。cache keyも予算日の切替で失効する。
@@ -79,6 +129,9 @@
   Content-Type、event ID永続/リセット/NUL、Unicode安全なerror切詰め、非2xx bodyの10秒/64 KiB上限も修正した。
 - Flutterのrefresh/会話切替と添付uploadの世代race、未保存URLへのruntime PATCH、メモdialog label、
   preflight error欠落を修正した。読込中会話への誤送信、stream resource残留、旧接続先statusの誤表示も防止した。
+- Androidでアプリをbackgroundへ移した際に、遅いHIGH回答の接続がprocess凍結とbackground network制限で
+  失われ得る問題を修正した。foreground serviceのstop失敗・timeout後は次回runで必ず新しい開始ackを取り直し、
+  Android 15以降の `Service.onTimeout()` でも猶予内にserviceを停止する。
 - 会話lock/rate-limit entryの無限増加、cancel直前の偽 `already_done`、plan実行間TOCTOU、公開routeの
   scrub漏れ、insightsの丸め平均と重複数値scanを修正した。
 - 再生成実行時の追加system指示をplan入力量に含め、内部failureをuser cancelとして永続化する分類ミスを修正した。
@@ -93,6 +146,23 @@
 
 ### Security
 
+- CIと通常pytestはAPIキーを持たず、local `.env` のlive設定から独立してSAFE MOCK境界を維持するようにした。
+- `.env.*`、署名certificate、mobile provisioning、APK/AAB/IPAなどの生成物を公開対象から除外し、
+  `.env.example` だけを明示的に追跡可能にした。
+- Direct APIキーをSharedPreferencesへ平文fallbackせず、secret-first/public-commitのrevision不一致時は
+  fail-closedにした。保存済みkeyを設定画面へ再表示せず、JSON/ZIP exportにも含めない。
+- Web版はbrowser key extractionとProvider CORSのriskを避けるためDirect BYOKの有効化を拒否し、
+  reference serverだけを利用可能にした。
+- Directの新規質問と選択済み添付本文をProvider送信前に合わせてpolicy scanし、保存済みmemory/historyも
+  後続promptへ入れる前にredactするようにした。
+- Directの通信失敗をDNS、TLS、接続拒否、途中切断、network到達不能、client終了、timeoutなどの固定codeへ
+  分類し、host、URI、生の例外本文、秘密値をUI・会話record・診断へ反射しないようにした。
+- Native releaseをDirect BYOK専用にし、reference toggleをdebug/profileとWebへ限定した。Android releaseは
+  cleartextを拒否し、app data全体をcloud backup/device transferから除外した。
+- iOS/macOSへKeychain entitlement、Windowsへ固定secure-storage namespaceと非昇格manifest、Linux releaseへ
+  compiler/linker hardening、WebへCSP・Trusted Types・`no-referrer` を追加した。
+- Android release署名はprivateな `key.properties` に加え、4つすべて揃った `CLAGE_ANDROID_*` 環境変数を
+  利用可能にした。部分設定・不完全propertiesはfail-closedでbuildを停止する。
 - Web版ではBearer tokenがbrowser storage上にあり、XSS・拡張機能・共有端末から十分に保護されない旨を
   設定画面へ常時表示した。
 - PDF text抽出を10秒上限の隔離subprocessへ移し、元添付の起動時/access時TTL purgeとdownloadの
@@ -102,6 +172,18 @@
 - live Web検索のtool別課金をtoken単価だけで「完全な金額見積もり」と扱う問題を修正し、
   budget有効時はunknown-cost policyでfail-closedまたは明示警告付き実行にした。`allow` でも価格判明済みの
   token小計は会議・日次上限で検査・予約し、不明なtool料金だけをlocal上限外として扱う。
+
+### Known limitations
+
+- Direct BYOKはWeb、durable run再接続、local金額budget、組織残高/請求取得、暗号化backup/importに未対応。
+- Direct添付は1件512 KiB以下、1会話8件以下、合計512 KiB以下のUTF-8 text/Markdown/CSV/JSONだけで、
+  内容はprocess memoryにだけ保持する。
+  app再起動後の再利用・download・ZIP同梱はできない。
+- Direct会話はSharedPreferences内のJSONで、application-level暗号化を行わない。
+- Androidのforeground serviceは利用者・OSによる停止やprocess終了後の復旧を保証しない。iOS / Desktopの
+  Direct background継続も未保証。
+- Directでlocal保存retryがすべて失敗した課金済み結果を退避するrecovery outboxは未実装。
+- Reference clientは本リポジトリのFastAPI契約に対応し、旧サブスクリプションserver固有APIの完全adapterではない。
 
 ## [0.2.0] - 2026-07-18
 

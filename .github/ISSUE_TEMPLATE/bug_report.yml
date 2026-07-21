@@ -1,0 +1,74 @@
+name: バグ報告
+description: 再現可能な不具合を、秘密情報を除いて報告します
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        報告ありがとうございます。APIキー、Bearer token、会話本文、署名鍵、生のProvider応答は貼らないでください。
+        セキュリティ上の問題は、IssueではなくSecurityタブの非公開報告を利用してください。
+  - type: input
+    id: version
+    attributes:
+      label: バージョンまたはcommit
+      placeholder: 0.2.0+6 / abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: プラットフォーム
+      options:
+        - Android
+        - iOS
+        - Windows
+        - macOS
+        - Linux
+        - Web
+        - Backendのみ
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 実行方式
+      options:
+        - Direct BYOK
+        - Reference server / SAFE MOCK
+        - Reference server / Live API
+        - 該当なし・不明
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 再現手順
+      description: 秘密情報を含まない最小手順を記載してください。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した動作
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の動作
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 追加情報
+      description: 固定エラーコード、画面、テスト結果など。送信前に秘密値と会話本文を除去してください。
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全確認
+      options:
+        - label: APIキー、token、個人情報、会話本文を含めていません
+          required: true

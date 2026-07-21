@@ -6,6 +6,8 @@ import 'package:clage_cook/models.dart';
 import 'package:clage_cook/screens/home_screen.dart';
 import 'package:clage_cook/screens/settings_screen.dart';
 import 'package:clage_cook/services/api_client.dart';
+import 'package:clage_cook/services/direct_settings_store.dart';
+import 'package:clage_cook/services/local_conversation_store.dart';
 import 'package:clage_cook/services/settings_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -27,6 +29,37 @@ class _MemorySettings implements SettingsRepository {
   }
 }
 
+class _MemoryDirectSettings implements DirectSettingsRepository {
+  _MemoryDirectSettings(this.value);
+
+  DirectSettings value;
+  bool failConfirmationPreferenceWrite = false;
+
+  @override
+  Future<void> clearAllKeys() async {
+    value = value.copyWith(
+      claudeApiKey: '',
+      chatGptApiKey: '',
+      geminiApiKey: '',
+      grokApiKey: '',
+    );
+  }
+
+  @override
+  Future<DirectSettings> load() async => value;
+
+  @override
+  Future<void> save(DirectSettings settings) async => value = settings;
+
+  @override
+  Future<void> setShowLiveApiConfirmation(bool enabled) async {
+    if (failConfirmationPreferenceWrite) {
+      throw StateError('simulated preference failure');
+    }
+    value = value.copyWith(showLiveApiConfirmation: enabled);
+  }
+}
+
 void main() {
   testWidgets('起動して会議シェルが表示される', (tester) async {
     await tester.pumpWidget(
@@ -37,6 +70,26 @@ void main() {
     expect(find.text('4つのAIを、1つの会議へ。'), findsOneWidget);
     expect(find.byType(TextField), findsOneWidget);
     expect(find.byIcon(Icons.send), findsOneWidget);
+  });
+
+  testWidgets('モバイルのcomposerは2段の操作帯と入力欄へ収まる', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      ClageCookApp(repository: _MemorySettings(), autoload: false),
+    );
+
+    expect(find.byKey(const Key('composer-quality-strip')), findsOneWidget);
+    expect(find.byKey(const Key('composer-effort-strip')), findsOneWidget);
+    expect(find.byKey(const Key('composer-tier-selector')), findsOneWidget);
+    expect(find.byKey(const Key('composer-effort-selector')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    expect(
+      tester.getSize(find.byKey(const Key('composer'))).height,
+      lessThanOrEqualTo(180),
+    );
   });
 
   testWidgets('キーボードから全文検索と新規会話を呼び出せる', (tester) async {
@@ -224,6 +277,64 @@ void main() {
     );
   });
 
+  testWidgets('品質・推論エフォート・Web検索を独立して送信する', (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    Map<String, dynamic>? planBody;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/plan') {
+          planBody = Map<String, dynamic>.from(jsonDecode(request.body) as Map);
+        }
+        return _preflightResponse(request, billable: false);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('品質'), findsOneWidget);
+    expect(find.text('エフォート'), findsOneWidget);
+    expect(find.text('WEB OFF'), findsOneWidget);
+    expect(find.text('AUTO'), findsNothing);
+
+    final tierSelector = find.byKey(const Key('composer-tier-selector'));
+    final effortSelector = find.byKey(const Key('composer-effort-selector'));
+    final webToggle = find.byKey(const Key('composer-web-toggle'));
+    await tester.tap(
+      find.descendant(of: tierSelector, matching: find.text('LOW')),
+    );
+    await tester.tap(
+      find.descendant(of: effortSelector, matching: find.text('HIGH')),
+    );
+    await tester.tap(webToggle);
+    await tester.pump();
+    expect(find.text('WEB ON'), findsOneWidget);
+
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '質問を入力…',
+      ),
+      '独立設定テスト',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(planBody?['tier'], 'low');
+    expect(planBody?['reasoning_mode'], 'high');
+    expect(planBody?['web_search'], isTrue);
+  });
+
   testWidgets('billable planはProviderと最大量を表示して確認までchatしない', (tester) async {
     final paths = <String>[];
     Map<String, dynamic>? chatBody;
@@ -274,6 +385,338 @@ void main() {
     expect(paths.where((path) => path == '/api/chat'), hasLength(1));
     expect(chatBody?['confirm_live_api'], isTrue);
     expect(chatBody?['confirm_sensitive_data'], isFalse);
+  });
+
+  testWidgets('次回から表示しないを選ぶと設定を保存して以後の通常確認を省略する', (tester) async {
+    final directRepository = _MemoryDirectSettings(
+      const DirectSettings(executionMode: ExecutionMode.referenceServer),
+    );
+    var chatCalls = 0;
+    Map<String, dynamic>? chatBody;
+    ApiClient buildClient() => ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/chat') {
+          chatCalls++;
+          chatBody = Map<String, dynamic>.from(jsonDecode(request.body) as Map);
+        }
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    final client = buildClient();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final messageField = find.byWidgetPredicate(
+      (widget) =>
+          widget is TextField && widget.decoration?.hintText == '質問を入力…',
+    );
+    await tester.enterText(messageField, '1回目');
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(find.text('実APIを使用します'), findsOneWidget);
+    expect(find.text('実行して次回から表示しない'), findsOneWidget);
+    expect(chatCalls, 0);
+
+    await tester.tap(find.text('実行して次回から表示しない'));
+    await tester.pumpAndSettle();
+    expect(directRepository.value.showLiveApiConfirmation, isFalse);
+    expect(chatCalls, 1);
+    expect(chatBody?['confirm_live_api'], isTrue);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    final secondClient = buildClient();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          clientFactory: (_) => secondClient,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '質問を入力…',
+      ),
+      '2回目',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+    expect(find.text('実APIを使用します'), findsNothing);
+    expect(chatCalls, 2);
+    expect(chatBody?['confirm_live_api'], isTrue);
+  });
+
+  testWidgets('通常確認OFFでもpolicy確認は省略せず機密送信フラグを明示する', (tester) async {
+    final directRepository = _MemoryDirectSettings(
+      const DirectSettings(
+        executionMode: ExecutionMode.referenceServer,
+        showLiveApiConfirmation: false,
+      ),
+    );
+    var chatCalls = 0;
+    Map<String, dynamic>? chatBody;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/chat') {
+          chatCalls++;
+          chatBody = Map<String, dynamic>.from(jsonDecode(request.body) as Map);
+        }
+        return _preflightResponse(
+          request,
+          billable: true,
+          policyConfirmation: true,
+        );
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '質問を入力…',
+      ),
+      '個人情報を含む質問',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(find.text('個人情報らしい内容を外部送信します'), findsOneWidget);
+    expect(find.textContaining('個人情報らしい文字列'), findsOneWidget);
+    expect(find.text('実行して次回から表示しない'), findsNothing);
+    expect(chatCalls, 0);
+
+    await tester.tap(find.text('確認して実行'));
+    await tester.pumpAndSettle();
+    expect(chatCalls, 1);
+    expect(chatBody?['confirm_live_api'], isTrue);
+    expect(chatBody?['confirm_sensitive_data'], isTrue);
+  });
+
+  testWidgets('次回非表示の保存に失敗した場合は実APIを呼ばない', (tester) async {
+    final directRepository = _MemoryDirectSettings(
+      const DirectSettings(executionMode: ExecutionMode.referenceServer),
+    )..failConfirmationPreferenceWrite = true;
+    var chatCalls = 0;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/chat') chatCalls++;
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '質問を入力…',
+      ),
+      '保存失敗時は送らない',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('実行して次回から表示しない'));
+    await tester.pumpAndSettle();
+
+    expect(chatCalls, 0);
+    expect(directRepository.value.showLiveApiConfirmation, isTrue);
+    expect(find.textContaining('表示設定を保存できませんでした'), findsOneWidget);
+  });
+
+  testWidgets('Direct BYOKでも通常確認OFFならbillable送信を直接開始する', (tester) async {
+    final directRepository = _MemoryDirectSettings(
+      const DirectSettings(
+        showLiveApiConfirmation: false,
+        chatGptApiKey: 'configured-key',
+      ),
+    );
+    final localRepository = SharedPreferencesLocalConversationRepository(
+      namespace: LocalConversationNamespace.directByok,
+      valueStore: MemoryLocalConversationValueStore(),
+    );
+    var chatCalls = 0;
+    Map<String, dynamic>? chatBody;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/chat') {
+          chatCalls++;
+          chatBody = Map<String, dynamic>.from(jsonDecode(request.body) as Map);
+        }
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          localConversationRepository: localRepository,
+          directClientFactory: (_, _) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '質問を入力…',
+      ),
+      'Direct確認省略',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(find.text('実APIを使用します'), findsNothing);
+    expect(chatCalls, 1);
+    expect(chatBody?['confirm_live_api'], isTrue);
+    expect(chatBody?['confirm_sensitive_data'], isFalse);
+  });
+
+  testWidgets('通常確認OFFは再生成にも適用して実API確認フラグを送る', (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final directRepository = _MemoryDirectSettings(
+      const DirectSettings(
+        executionMode: ExecutionMode.referenceServer,
+        showLiveApiConfirmation: false,
+      ),
+    );
+    Map<String, dynamic>? regenerateBody;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/conversations') {
+          return _widgetJsonResponse([_completedConversationSummary()]);
+        }
+        if (request.url.path == '/api/conversations/conversation-id') {
+          return _widgetJsonResponse(_completedConversation());
+        }
+        if (request.url.path.endsWith('/regeneration-plan')) {
+          return _planOnlyResponse(billable: true);
+        }
+        if (request.url.path.endsWith('/regenerate')) {
+          regenerateBody = Map<String, dynamic>.from(
+            jsonDecode(request.body) as Map,
+          );
+          return _widgetJsonResponse({
+            'conversation': _completedConversation(),
+          });
+        }
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('再生成テスト'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('ChatGPTの回答を再生成'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('実APIを使用します'), findsNothing);
+    expect(regenerateBody?['confirm_live_api'], isTrue);
+    expect(regenerateBody?['confirm_sensitive_data'], isFalse);
+  });
+
+  testWidgets('再生成も通常確認OFF時のpolicy確認を必ず表示する', (tester) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final directRepository = _MemoryDirectSettings(
+      const DirectSettings(
+        executionMode: ExecutionMode.referenceServer,
+        showLiveApiConfirmation: false,
+      ),
+    );
+    Map<String, dynamic>? regenerateBody;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/conversations') {
+          return _widgetJsonResponse([_completedConversationSummary()]);
+        }
+        if (request.url.path == '/api/conversations/conversation-id') {
+          return _widgetJsonResponse(_completedConversation());
+        }
+        if (request.url.path.endsWith('/regeneration-plan')) {
+          return _planOnlyResponse(billable: true, policyConfirmation: true);
+        }
+        if (request.url.path.endsWith('/regenerate')) {
+          regenerateBody = Map<String, dynamic>.from(
+            jsonDecode(request.body) as Map,
+          );
+          return _widgetJsonResponse({
+            'conversation': _completedConversation(),
+          });
+        }
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          directRepository: directRepository,
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('再生成テスト'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('ChatGPTの回答を再生成'));
+    await tester.pump();
+
+    expect(find.text('個人情報らしい内容を外部送信します'), findsOneWidget);
+    expect(find.textContaining('個人情報らしい文字列'), findsOneWidget);
+    expect(find.text('実行して次回から表示しない'), findsNothing);
+    expect(regenerateBody, isNull);
+
+    await tester.tap(find.text('確認して実行'));
+    await tester.pumpAndSettle();
+    expect(regenerateBody?['confirm_live_api'], isTrue);
+    expect(regenerateBody?['confirm_sensitive_data'], isTrue);
   });
 
   testWidgets('policy blockは送信せずマスク済み文面への置換を提示する', (tester) async {
@@ -372,7 +815,20 @@ void main() {
     expect(chatCalls, 1);
     expect(find.textContaining('再接続または停止'), findsOneWidget);
     expect(find.byIcon(Icons.stop), findsOneWidget);
-    expect(tester.widget<TextField>(messageField).enabled, isFalse);
+    expect(tester.widget<TextField>(messageField).enabled, isTrue);
+    await tester.enterText(messageField, '次回の下書き');
+    final tierSelector = find.byKey(const Key('composer-tier-selector'));
+    expect(
+      tester.widget<SegmentedButton<String>>(tierSelector).onSelectionChanged,
+      isNotNull,
+    );
+    await tester.tap(
+      find.descendant(of: tierSelector, matching: find.text('HIGH')),
+    );
+    await tester.pump();
+    expect(tester.widget<SegmentedButton<String>>(tierSelector).selected, {
+      'high',
+    });
 
     await tester.tap(find.byIcon(Icons.stop));
     await tester.pump();
@@ -381,6 +837,7 @@ void main() {
     expect(chatCalls, 1);
     expect(find.text('完了が先に確定しました'), findsOneWidget);
     expect(find.textContaining('保存済み結果を確認できます'), findsOneWidget);
+    expect(tester.widget<TextField>(messageField).controller?.text, '次回の下書き');
   });
 
   testWidgets('SSEが無通信のままならidle timeoutで再接続状態へ移る', (tester) async {
@@ -680,11 +1137,83 @@ Map<String, dynamic> _savedRunningConversation({required bool running}) => {
   ],
 };
 
+Map<String, dynamic> _completedConversationSummary() => {
+  'id': 'conversation-id',
+  'title': '再生成テスト',
+  'updated_at': '2026-07-21T00:00:00Z',
+  'turn_count': 1,
+  'preview': '再生成して',
+};
+
+Map<String, dynamic> _completedConversation() => {
+  'id': 'conversation-id',
+  'title': '再生成テスト',
+  'turns': [
+    {
+      'request_id': 'completed-turn-request',
+      'message': '再生成して',
+      'clean_message': '再生成して',
+      'status': 'completed',
+      'options': {
+        'tier': 'high',
+        'reasoning_mode': 'high',
+        'providers': ['chatgpt'],
+        'synthesize': false,
+      },
+      'answers': {
+        'chatgpt': {
+          'ok': true,
+          'text': '最初の回答',
+          'model': 'gpt-test',
+          'completion_status': 'completed',
+        },
+      },
+      'synthesis': {'ok': false, 'text': '', 'source': 'none', 'skipped': true},
+    },
+  ],
+};
+
+http.Response _planOnlyResponse({
+  required bool billable,
+  bool policyConfirmation = false,
+}) => _preflightResponse(
+  http.Request('POST', Uri.parse('http://localhost:8000/api/plan')),
+  billable: billable,
+  policyConfirmation: policyConfirmation,
+);
+
 http.Response _preflightResponse(
   http.Request request, {
   required bool billable,
   bool blocked = false,
+  bool policyConfirmation = false,
 }) {
+  final policyAction = blocked
+      ? 'block'
+      : policyConfirmation
+      ? 'confirm'
+      : 'allow';
+  final policyFindings = blocked
+      ? <Object>[
+          {
+            'rule_id': 'openai_api_key',
+            'label': 'OpenAI APIキーらしい文字列',
+            'severity': 'block',
+            'start': 3,
+            'end': 43,
+          },
+        ]
+      : policyConfirmation
+      ? <Object>[
+          {
+            'rule_id': 'personal_data',
+            'label': '個人情報らしい文字列',
+            'severity': 'confirm',
+            'start': 0,
+            'end': 4,
+          },
+        ]
+      : <Object>[];
   switch (request.url.path) {
     case '/api/health':
       return _widgetJsonResponse({
@@ -713,23 +1242,19 @@ http.Response _preflightResponse(
         'active_workers': ['chatgpt'],
         'synthesizer': 'synthesizer',
         'auth_required': false,
+        'web_search': {
+          'enabled': true,
+          'default': false,
+          'max_uses': 3,
+          'strict_total_limit': false,
+        },
       });
     case '/api/conversations':
       return _widgetJsonResponse(<Object>[]);
     case '/api/policy/scan':
       return _widgetJsonResponse({
-        'action': blocked ? 'block' : 'allow',
-        'findings': blocked
-            ? [
-                {
-                  'rule_id': 'openai_api_key',
-                  'label': 'OpenAI APIキーらしい文字列',
-                  'severity': 'block',
-                  'start': 3,
-                  'end': 43,
-                },
-              ]
-            : <Object>[],
+        'action': policyAction,
+        'findings': policyFindings,
         'redacted_text': blocked ? '確認 ⟪REDACTED:openai_api_key⟫' : '会議',
         'disclaimer': '',
       });
@@ -761,18 +1286,8 @@ http.Response _preflightResponse(
         'calls': {'answers': 1, 'debate': 0, 'synthesis': 0, 'total': 1},
         'max_output_tokens': {'total': 2400, 'live_total': billable ? 2400 : 0},
         'policy': {
-          'action': blocked ? 'block' : 'allow',
-          'findings': blocked
-              ? [
-                  {
-                    'rule_id': 'openai_api_key',
-                    'label': 'OpenAI APIキーらしい文字列',
-                    'severity': 'block',
-                    'start': 3,
-                    'end': 43,
-                  },
-                ]
-              : <Object>[],
+          'action': policyAction,
+          'findings': policyFindings,
           'redacted_text': blocked ? '確認 ⟪REDACTED:openai_api_key⟫' : '会議',
           'disclaimer': '',
         },

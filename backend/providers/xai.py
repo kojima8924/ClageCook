@@ -17,7 +17,7 @@ from .base import (
 )
 
 
-_EFFORT = {"low": "low", "balanced": "medium", "high": "high"}
+_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
 class XAIProvider(HttpProvider):
@@ -33,8 +33,9 @@ class XAIProvider(HttpProvider):
             "input": input_messages,
             "store": False,
             "max_output_tokens": request.max_output_tokens,
-            "reasoning": {"effort": _EFFORT.get(request.tier, "medium")},
         }
+        if request.reasoning_effort in _EFFORTS:
+            payload["reasoning"] = {"effort": request.reasoning_effort}
         if request.prompt_cache_key:
             payload["prompt_cache_key"] = opaque_prompt_cache_key(
                 request.prompt_cache_key

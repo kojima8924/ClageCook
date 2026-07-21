@@ -168,7 +168,13 @@ async def test_anthropic_current_models_use_adaptive_thinking(
     async with _client(handler) as client:
         result = await AnthropicProvider(
             name="claude", model=model, api_key="secret", client=client
-        ).complete(CompletionRequest(prompt="hello", tier=tier))
+        ).complete(
+            CompletionRequest(
+                prompt="hello",
+                tier=tier,
+                reasoning_effort=effort,
+            )
+        )
 
     assert result.text == "answer"
 
@@ -195,7 +201,13 @@ async def test_anthropic_always_on_thinking_model_uses_effort_without_field():
             model="claude-fable-5",
             api_key="secret",
             client=client,
-        ).complete(CompletionRequest(prompt="hello", tier="high"))
+        ).complete(
+            CompletionRequest(
+                prompt="hello",
+                tier="low",
+                reasoning_effort="high",
+            )
+        )
 
     assert result.text == "answer"
 
@@ -269,7 +281,12 @@ async def test_openai_responses_contract_and_store_false():
             name="chatgpt", model="gpt-test", api_key="secret", client=client
         )
         result = await provider.complete(
-            CompletionRequest(prompt="hello", system="system", tier="high")
+            CompletionRequest(
+                prompt="hello",
+                system="system",
+                tier="high",
+                reasoning_effort="high",
+            )
         )
     assert result.text == "OpenAI answer"
     assert result.usage["total_tokens"] == 8
@@ -320,7 +337,13 @@ async def test_gemini_interactions_contract():
         provider = GeminiProvider(
             name="gemini", model="gemini-test", api_key="secret", client=client
         )
-        result = await provider.complete(CompletionRequest(prompt="hello", tier="low"))
+        result = await provider.complete(
+            CompletionRequest(
+                prompt="hello",
+                tier="low",
+                reasoning_effort="low",
+            )
+        )
     assert result.text == "Gemini answer"
     assert result.usage == {
         "input_tokens": 7,
@@ -367,7 +390,12 @@ async def test_xai_responses_contract():
             name="grok", model="grok-test", api_key="secret", client=client
         )
         result = await provider.complete(
-            CompletionRequest(prompt="hello", system="system", tier="balanced")
+            CompletionRequest(
+                prompt="hello",
+                system="system",
+                tier="balanced",
+                reasoning_effort="medium",
+            )
         )
     assert result.text == "Grok answer"
     assert result.usage["total_tokens"] == 5

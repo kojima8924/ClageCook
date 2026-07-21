@@ -1,6 +1,13 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8">
+  <meta name="referrer" content="no-referrer">
+  <!-- This policy reduces script-injection risk around WebCrypto-backed key
+       storage while retaining direct HTTPS APIs and development reference
+       servers. Production hosting must also send CSP, HSTS, nosniff and
+       frame-ancestors as HTTP response headers. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'none'; script-src 'self' 'wasm-unsafe-eval' blob: https://www.gstatic.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https: http: ws: wss:; worker-src 'self' blob:; child-src 'self' blob:; trusted-types flutter-js; require-trusted-types-for 'script'">
   <!--
     If you are serving your web app in a path other than the root, change the
     href value below to reflect the base path you are serving from.
@@ -16,9 +23,8 @@
   -->
   <base href="$FLUTTER_BASE_HREF">
 
-  <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
+  <meta name="description" content="Clage Cook — APIキーだけで使えるローカル保存型のマルチAI会議クライアント。">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">

@@ -784,9 +784,15 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
             "method": "configured_price_table",
         }
     envelope = plan.get("input_envelope") or {}
-    output = plan.get("max_output_tokens") or {}
-    attempts = int((plan.get("retry_envelope") or {}).get("configured_retries_per_live_call", 0)) + 1
-    per_call_output = int(output.get("per_call") or 0)
+    attempts = (
+        int(
+            (plan.get("retry_envelope") or {}).get(
+                "configured_retries_per_live_call",
+                0,
+            )
+        )
+        + 1
+    )
     debate_effective = bool((plan.get("options") or {}).get("debate_effective"))
     items: list[dict[str, Any]] = []
     for provider in plan.get("providers") or []:
@@ -796,6 +802,7 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
         if debate_effective:
             input_tokens += int(envelope.get("debate_per_call") or 0)
         calls = int(provider.get("max_calls") or 0)
+        per_call_output = int(provider.get("max_output_tokens") or 0)
         items.append(
             _estimate_max_item(
                 catalog,
@@ -809,6 +816,7 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
     synthesizer = plan.get("synthesizer") or {}
     if isinstance(synthesizer, dict) and synthesizer.get("billable"):
         calls = int(synthesizer.get("max_calls") or 0)
+        per_call_output = int(synthesizer.get("max_output_tokens") or 0)
         items.append(
             _estimate_max_item(
                 catalog,

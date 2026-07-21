@@ -52,6 +52,12 @@ _RULES = (
         re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
     ),
     _Rule(
+        "google_aq_api_key",
+        "Google APIキーらしいAQ形式の文字列",
+        "block",
+        re.compile(r"\bAQ\.[0-9A-Za-z_-]{20,}\b"),
+    ),
+    _Rule(
         "xai_api_key",
         "xAI APIキーらしい文字列",
         "block",

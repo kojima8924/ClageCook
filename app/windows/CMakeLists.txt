@@ -6,6 +6,11 @@ project(clage_cook LANGUAGES CXX)
 # the on-disk name of your application.
 set(BINARY_NAME "clage_cook")
 
+# Keep flutter_secure_storage's DPAPI/Credential Manager namespace stable even
+# if the executable is renamed in a future packaging pass.
+set(STORAGE_PREFIX "jp.akoji.clageCook" CACHE STRING
+  "Stable flutter_secure_storage namespace")
+
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
 cmake_policy(VERSION 3.14...3.25)

@@ -1,12 +1,13 @@
 name: clage_cook
 description: "BYOK multi-model AI conference client for Clage Cook."
 publish_to: "none"
-version: 0.2.0+2
+version: 0.2.0+6
 
 environment:
   sdk: ^3.12.2
 
 dependencies:
+  archive: ^4.0.9
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8

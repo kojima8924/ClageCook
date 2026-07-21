@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,8 +9,12 @@ import '../controllers/conversation_selection_controller.dart';
 import '../controllers/live_run_controller.dart';
 import '../models.dart';
 import '../services/api_client.dart';
+import '../services/direct_byok_client.dart';
+import '../services/direct_settings_store.dart';
+import '../services/local_conversation_store.dart';
 import '../services/settings_store.dart';
 import '../widgets/turn_view.dart';
+import 'app_settings_screen.dart';
 import 'settings_screen.dart';
 import 'usage_screen.dart';
 
@@ -21,11 +26,30 @@ const _providerLabels = {
   'grok': 'Grok',
 };
 
+enum _BillableConfirmationAction { cancel, confirmOnce, disableFuture }
+
+const _promptTemplates = <String, String>{
+  '比較': '次の選択肢を、評価軸・長所・短所・不確実性ごとに比較してください。\n\n',
+  '反証': '次の案について、成立条件・反例・見落としやすいリスクを検証してください。\n\n',
+  '発想': '次のテーマについて、前提の異なる複数の案を出し、それぞれの特徴を示してください。\n\n',
+  '事実確認': '次の内容を、確認できる事実・推測・未確認事項に分けて検討してください。\n\n',
+};
+
 typedef ApiClientFactory = ApiClient Function(ConnectionSettings settings);
+typedef DirectApiClientFactory =
+    ApiClient Function(
+      DirectSettings settings,
+      LocalConversationRepository conversations,
+    );
 typedef AttachmentPicker = Future<FilePickerResult?> Function();
 
 ApiClient _defaultApiClientFactory(ConnectionSettings settings) =>
     ApiClient(settings);
+
+ApiClient _defaultDirectApiClientFactory(
+  DirectSettings settings,
+  LocalConversationRepository conversations,
+) => DirectByokClient(settings: settings, conversations: conversations);
 
 Future<FilePickerResult?> _defaultAttachmentPicker() =>
     FilePicker.platform.pickFiles(
@@ -53,13 +77,21 @@ class HomeScreen extends StatefulWidget {
     required this.repository,
     this.autoload = true,
     this.clientFactory = _defaultApiClientFactory,
+    this.directRepository,
+    this.localConversationRepository,
+    this.directClientFactory = _defaultDirectApiClientFactory,
     this.attachmentPicker = _defaultAttachmentPicker,
+    this.allowReferenceServer = !kReleaseMode || kIsWeb,
   });
 
   final SettingsRepository repository;
   final bool autoload;
   final ApiClientFactory clientFactory;
+  final DirectSettingsRepository? directRepository;
+  final LocalConversationRepository? localConversationRepository;
+  final DirectApiClientFactory directClientFactory;
   final AttachmentPicker attachmentPicker;
+  final bool allowReferenceServer;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -82,16 +114,20 @@ class _HomeScreenState extends State<HomeScreen> {
 
   ApiClient? _client;
   ConnectionSettings? _connection;
+  DirectSettings? _directSettings;
   ServerSettings? _server;
   List<ConversationSummary> _summaries = const [];
   List<ConversationSummary>? _searchResults;
   String _tier = 'balanced';
+  String _defaultReasoningMode = 'auto';
+  String? _reasoningModeOverride;
   bool _debate = false;
   bool _synthesize = true;
   bool _blind = false;
   bool _webSearch = false;
   bool _loading = false;
   bool _uploadingAttachment = false;
+  bool _cancelPending = false;
   bool _searching = false;
   String _error = '';
   String _searchError = '';
@@ -106,8 +142,27 @@ class _HomeScreenState extends State<HomeScreen> {
   bool get _loadingConversation => _selection.loading;
   bool get _sending => _run.sending;
   bool get _streamDisconnected => _run.disconnected;
+  bool get _showTokenUsageLedger =>
+      _directSettings?.showTokenUsageLedger ?? true;
   String? get _terminalReloadConversationId =>
       _run.terminalReloadConversationId;
+  String get _reasoningMode => _reasoningModeOverride ?? _defaultReasoningMode;
+  String get _effortSelection => _reasoningModeOverride ?? 'default';
+
+  void _insertPromptTemplate(String template) {
+    final value = _messageController.value;
+    final selection = value.selection.isValid
+        ? value.selection
+        : TextSelection.collapsed(offset: value.text.length);
+    final start = selection.start.clamp(0, value.text.length);
+    final end = selection.end.clamp(start, value.text.length);
+    final nextText = value.text.replaceRange(start, end, template);
+    _messageController.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: start + template.length),
+    );
+    _messageFocusNode.requestFocus();
+  }
 
   @override
   void initState() {
@@ -171,7 +226,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _searchResults = const [];
         _searching = false;
-        _searchError = 'バックエンドへ接続すると回答本文まで全文検索できます。';
+        _searchError = '実行方式を設定すると回答本文まで全文検索できます。';
       });
       return;
     }
@@ -209,10 +264,30 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     ApiClient? candidate;
     ConnectionSettings? attemptedConnection;
+    DirectSettings? attemptedDirectSettings;
     try {
       final connection = await widget.repository.load();
       attemptedConnection = connection;
-      candidate = widget.clientFactory(connection);
+      final loadedDirectSettings = await widget.directRepository?.load();
+      final directSettings =
+          loadedDirectSettings != null &&
+              !widget.allowReferenceServer &&
+              loadedDirectSettings.executionMode ==
+                  ExecutionMode.referenceServer
+          ? loadedDirectSettings.copyWith(
+              executionMode: ExecutionMode.directByok,
+            )
+          : loadedDirectSettings;
+      attemptedDirectSettings = directSettings;
+      if (directSettings?.executionMode == ExecutionMode.directByok) {
+        final conversations = widget.localConversationRepository;
+        if (conversations == null) {
+          throw StateError('Direct BYOKの端末内会話ストレージが初期化されていません。');
+        }
+        candidate = widget.directClientFactory(directSettings!, conversations);
+      } else {
+        candidate = widget.clientFactory(connection);
+      }
       await candidate.health();
       final results = await Future.wait<Object>([
         candidate.serverSettings(),
@@ -240,12 +315,17 @@ class _HomeScreenState extends State<HomeScreen> {
       if (selectedProviders.isEmpty) selectedProviders.addAll(available);
       setState(() {
         _connection = connection;
+        _directSettings = directSettings;
         _server = server;
         _summaries = summaries;
         _selection.restore(selectedId: selectedId, conversation: selected);
         _selectedProviders
           ..clear()
           ..addAll(selectedProviders);
+        if (directSettings != null) {
+          _defaultReasoningMode = directSettings.reasoningMode.name;
+        }
+        if (!server.webSearch.enabled) _webSearch = false;
         _loading = false;
       });
       if (_searchController.text.trim().isNotEmpty) {
@@ -264,13 +344,14 @@ class _HomeScreenState extends State<HomeScreen> {
       _searchTimer?.cancel();
       setState(() {
         _connection = attemptedConnection;
+        _directSettings = attemptedDirectSettings;
         _server = null;
         _summaries = const [];
         _searchResults = null;
         _selectedProviders.clear();
         _loading = false;
         _searching = false;
-        _error = 'バックエンドに接続できないため接続を無効化しました: $error';
+        _error = '実行環境を初期化できないため接続を無効化しました: $error';
       });
     }
   }
@@ -554,13 +635,28 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final initial = _connection ?? await widget.repository.load();
     if (!mounted) return;
+    final directRepository = widget.directRepository;
+    final initialDirect = _directSettings ?? await directRepository?.load();
+    if (!mounted) return;
     final changed = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
-        builder: (_) => SettingsScreen(
-          repository: widget.repository,
-          initial: initial,
-          initialServerSettings: _server,
-        ),
+        builder: (_) => directRepository != null && initialDirect != null
+            ? AppSettingsScreen(
+                directRepository: directRepository,
+                serverRepository: widget.repository,
+                initialDirect: initialDirect,
+                initialServer: initial,
+                initialServerSettings:
+                    initialDirect.executionMode == ExecutionMode.referenceServer
+                    ? _server
+                    : null,
+                allowReferenceServer: widget.allowReferenceServer,
+              )
+            : SettingsScreen(
+                repository: widget.repository,
+                initial: initial,
+                initialServerSettings: _server,
+              ),
       ),
     );
     if (changed == true) await _bootstrap();
@@ -569,7 +665,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _openUsage() async {
     final client = _client;
     if (client == null) {
-      setState(() => _error = '先にバックエンドへ接続してください。');
+      setState(() => _error = '先に実行方式を設定してください。');
       return;
     }
     await Navigator.of(context).push<void>(
@@ -655,25 +751,29 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<bool> _confirmBillableRun(
+  Future<_BillableConfirmationAction> _confirmBillableRun(
     RunPlan plan,
-    PolicyScanResult policy,
-  ) async {
+    PolicyScanResult policy, {
+    required bool allowDisableFuture,
+  }) async {
     final participants = plan.billableParticipants;
     final liveTokens = plan.maxOutputTokens['live_total'] ?? 0;
     final allCalls = plan.calls['total'] ?? 0;
     final retryEnvelope = plan.retryEnvelope;
+    final sensitiveConfirmation = policy.action == 'confirm';
     final personalDataLabels = policy.findings
         .where((finding) => finding.severity == 'confirm')
         .map((finding) => finding.label)
         .toSet()
         .toList(growable: false);
-    return await showDialog<bool>(
+    return await showDialog<_BillableConfirmationAction>(
           context: context,
           barrierDismissible: false,
           builder: (context) => AlertDialog(
             icon: const Icon(Icons.payments_outlined),
-            title: const Text('実APIを使用します'),
+            title: Text(
+              sensitiveConfirmation ? '個人情報らしい内容を外部送信します' : '実APIを使用します',
+            ),
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -762,22 +862,97 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(context, false),
+                onPressed: () =>
+                    Navigator.pop(context, _BillableConfirmationAction.cancel),
                 child: const Text('キャンセル'),
               ),
+              if (allowDisableFuture)
+                TextButton(
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _BillableConfirmationAction.disableFuture,
+                  ),
+                  child: const Text('実行して次回から表示しない'),
+                ),
               FilledButton(
-                onPressed: () => Navigator.pop(context, true),
+                onPressed: () => Navigator.pop(
+                  context,
+                  _BillableConfirmationAction.confirmOnce,
+                ),
                 child: const Text('確認して実行'),
               ),
             ],
           ),
         ) ??
-        false;
+        _BillableConfirmationAction.cancel;
+  }
+
+  bool _requiresBillableConfirmation(RunPlan plan, PolicyScanResult policy) =>
+      plan.billable &&
+      (_directSettings?.showLiveApiConfirmation != false ||
+          policy.action == 'confirm');
+
+  Future<bool> _approveBillableRun(
+    RunPlan plan,
+    PolicyScanResult policy,
+  ) async {
+    if (!_requiresBillableConfirmation(plan, policy)) return true;
+    final action = await _confirmBillableRun(
+      plan,
+      policy,
+      allowDisableFuture:
+          policy.action != 'confirm' &&
+          widget.directRepository != null &&
+          _directSettings != null,
+    );
+    if (!mounted || action == _BillableConfirmationAction.cancel) return false;
+    if (action == _BillableConfirmationAction.disableFuture) {
+      return _disableFutureLiveApiConfirmation();
+    }
+    return true;
+  }
+
+  PolicyScanResult _effectivePolicy(
+    PolicyScanResult standalone,
+    PolicyScanResult planned,
+  ) {
+    if (standalone.blocked) return standalone;
+    if (planned.blocked) return planned;
+    if (planned.action == 'confirm') return planned;
+    if (standalone.action == 'confirm') return standalone;
+    return planned;
+  }
+
+  Future<bool> _disableFutureLiveApiConfirmation() async {
+    final repository = widget.directRepository;
+    final settings = _directSettings;
+    if (repository == null || settings == null) {
+      setState(() {
+        _error = 'この実行環境では確認表示の設定を保存できません。設定画面から変更してください。';
+      });
+      return false;
+    }
+    final updated = settings.copyWith(showLiveApiConfirmation: false);
+    try {
+      await repository.setShowLiveApiConfirmation(false);
+      if (!mounted) return false;
+      setState(() {
+        _directSettings = updated;
+        _error = '';
+      });
+      return true;
+    } catch (error) {
+      if (mounted) {
+        setState(() => _error = '実API確認の表示設定を保存できませんでした: $error');
+      }
+      return false;
+    }
   }
 
   Future<void> _send() async {
     final client = _client;
-    final message = _messageController.text.trim();
+    final rawDraft = _messageController.text;
+    final message = rawDraft.trim();
     if (_sending ||
         _loadingConversation ||
         _uploadingAttachment ||
@@ -786,7 +961,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     if (client == null || _server == null) {
-      setState(() => _error = '先に設定画面でバックエンドへ接続してください。');
+      setState(() => _error = '先に設定画面でバックエンドへ接続するか、Direct BYOKを設定してください。');
       return;
     }
     final providers = _providerOrder
@@ -794,6 +969,7 @@ class _HomeScreenState extends State<HomeScreen> {
         .toList(growable: false);
     final conversationId = _selectedId;
     final tier = _tier;
+    final reasoningMode = _reasoningMode;
     final debate = _debate;
     final synthesize = _synthesize;
     final blind = _blind;
@@ -818,6 +994,7 @@ class _HomeScreenState extends State<HomeScreen> {
           message: message,
           conversationId: conversationId,
           tier: tier,
+          reasoningMode: reasoningMode,
           debate: debate,
           providers: providers,
           synthesize: synthesize,
@@ -830,10 +1007,8 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       final plan = checks[0] as RunPlan;
       final scan = checks[1] as PolicyScanResult;
-      final effectivePolicy = scan.action != 'allow' ? scan : plan.policy;
-      final blockedPolicy = scan.blocked
-          ? scan
-          : (plan.policy.blocked ? plan.policy : null);
+      final effectivePolicy = _effectivePolicy(scan, plan.policy);
+      final blockedPolicy = effectivePolicy.blocked ? effectivePolicy : null;
       if (blockedPolicy != null) {
         setState(_run.endRequest);
         await _showPolicyBlocked(blockedPolicy);
@@ -852,7 +1027,7 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
       if (plan.billable) {
-        final confirmed = await _confirmBillableRun(plan, effectivePolicy);
+        final confirmed = await _approveBillableRun(plan, effectivePolicy);
         if (!mounted) return;
         if (!confirmed) {
           setState(_run.endRequest);
@@ -866,6 +1041,7 @@ class _HomeScreenState extends State<HomeScreen> {
         message: message,
         conversationId: conversationId,
         tier: tier,
+        reasoningMode: reasoningMode,
         debate: debate,
         providers: providers,
         synthesize: synthesize,
@@ -881,6 +1057,7 @@ class _HomeScreenState extends State<HomeScreen> {
         message: message,
         providers: providers,
         tier: tier,
+        reasoningMode: reasoningMode,
         debate: debate,
         synthesize: synthesize,
         blind: blind,
@@ -892,7 +1069,9 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       // HTTP受理後にだけ下書きを消す。controller更新をsetStateの外で通知し、
       // Flutter Webのsemantics inputにも確実に反映させる。
-      _messageController.clear();
+      if (_messageController.text == rawDraft) {
+        _messageController.clear();
+      }
       setState(() {
         _pendingAttachments.clear();
         _run.attach(live);
@@ -1029,6 +1208,7 @@ class _HomeScreenState extends State<HomeScreen> {
         requestId: live.requestId,
         lastEventId: live.lastEventId,
         tier: live.tier,
+        reasoningMode: live.reasoningMode,
         debate: live.debate,
         providers: live.providers,
         synthesize: live.synthesize,
@@ -1050,8 +1230,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _cancelLiveTurn() async {
     final live = _liveTurn;
     final client = _client;
-    if (live == null || client == null) return;
-    setState(() => live.phase = '停止をリクエスト中');
+    if (live == null || client == null || _cancelPending) return;
+    setState(() {
+      _cancelPending = true;
+      live.phase = '停止をリクエスト中';
+    });
     try {
       final result = await client.cancelRun(live.requestId);
       if (!mounted || _liveTurn?.requestId != live.requestId) return;
@@ -1067,6 +1250,10 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _error = '停止リクエストに失敗しました: $error';
       });
+    } finally {
+      if (mounted && _cancelPending) {
+        setState(() => _cancelPending = false);
+      }
     }
   }
 
@@ -1086,6 +1273,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final requestTier = {'low', 'balanced', 'high'}.contains(rawRequestTier)
         ? rawRequestTier
         : 'balanced';
+    final rawReasoningMode =
+        resume['reasoning_mode']?.toString() ??
+        turn.options['reasoning_mode']?.toString() ??
+        'auto';
+    final requestReasoningMode =
+        {'auto', 'low', 'medium', 'high'}.contains(rawReasoningMode)
+        ? rawReasoningMode
+        : 'auto';
     final rawRequestedProviders = resume['providers'];
     final requestedProviders = rawRequestedProviders is List
         ? _providerOrder
@@ -1120,6 +1315,7 @@ class _HomeScreenState extends State<HomeScreen> {
         conversationId: conversationId,
         requestId: turn.requestId,
         tier: requestTier,
+        reasoningMode: requestReasoningMode,
         debate: resume['debate'] == true,
         providers: requestedProviders,
         synthesize: resume['synthesize'] != false,
@@ -1135,6 +1331,7 @@ class _HomeScreenState extends State<HomeScreen> {
         message: turn.message.isNotEmpty ? turn.message : turn.cleanMessage,
         providers: displayProviders,
         tier: effectiveTier,
+        reasoningMode: requestReasoningMode,
         debate: turn.options['debate'] == true,
         synthesize: turn.options['synthesize'] != false,
         blind: turn.options['blind'] == true,
@@ -1324,10 +1521,8 @@ class _HomeScreenState extends State<HomeScreen> {
             .join(' ');
         throw ApiException(reason.isEmpty ? '安全条件により再生成できません。' : reason);
       }
-      var confirmed = true;
-      if (plan.billable) {
-        confirmed = await _confirmBillableRun(plan, plan.policy);
-      }
+      final confirmed = await _approveBillableRun(plan, plan.policy);
+      if (!mounted) return;
       if (!confirmed) return;
       final conversation = await client.regenerate(
         conversationId: conversationId,
@@ -1597,22 +1792,29 @@ class _HomeScreenState extends State<HomeScreen> {
 
   PreferredSizeWidget _appBar(bool wide, bool compact) {
     final safeMock = _server != null && !_server!.liveApiEnabled;
+    final directByok = _server?.mode == 'direct-byok';
     final settingsLocked =
         _sending || _uploadingAttachment || _liveTurn != null;
     return AppBar(
       titleSpacing: wide ? 20 : null,
-      title: safeMock && compact
-          ? const Column(
+      title: (safeMock || directByok) && compact
+          ? Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text('Clage Cook'),
+                const Text('Clage Cook'),
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.lock_outline, size: 12),
-                    SizedBox(width: 3),
-                    Text('SAFE MOCK', style: TextStyle(fontSize: 10)),
+                    Icon(
+                      directByok ? Icons.phone_android : Icons.lock_outline,
+                      size: 12,
+                    ),
+                    const SizedBox(width: 3),
+                    Text(
+                      directByok ? 'DIRECT · 端末内保存' : 'SAFE MOCK',
+                      style: const TextStyle(fontSize: 10),
+                    ),
                   ],
                 ),
               ],
@@ -1625,18 +1827,26 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Tooltip(
               message: safeMock
                   ? '外部API呼び出しはサーバー側で施錠されています'
-                  : '実APIの利用が許可されています',
+                  : directByok
+                  ? '端末から各社APIへ直接接続し、会話を端末内へ保存します'
+                  : '開発用サーバー経由の実行です',
               child: Chip(
                 avatar: Icon(
                   safeMock
                       ? Icons.lock_outline
+                      : directByok
+                      ? Icons.phone_android
                       : _server!.mode == 'mock'
                       ? Icons.science_outlined
                       : Icons.cloud_done_outlined,
                   size: 17,
                 ),
                 label: Text(
-                  safeMock ? 'SAFE MOCK' : _server!.mode.toUpperCase(),
+                  safeMock
+                      ? 'SAFE MOCK'
+                      : directByok
+                      ? 'DIRECT · LOCAL'
+                      : _server!.mode.toUpperCase(),
                 ),
                 visualDensity: VisualDensity.compact,
               ),
@@ -1996,12 +2206,18 @@ class _HomeScreenState extends State<HomeScreen> {
             onForkEdit: turn.status == 'completed'
                 ? () => unawaited(_forkEditTurn(turn))
                 : null,
+            showTokenUsageLedger: _showTokenUsageLedger,
           ),
           const SizedBox(height: 24),
           const Divider(),
           const SizedBox(height: 20),
         ],
-        if (showLive) LiveTurnView(key: ValueKey(live.requestId), turn: live),
+        if (showLive)
+          LiveTurnView(
+            key: ValueKey(live.requestId),
+            turn: live,
+            showTokenUsageLedger: _showTokenUsageLedger,
+          ),
       ],
     );
   }
@@ -2025,17 +2241,17 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 10),
               const Text(
                 'Claude・Gemini・ChatGPT・Grokが並列で回答し、'
-                '最後に1つの結論へ統合します。APIキーがない間はモックデモで動きます。',
+                '最後に1つの回答へ統合します。Direct BYOKではAPIキーと端末内保存だけで動きます。',
                 textAlign: TextAlign.center,
               ),
-              if (_server == null) ...[
+              if (_server == null || _server!.activeWorkers.isEmpty) ...[
                 const SizedBox(height: 18),
                 FilledButton.icon(
                   onPressed: _sending || _liveTurn != null
                       ? null
                       : _openSettings,
                   icon: const Icon(Icons.settings_ethernet),
-                  label: const Text('バックエンドに接続'),
+                  label: const Text('実行方式を設定'),
                 ),
               ],
             ],
@@ -2045,30 +2261,67 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _composerStrip({required Key key, required List<Widget> children}) {
+    return SizedBox(
+      key: key,
+      height: 48,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(mainAxisSize: MainAxisSize.min, children: children),
+      ),
+    );
+  }
+
   Widget _composer() {
     final theme = Theme.of(context);
     final active = _server?.activeWorkers ?? const <String>[];
+    final webSearchAvailable = _server?.webSearch.enabled ?? false;
+    const compactSegmentStyle = ButtonStyle(
+      minimumSize: WidgetStatePropertyAll(Size(0, 40)),
+      padding: WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 6)),
+    );
     final runActive = _liveTurn != null;
-    final controlsDisabled =
-        _sending || _loadingConversation || _uploadingAttachment || runActive;
+    final preparing = _sending && !runActive;
+    final draftLocked = _loadingConversation || preparing;
+    final optionsLocked =
+        _loadingConversation || _uploadingAttachment || preparing;
+    final attachmentLocked =
+        _loadingConversation || _uploadingAttachment || _sending || runActive;
     return Material(
+      key: const Key('composer'),
       elevation: 8,
       color: theme.colorScheme.surfaceContainer,
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+          padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 1000),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    children: [
-                      SegmentedButton<String>(
+                _composerStrip(
+                  key: const Key('composer-quality-strip'),
+                  children: [
+                    if (runActive) ...[
+                      Chip(
+                        avatar: const Icon(Icons.edit_note, size: 17),
+                        label: const Text('次回'),
+                        visualDensity: VisualDensity.compact,
+                        side: BorderSide(color: theme.colorScheme.primary),
+                      ),
+                      const SizedBox(width: 6),
+                    ],
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: Text('品質', style: theme.textTheme.labelLarge),
+                    ),
+                    Semantics(
+                      label: 'モデルと出力枠の品質',
+                      child: SegmentedButton<String>(
+                        key: const Key('composer-tier-selector'),
+                        style: compactSegmentStyle,
                         segments: const [
                           ButtonSegment(value: 'low', label: Text('LOW')),
                           ButtonSegment(
@@ -2078,100 +2331,136 @@ class _HomeScreenState extends State<HomeScreen> {
                           ButtonSegment(value: 'high', label: Text('HIGH')),
                         ],
                         selected: {_tier},
-                        onSelectionChanged: controlsDisabled
+                        onSelectionChanged: optionsLocked
                             ? null
                             : (value) => setState(() => _tier = value.first),
                         showSelectedIcon: false,
                       ),
-                      const SizedBox(width: 8),
-                      FilterChip(
+                    ),
+                    const SizedBox(width: 8),
+                    Tooltip(
+                      message: '相互批評を追加します。利用量と待ち時間が増えます。',
+                      child: FilterChip(
                         label: const Text('DEBATE'),
-                        avatar: const Icon(Icons.forum_outlined, size: 18),
+                        avatar: const Icon(Icons.forum_outlined, size: 17),
                         selected: _debate,
-                        onSelected: controlsDisabled
+                        onSelected: optionsLocked
                             ? null
                             : (value) => setState(() => _debate = value),
+                        visualDensity: VisualDensity.compact,
                       ),
-                      const SizedBox(width: 6),
-                      FilterChip(
+                    ),
+                  ],
+                ),
+                _composerStrip(
+                  key: const Key('composer-effort-strip'),
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: Text('エフォート', style: theme.textTheme.labelLarge),
+                    ),
+                    Tooltip(
+                      message:
+                          '既定は${_defaultReasoningMode.toUpperCase()}です。変更は次の会議だけに適用します。',
+                      child: Semantics(
+                        label: '推論エフォート',
+                        child: SegmentedButton<String>(
+                          key: const Key('composer-effort-selector'),
+                          style: compactSegmentStyle,
+                          segments: const [
+                            ButtonSegment(value: 'default', label: Text('既定')),
+                            ButtonSegment(value: 'low', label: Text('LOW')),
+                            ButtonSegment(
+                              value: 'medium',
+                              label: Text('MEDIUM'),
+                            ),
+                            ButtonSegment(value: 'high', label: Text('HIGH')),
+                          ],
+                          selected: {_effortSelection},
+                          onSelectionChanged: optionsLocked
+                              ? null
+                              : (value) => setState(() {
+                                  _reasoningModeOverride =
+                                      value.first == 'default'
+                                      ? null
+                                      : value.first;
+                                }),
+                          showSelectedIcon: false,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Tooltip(
+                      message: webSearchAvailable
+                          ? '初回回答だけWeb検索を許可します。検索利用量が増える場合があります。'
+                          : '現在の実行環境はWeb検索に対応していません。',
+                      child: FilterChip(
+                        key: const Key('composer-web-toggle'),
+                        label: Text(_webSearch ? 'WEB ON' : 'WEB OFF'),
+                        avatar: Icon(
+                          _webSearch ? Icons.public : Icons.public_off_outlined,
+                          size: 17,
+                        ),
+                        selected: _webSearch,
+                        onSelected: optionsLocked || !webSearchAvailable
+                            ? null
+                            : (value) => setState(() => _webSearch = value),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Tooltip(
+                      message: '各回答を最後に1つへ統合します。',
+                      child: FilterChip(
                         label: const Text('統合'),
-                        avatar: const Icon(Icons.auto_awesome, size: 18),
+                        avatar: const Icon(Icons.auto_awesome, size: 17),
                         selected: _synthesize,
-                        onSelected: controlsDisabled
+                        onSelected: optionsLocked
                             ? null
                             : (value) => setState(() => _synthesize = value),
+                        visualDensity: VisualDensity.compact,
                       ),
-                      const SizedBox(width: 6),
-                      FilterChip(
+                    ),
+                    const SizedBox(width: 6),
+                    Tooltip(
+                      message: '批評と統合へAI名を渡さず、ブランド先入観を減らします。',
+                      child: FilterChip(
                         label: const Text('BLIND'),
                         avatar: const Icon(
                           Icons.visibility_off_outlined,
-                          size: 18,
+                          size: 17,
                         ),
                         selected: _blind,
-                        onSelected: controlsDisabled
+                        onSelected: optionsLocked
                             ? null
                             : (value) => setState(() => _blind = value),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    for (final provider in _providerOrder.where(
+                      active.contains,
+                    )) ...[
+                      FilterChip(
+                        label: Text(_providerLabels[provider] ?? provider),
+                        selected: _selectedProviders.contains(provider),
+                        onSelected: optionsLocked
+                            ? null
+                            : (value) => setState(() {
+                                if (value) {
+                                  _selectedProviders.add(provider);
+                                } else {
+                                  _selectedProviders.remove(provider);
+                                }
+                              }),
+                        visualDensity: VisualDensity.compact,
                       ),
                       const SizedBox(width: 6),
-                      FilterChip(
-                        label: const Text('WEB'),
-                        avatar: const Icon(Icons.public, size: 18),
-                        selected: _webSearch,
-                        onSelected:
-                            controlsDisabled ||
-                                !(_server?.webSearch.enabled ?? false)
-                            ? null
-                            : (value) => setState(() => _webSearch = value),
-                      ),
-                      const SizedBox(width: 10),
-                      for (final provider in _providerOrder.where(
-                        active.contains,
-                      )) ...[
-                        FilterChip(
-                          label: Text(_providerLabels[provider] ?? provider),
-                          selected: _selectedProviders.contains(provider),
-                          onSelected: controlsDisabled
-                              ? null
-                              : (value) => setState(() {
-                                  if (value) {
-                                    _selectedProviders.add(provider);
-                                  } else {
-                                    _selectedProviders.remove(provider);
-                                  }
-                                }),
-                        ),
-                        const SizedBox(width: 6),
-                      ],
                     ],
-                  ),
+                  ],
                 ),
-                if (_debate)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(
-                      'DEBATEは回答者をもう1度呼び出すため、利用量と待ち時間が増えます。',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                  ),
-                if (_blind)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(
-                      'BLINDは相互批評と統合へAI名を渡さず、ブランド先入観を減らします。',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                  ),
-                if (_webSearch)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(
-                      'WEBは初回回答にサーバー側検索を許可します。検索tool分の利用量や料金が増える場合があります。',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                  ),
                 if (_pendingAttachments.isNotEmpty) ...[
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 4),
                   Wrap(
                     spacing: 6,
                     runSpacing: 6,
@@ -2189,7 +2478,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           label: Text(
                             '${attachment.name} · ${_formatBytes(attachment.sizeBytes)}',
                           ),
-                          onDeleted: controlsDisabled || _uploadingAttachment
+                          onDeleted: attachmentLocked
                               ? null
                               : () => unawaited(
                                   _removePendingAttachment(attachment),
@@ -2198,15 +2487,36 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ),
                 ],
-                const SizedBox(height: 8),
+                const SizedBox(height: 4),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
+                    PopupMenuButton<String>(
+                      tooltip: '質問テンプレートを挿入',
+                      enabled: !draftLocked,
+                      icon: const Icon(Icons.auto_fix_high_outlined),
+                      onSelected: (label) =>
+                          _insertPromptTemplate(_promptTemplates[label]!),
+                      itemBuilder: (context) => [
+                        for (final entry in _promptTemplates.entries)
+                          PopupMenuItem(
+                            value: entry.key,
+                            child: ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(Icons.add_comment_outlined),
+                              title: Text(entry.key),
+                              subtitle: Text(
+                                entry.value.trim(),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                     IconButton(
                       tooltip: '添付を追加',
-                      onPressed: controlsDisabled || _uploadingAttachment
-                          ? null
-                          : _pickAttachments,
+                      onPressed: attachmentLocked ? null : _pickAttachments,
                       icon: _uploadingAttachment
                           ? const SizedBox.square(
                               dimension: 18,
@@ -2221,22 +2531,37 @@ class _HomeScreenState extends State<HomeScreen> {
                         focusNode: _messageFocusNode,
                         minLines: 1,
                         maxLines: 6,
-                        enabled: !controlsDisabled,
+                        enabled: !draftLocked,
                         textCapitalization: TextCapitalization.sentences,
-                        decoration: const InputDecoration(
+                        decoration: InputDecoration(
                           hintText: '質問を入力…',
-                          helperText: '下書きはサーバーが受理するまで消えません',
+                          prefixIcon: runActive
+                              ? const Tooltip(
+                                  message: '生成中の会議とは別の、次回用の下書きです。',
+                                  child: Icon(Icons.edit_note),
+                                )
+                              : null,
                           border: OutlineInputBorder(),
+                          isDense: true,
                         ),
                       ),
                     ),
                     const SizedBox(width: 8),
                     IconButton.filled(
-                      tooltip: runActive ? '会議を停止' : '会議を開始',
+                      tooltip: runActive
+                          ? (_cancelPending ? '会議を停止中' : '会議を停止')
+                          : '会議を開始',
                       onPressed: runActive
-                          ? _cancelLiveTurn
-                          : (controlsDisabled ? null : _send),
-                      icon: runActive
+                          ? (_cancelPending ? null : _cancelLiveTurn)
+                          : (draftLocked || _uploadingAttachment
+                                ? null
+                                : _send),
+                      icon: _cancelPending
+                          ? const SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : runActive
                           ? const Icon(Icons.stop)
                           : _sending
                           ? const Icon(Icons.hourglass_top)

@@ -146,6 +146,18 @@ void main() {
     expect(result.redactedText, contains('REDACTED'));
   });
 
+  test('未知のpolicy actionは送信許可へ倒さずblockに正規化する', () {
+    final result = PolicyScanResult.fromJson({
+      'action': 'future_action',
+      'findings': <Object>[],
+      'redacted_text': '',
+      'disclaimer': '未知action',
+    });
+
+    expect(result.action, 'block');
+    expect(result.blocked, isTrue);
+  });
+
   test('実行planから課金対象と最大call/tokenを復元する', () {
     final plan = RunPlan.fromJson({
       'allowed': true,

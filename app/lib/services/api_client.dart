@@ -113,6 +113,7 @@ class ApiClient {
     required String message,
     String? conversationId,
     String tier = 'balanced',
+    String reasoningMode = 'auto',
     bool debate = false,
     List<String>? providers,
     bool synthesize = true,
@@ -123,6 +124,7 @@ class ApiClient {
     final payload = _runPayload(
       message: message,
       tier: tier,
+      reasoningMode: reasoningMode,
       debate: debate,
       providers: providers,
       synthesize: synthesize,
@@ -329,6 +331,7 @@ class ApiClient {
     required String message,
     String? conversationId,
     String tier = 'balanced',
+    String reasoningMode = 'auto',
     bool debate = false,
     List<String>? providers,
     bool synthesize = true,
@@ -350,6 +353,7 @@ class ApiClient {
       ..._runPayload(
         message: message,
         tier: tier,
+        reasoningMode: reasoningMode,
         debate: debate,
         providers: providers,
         synthesize: synthesize,
@@ -573,6 +577,7 @@ class ApiClient {
   static Map<String, dynamic> _runPayload({
     required String message,
     required String tier,
+    required String reasoningMode,
     required bool debate,
     required List<String>? providers,
     required bool synthesize,
@@ -582,6 +587,7 @@ class ApiClient {
   }) => {
     'message': message,
     'tier': tier,
+    'reasoning_mode': reasoningMode,
     'debate': debate,
     'providers': providers,
     'synthesize': synthesize,

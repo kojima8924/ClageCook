@@ -11,6 +11,7 @@ from policy import scan_text
         ("anthropic_api_key", "sk-ant-" + "a" * 30),
         ("openai_api_key", "sk-proj-" + "b" * 30),
         ("google_api_key", "AIza" + "C" * 35),
+        ("google_aq_api_key", "AQ." + "Q" * 32),
         ("xai_api_key", "xai-" + "d" * 30),
         ("github_token", "ghp_" + "e" * 30),
         ("github_fine_grained_token", "github_pat_" + "e" * 30),
