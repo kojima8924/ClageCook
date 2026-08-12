@@ -13,9 +13,11 @@ PC上のバックエンド、LAN、Tailscaleは不要で、会話は端末内へ
 サブスクリプション方式やサーバー版とUIを照合する開発用途のため、**reference server** 接続も
 切り替えて使えます。
 
-> このリポジトリは、AI支援を活用した設計・実装・検証力を示す公開ベータ／ポートフォリオです。
-> production supportや後方互換性はまだ保証しません。Direct BYOKは各社の有料APIを呼び得るため、
-> 送信前に必ず最大呼出回数と利用するProviderを確認してください。
+> **このアプリでできること / 使う前に確認すること**
+> 1つの質問に対する各社の回答がどう食い違うかを、比較・相互批評・統合まで1画面で確認できます。
+> 呼び出しに使うのは利用者自身のAPIキーなので、送信先のProviderと費用の主導権は利用者側にあります。
+> 一方で現在は公開ベータであり、production supportや後方互換性はまだ保証しません。Direct BYOKは
+> 各社の有料APIを呼び得るため、送信前に会議前planで最大呼出回数と利用するProviderを必ず確認してください。
 
 本プロジェクトはAnthropic、OpenAI、Google、xAIによる公式製品または提携製品ではありません。
 各社名、サービス名、商標はそれぞれの権利者に帰属します。
@@ -310,9 +312,17 @@ Android releaseはdebug keyへfallbackしません。配布用署名にはprivat
 Flutter固有の説明は [app/README.md](app/README.md)、開発状況は [HANDOFF.md](HANDOFF.md)、
 変更履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
-このプロジェクトでAIをどの工程に使い、人間が何を判断し、どの成果物で検証可能にしているかは
+Flutter / DartによるUI実装はAI coding agentへ委任し、作者は仕様とアーキテクチャの決定、生成物への
+修正指示、Windows・Android実機での動作確認を担当しています。Providerごとに異なるAPI契約（認証header、
+endpoint、応答形式）を共通interfaceへ吸収すること、一部Providerが失敗しても完了済み回答を保持して統合まで
+進めること、APIキーをOSのsecure storageへ置くこと、Direct接続と開発用reference serverを分離することは、
+作者の設計判断です。
+
+どの工程にAIを使い、人間が何を判断し、どの成果物で検証可能にしているかは
 [AI支援開発について](docs/AI_ASSISTED_DEVELOPMENT.md) に記録しています。AIの提案はそのまま採用せず、
 source、test、CI、Issue、文書の整合を確認して取り込みます。
+
+作者の他の制作物は [ポートフォリオ](https://kojima8924.github.io/) にまとめています。
 
 不具合・機能提案にはGitHub Issueを利用できます。秘密情報や脆弱性の詳細は公開Issueへ投稿せず、
 [SECURITY.md](SECURITY.md) の報告手順に従ってください。
