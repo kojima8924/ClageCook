@@ -6,7 +6,8 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 
 Claude、Gemini、ChatGPT、Grokへ同じ質問を並列に送り、回答を比較し、必要なら相互批評を経て
-1つの回答へ統合するBYOK（Bring Your Own Key）のAI会議アプリです。
+1つの回答へ統合するBYOK（Bring Your Own Key＝自分で取得した各社のAPIキーを持ち込んで使う方式）の
+AI会議アプリです。
 
 現在の本命は、Flutterアプリから各社の公式HTTPS APIへ直接接続する **Direct BYOK** です。
 PC上のバックエンド、LAN、Tailscaleは不要で、会話は端末内へ保存します。旧Clage Cookの
@@ -22,7 +23,30 @@ PC上のバックエンド、LAN、Tailscaleは不要で、会話は端末内へ
 本プロジェクトはAnthropic、OpenAI、Google、xAIによる公式製品または提携製品ではありません。
 各社名、サービス名、商標はそれぞれの権利者に帰属します。
 
+## この文書で使う用語
+
+初めての方向けに、以降で使う用語を先にまとめます。
+
+| 用語 | 意味 |
+| --- | --- |
+| Provider | Claude等を提供する各社（Anthropic / OpenAI / Google / xAI）、またはその接続先のこと |
+| APIキー | 各社の有料APIを呼ぶための、利用者ごとに発行される認証用の文字列 |
+| BYOK | Bring Your Own Key。運営者のキーではなく、利用者自身のAPIキーで各社APIを呼ぶ方式 |
+| トークン（token） | AIが文章を数える単位。入出力の量＝課金量もこの単位で決まる |
+| SSE | Server-Sent Events。サーバーから結果を細切れに受信し続けるHTTPの仕組み |
+| モック / SAFE MOCK | 本物のAPIを呼ばずに偽の応答を返すテスト用動作。課金ゼロで挙動を確認できる |
+| live gate | 実APIを呼べる状態になるまでの安全弁。条件が揃わない限りモックのままにする仕組み |
+| fail-closed | 設定が不完全・不正なとき「動かない」側へ倒す設計。中途半端に動いて事故になるのを防ぐ |
+| Bearer token | HTTPリクエストに添える合言葉のような認証文字列 |
+| secure storage | OSが提供する暗号化された保存領域。APIキーの置き場所に使う |
+| partial | 途中で終わった不完全な回答。破棄せず「不完全」と明示して残す |
+| tier | 使用モデルと出力上限の段階。本アプリでは `LOW / BALANCED / HIGH` |
+| durable | プロセスが落ちても実行記録が消えないよう、逐次ディスクへ書く性質 |
+| immutable | 一度記録したら後から書き換えない性質。再生成の履歴保持などに使う |
+
 ## 2つの実行方式
+
+アプリ本体（Flutter製）は共通で、接続先だけが異なります。
 
 | 項目 | Direct BYOK（既定） | Reference server（開発用） |
 | --- | --- | --- |
@@ -40,7 +64,185 @@ Directの履歴とreference serverの履歴は混ざりません。設定画面�
 操作感やOSS serverの挙動と見比べるために残しています。現時点のreference clientは本リポジトリの
 FastAPI契約を実装しており、旧サブスクリプションserver固有APIへの完全な互換adapterではありません。
 
+## クイックスタート
+
+### 前提条件
+
+- 共通: `git clone` でこのリポジトリを取得済みであること
+- Direct BYOK: [Flutter](https://flutter.dev/) stable（`flutter doctor` で確認）と、対象OSのビルド環境
+- Reference server: Python 3.10以上
+- **APIキーをまだ持っていない場合**は、先にreference serverのSAFE MOCKを試すのがおすすめです。
+  課金ゼロ・キー入力なしでアプリの流れを確認できます。
+
+### A. まず課金ゼロで動かす（Reference server / SAFE MOCK）
+
+Windows PowerShellの例です（macOS / Linuxは各手順の注記どおり読み替えてください）。
+
+1. backendへ移動します。
+
+   ```powershell
+   cd backend
+   ```
+
+2. このプロジェクト専用のPython環境（venv）を作ります。PC全体のPythonを汚さないためです。
+
+   ```powershell
+   python -m venv .venv
+   ```
+
+3. venvを有効化します。
+
+   ```powershell
+   .\.venv\Scripts\Activate.ps1
+   ```
+
+   macOS / Linuxでは `source .venv/bin/activate` です。PowerShellで「スクリプトの実行が無効」
+   エラーになる場合は、同じウィンドウ内でだけ許可する
+   `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned` を先に実行してください。
+
+4. 依存パッケージをインストールします。
+
+   ```powershell
+   python -m pip install -r requirements.txt
+   ```
+
+5. 設定ファイルの雛形をコピーします（macOS / Linuxでは `cp .env.example .env`）。
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+6. serverを起動します。
+
+   ```powershell
+   python -m uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1
+   ```
+
+7. ブラウザで <http://127.0.0.1:8000/api/health> を開きます。`"ok": true` と `"mode": "mock"` を
+   含むJSONが表示されれば起動成功です。
+
+初期状態は、APIキーがあっても外部APIを呼ばない `SAFE MOCK` です。Flutterアプリから繋ぐ場合は、
+実行方式を「開発用サーバー」にしてこのURLを設定します。Web版（`flutter run -d chrome`）は
+Direct BYOKを使えないため、この方式が前提です。
+
+実APIを使う場合だけ、privateな `backend/.env` へ自分のキー、`CLAGE_LIVE_API_ENABLED=true`、
+十分に長い `CLAGE_AUTH_TOKEN` を設定し、serverを再起動します。Flutter側にも同じBearer tokenを
+保存します。live gate（うっかり課金APIを呼ぶ事故を防ぐ安全弁）の動作は次のとおりです。
+
+| 設定 | 動作 |
+| --- | --- |
+| `CLAGE_LIVE_API_ENABLED=false` | 4つのSAFE MOCK。Bearerは任意 |
+| `true`、`CLAGE_AUTH_TOKEN` なし | 起動を拒否 |
+| `true`、APIキー0個 | Providerなしとしてfail-closed |
+| `true`、APIキー1〜4個 | 設定済み実Providerだけを使用 |
+| `INCLUDE_MOCK_PROVIDERS=true` | 未設定Providerの明示的なmock混在を許可 |
+
+運用上の注意です。
+
+- 同じ `CLAGE_DATA_DIR` を書くserverは1 processだけにし、Uvicornは `--workers 1` で起動して
+  ください（複数processが同じ保存先を書くとデータが壊れるためです）。
+- 別端末から接続する場合だけ `0.0.0.0` で待ち受け、信頼できるLANまたはTailscaleとBearer認証を
+  使います。**インターネットへ直接公開しないでください。**
+- Androidを含むnative releaseはDirect BYOK専用です。Reference toggleはnativeのdebug/profileと、
+  Directを使えないWebでだけ表示します。
+
+価格表、会議・日次budget、管理telemetry、runtime model設定はreference serverだけの機能です。
+詳細は [`backend/.env.example`](backend/.env.example) と [HANDOFF.md](HANDOFF.md) を参照してください。
+
+### B. 本命の使い方（Direct BYOK / Android・iOS・Desktop）
+
+1. Flutterの状態を確認します。
+
+   ```powershell
+   flutter doctor
+   ```
+
+2. appへ移動して依存を取得します。
+
+   ```powershell
+   cd app
+   flutter pub get
+   ```
+
+3. 対象deviceで起動します（Windowsの例）。
+
+   ```powershell
+   flutter run -d windows
+   ```
+
+   Android実機なら、接続済みdeviceを `flutter devices` で確認してから
+   `flutter run -d <device-id>` を実行します。
+
+4. アプリ右上の「接続とBYOK設定」で次を設定します。
+
+   1. 実行方式を `Direct BYOK` にする。
+   2. Claude / Gemini / ChatGPT / Grokのうち、使う会社のAPIキーを1つ以上入力する。
+   3. 必要ならmodel IDと統合役を変更する。空欄は組み込み既定値を使う。
+   4. 既定の推論エフォートをAUTO / LOW / MEDIUM / HIGHから選び、保存する。
+
+5. 質問を送ると会議前planが表示されます。**最大呼出回数と利用Providerを確認してから**実行して
+   ください（Direct BYOKは各社の有料APIを直接呼ぶためです）。
+
+保存済みキーは画面へ読み戻しません。空欄のまま保存すると既存値を維持し、入力した会社だけを
+更新します。キーを全削除する操作も用意しています。APIキーはsource、repository、会話JSONへ
+保存しないでください。
+
+Web buildでは、ブラウザからのキー抽出riskと各社CORS制約（ブラウザが別サイトへのAPI呼び出しを
+制限する仕組み）を避けるためDirect BYOKを有効化できません。設定storeもvendor APIキーを
+読み書きせず、旧recordは読み込まずに削除を試みます。Webで使う場合はreference serverへ
+切り替えてください。
+
+## 構成
+
+```text
+既定: Direct BYOK
+
+Flutter app
+  ├─ API keys ─ platform secure storage
+  ├─ conversations ─ app-local SharedPreferences records
+  ├─ local plan / policy / orchestration
+  └─ HTTPS
+       ├─ Anthropic Messages API
+       ├─ OpenAI Responses API
+       ├─ Gemini Interactions API
+       └─ xAI Responses API
+
+開発用: Reference server
+
+Flutter app ─ REST/SSE ─ FastAPI
+                           ├─ SAFE MOCK / official provider APIs
+                           ├─ durable run + event journal
+                           ├─ budget / telemetry
+                           └─ server-local conversation store
+```
+
+`app/` がFlutterクライアント（詳細は [app/README.md](app/README.md)）、`backend/` が
+reference server（FastAPI）です。backendの主なファイルは次のとおりです。エンドポイント群は
+FastAPIのAPIRouter（エンドポイントを別ファイルへ分割して登録する仕組み）でmain.pyから
+分離しています。
+
+| ファイル | 役割 |
+| --- | --- |
+| `main.py` | アプリ本体。会議（`/api/chat`）、plan、設定、停止など中心エンドポイントと共有処理 |
+| `api_models.py` | リクエスト入力の検証（Pydanticモデル） |
+| `conversations_api.py` | 会話のCRUD・検索・添付・エクスポートAPI（APIRouter） |
+| `regeneration_api.py` | 回答・統合の再生成API（APIRouter） |
+| `sanitizing.py` | SSE・API応答・保存turnから内部情報を落とす整形ヘルパー |
+| `scrubbing.py` | 公開データからの秘密らしい文字列の除去 |
+| `policy.py` | 外部送信前に秘密らしい文字列を検出するローカルスキャナ |
+| `planning.py` | 課金APIを呼ばずに1会議の最大実行量を見積もるplan |
+| `orchestrator.py` | 4AIへの並列送信・相互批評・統合のコア |
+| `providers/` | 各社APIアダプタ（anthropic / openai / gemini / xai）とSAFE MOCK |
+| `finance.py` / `finance_costs.py` | 予算予約の台帳と、価格表による純粋なコスト計算 |
+| `storage.py` | 会話の保存（1会話1JSONファイル） |
+| `config.py` | `.env` 読み込みとlive gate判定 |
+
+このほかに実行管理（`runs.py`）、利用量記録（`telemetry.py` / `admin_telemetry.py`）、
+添付（`attachments.py`）、エクスポート（`exporting.py`）などの補助モジュールがあります。
+
 ## Direct BYOKで実装済み
+
+既定方式でできることの一覧です（初回は読み飛ばして構いません）。
 
 - Anthropic Messages API、OpenAI Responses API、Gemini Interactions API、xAI Responses APIへの端末直結
 - 設定済みProviderの並列回答、部分失敗、統合、DEBATE、BLIND、Provider選択、統合省略
@@ -70,15 +272,10 @@ FastAPI契約を実装しており、旧サブスクリプションserver固有A
 
 ## モデルtier・推論エフォート・出力上限
 
-composerでは、使用modelと最大出力枠を決めるtierを `LOW / BALANCED / HIGH` から選びます。
-推論エフォートはtierと独立しており、直下の `設定値 / LOW / MEDIUM / HIGH` から選びます。
-`設定値` は設定画面に保存した `AUTO / LOW / MEDIUM / HIGH` の既定値を使います。
-
-| モデル・出力枠 | tier |
-| --- | --- |
-| LOW | low |
-| BALANCED | balanced |
-| HIGH | high |
+composerでは、使用modelと最大出力枠を決めるtierを `LOW / BALANCED / HIGH` から選びます
+（内部値もそのまま `low / balanced / high` です）。推論エフォートはtierと独立しており、
+直下の `設定値 / LOW / MEDIUM / HIGH` から選びます。`設定値` は設定画面に保存した
+`AUTO / LOW / MEDIUM / HIGH` の既定値を使います。
 
 | 推論エフォート | `reasoning_mode` | 動作 |
 | --- | --- | --- |
@@ -91,7 +288,7 @@ composerでは、使用modelと最大出力枠を決めるtierを `LOW / BALANCE
 回答の方向、文体、簡潔さ、結論を誘導するpromptではありません。未知modelやreasoning指定に未対応のmodelには、
 未確認のfieldを送らずProvider既定値を使います。選択値と実効値はplan・結果へ残します。
 
-Direct BYOKの1 callあたりの既定上限は次のとおりです。
+Direct BYOKの1 callあたりの既定上限（単位はtoken）は次のとおりです。
 
 | Provider | LOW | BALANCED | HIGH |
 | --- | ---: | ---: | ---: |
@@ -107,92 +304,6 @@ Direct BYOKの1 callあたりの既定上限は次のとおりです。
 Reference serverも同じ `LOW / BALANCED / HIGH` のtierと、独立した
 `auto / low / medium / high` のreasoning契約を使います。serverの既定上限とoverrideは
 [`backend/.env.example`](backend/.env.example) を参照してください。
-
-## 構成
-
-```text
-既定: Direct BYOK
-
-Flutter app
-  ├─ API keys ─ platform secure storage
-  ├─ conversations ─ app-local SharedPreferences records
-  ├─ local plan / policy / orchestration
-  └─ HTTPS
-       ├─ Anthropic Messages API
-       ├─ OpenAI Responses API
-       ├─ Gemini Interactions API
-       └─ xAI Responses API
-
-開発用: Reference server
-
-Flutter app ─ REST/SSE ─ FastAPI
-                           ├─ SAFE MOCK / official provider APIs
-                           ├─ durable run + event journal
-                           ├─ budget / telemetry
-                           └─ server-local conversation store
-```
-
-## クイックスタート
-
-### Direct BYOK（Android / iOS / Desktop）
-
-Flutter stableを用意し、対象deviceで起動します。Windowsの例です。
-
-```powershell
-cd app
-flutter pub get
-flutter run -d windows
-```
-
-Android実機なら、接続済みdeviceを `flutter devices` で確認してから `flutter run -d <device-id>` を
-実行します。アプリ右上の「接続とBYOK設定」で次を設定してください。
-
-1. 実行方式を `Direct BYOK` にする。
-2. Claude / Gemini / ChatGPT / Grokのうち、使う会社のAPIキーを1つ以上入力する。
-3. 必要ならmodel IDと統合役を変更する。空欄は組み込み既定値を使う。
-4. 既定の推論エフォートをAUTO / LOW / MEDIUM / HIGHから選び、保存する。
-
-保存済みキーは画面へ読み戻しません。空欄のまま保存すると既存値を維持し、入力した会社だけを更新します。
-キーを全削除する操作も用意しています。APIキーはsource、repository、会話JSONへ保存しないでください。
-
-Web buildでは、ブラウザからのキー抽出riskと各社CORS制約を避けるためDirect BYOKを有効化できません。
-設定storeもvendor APIキーを読み書きせず、旧recordは読み込まずに削除を試みます。Webで使う場合は
-reference serverへ切り替えてください。
-
-### Reference server（任意・開発用）
-
-Python 3.10以降を用意します。
-
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-python -m uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1
-```
-
-初期状態は、APIキーがあっても外部APIを呼ばない `SAFE MOCK` です。実APIを使う場合だけ、privateな
-`backend/.env` へ自分のキー、`CLAGE_LIVE_API_ENABLED=true`、十分に長い `CLAGE_AUTH_TOKEN` を設定し、
-serverを再起動します。Flutterの実行方式を「開発用サーバー」に変え、URLと同じBearer tokenを保存します。
-
-同じ `CLAGE_DATA_DIR` を書くserverは1 processだけにし、Uvicornは `--workers 1` で起動してください。
-別端末から接続する場合だけ `0.0.0.0` で待ち受け、信頼できるLANまたはTailscaleとBearer認証を使います。
-インターネットへ直接公開しないでください。Androidを含むnative releaseはDirect BYOK専用です。
-Reference toggleはnativeのdebug/profileと、Directを使えないWebでだけ表示します。
-
-Reference serverのlive gateは次のとおりです。
-
-| 設定 | 動作 |
-| --- | --- |
-| `CLAGE_LIVE_API_ENABLED=false` | 4つのSAFE MOCK。Bearerは任意 |
-| `true`、`CLAGE_AUTH_TOKEN` なし | 起動を拒否 |
-| `true`、APIキー0個 | Providerなしとしてfail-closed |
-| `true`、APIキー1〜4個 | 設定済み実Providerだけを使用 |
-| `INCLUDE_MOCK_PROVIDERS=true` | 未設定Providerの明示的なmock混在を許可 |
-
-価格表、会議・日次budget、管理telemetry、runtime model設定はreference serverだけの機能です。詳細は
-[`backend/.env.example`](backend/.env.example) と [HANDOFF.md](HANDOFF.md) を参照してください。
 
 ## 操作
 
@@ -239,16 +350,23 @@ ZIPはreference serverでだけ利用できます。
 
 ## Directとreferenceの安全境界
 
-共通して、実APIを呼ぶ会議・再生成の通常確認は既定ONです。「次回から表示しない」または設定画面で
-通常の課金可能性の確認だけをOFFにできます。APIキー・秘密鍵候補のblockと、メールアドレス・電話番号候補の
-追加確認はこの設定では解除されません。ただし両modeの機能は同一ではありません。
+安全機能はいずれも「誤操作・設定ミス・想定外の中断で、意図しない課金や情報送信が起きない」ことを
+目的としています。
+
+共通して、実APIを呼ぶ会議・再生成の通常確認は既定ONです（なぜ: 課金が発生し得る操作を、毎回
+利用者の明示的な同意にするためです）。「次回から表示しない」または設定画面で通常の課金可能性の
+確認だけをOFFにできます。APIキー・秘密鍵候補のblockと、メールアドレス・電話番号候補の追加確認は
+この設定では解除されません。ただし両modeの機能は同一ではありません。
 
 - Directは端末からAPIへ直接送信します。local price table、日次budget、管理API残高、durable event journal、
   app強制終了後のrun再接続はまだありません。Androidのforeground serviceはbackground中のprocess凍結を
   抑える実行時保護であり、OS・利用者による停止やprocess終了後の復旧を保証しません。
 - Directの停止は端末側HTTP clientを閉じますが、Provider側の処理・課金停止を保証しません。
-- Reference serverはdurable claim、再接続、budget予約、server側scrubberなど追加防御を持ちます。
-- Reference serverのHTTP retry既定値も0ですが、管理者が設定で増やせます。Directは常に0です。
+- Reference serverはdurable claim、再接続、budget予約（なぜ: 想定額を超える連続課金を上限で
+  止めるためです）、server側scrubber（なぜ: 秘密らしい文字列を応答・保存データへ残さないためです）
+  など追加防御を持ちます。
+- Reference serverのHTTP retry既定値も0ですが、管理者が設定で増やせます。Directは常に0です
+  （なぜ: 自動再試行は同じ課金を二重に発生させ得るためです）。
 - どちらもpartial回答を自動継続しません。利用者が必要性を判断して再生成してください。
 
 詳しい脅威モデルは [SECURITY.md](SECURITY.md) を参照してください。
@@ -287,7 +405,11 @@ flutter build windows --release
 flutter build apk --release
 ```
 
-通常testはreal API keyを使いません。iOS / macOS / Linuxのnative buildは各OS上で最終確認が必要です。
+通常testはreal API keyを使いません。`backend/tests/conftest.py` がテスト開始前に実API無効・
+キー空の安全設定を強制するため、手元の `.env` で実APIを有効にしていてもtestから課金APIを
+呼ぶことはありません。
+
+iOS / macOS / Linuxのnative buildは各OS上で最終確認が必要です。
 Android releaseはdebug keyへfallbackしません。配布用署名にはprivateな `app/android/key.properties` と
 配布者自身のkeystore、または4つすべて揃った `CLAGE_ANDROID_*` 署名環境変数を用意し、certificateを
 検証してください。部分設定はfail-closedでbuildを停止します。
