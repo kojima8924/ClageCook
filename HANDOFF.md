@@ -199,7 +199,11 @@ Reference serverはDirectの必須componentではありません。以下は開�
 
 ### Backend module map
 
-- `main.py`: FastAPI routes、認証、rate/concurrency、run lifecycle
+- `main.py`: FastAPI app、chat/plan/settings routes、認証、rate/concurrency、run lifecycle
+- `api_models.py`: APIリクエストのPydanticモデル、request ID検証
+- `sanitizing.py`: SSE/保存turnのsanitizeと公開scrubヘルパー
+- `conversations_api.py`: 会話CRUD・添付・エクスポートのAPIRouter(mainのglobalを遅延参照)
+- `regeneration_api.py`: 再生成API(plan/regenerate)のAPIRouter(mainのglobalを遅延参照)
 - `config.py`: dotenv、model/reasoning解決、Provider別上限、公開settings
 - `planning.py`: call/output/input/retry/cost/budget plan
 - `orchestrator.py`: 並列回答、DEBATE、BLIND、統合
@@ -207,7 +211,8 @@ Reference serverはDirectの必須componentではありません。以下は開�
 - `storage.py`: 1会話1JSON、atomic replace、会話lock
 - `runs.py`: background run、SSE replay、cancel、retention
 - `regeneration.py`: immutable regeneration state
-- `finance.py`: price snapshot、budget reservation/settle/reconciliation
+- `finance.py`: budget reservation/settle/reconciliation(durable台帳)
+- `finance_costs.py`: 価格表による純粋なコスト計算・課金entry集計・設定パーサ
 - `attachments.py`: owner固定upload、MIME/signature/TTL、PDF subprocess
 - `telemetry.py` / `admin_telemetry.py`: local usageとopt-in管理集計
 - `scrubbing.py` / `policy.py`: 公開pathの再帰scrub、送信前policy

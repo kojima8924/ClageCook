@@ -5,28 +5,25 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../controllers/conversation_search_controller.dart';
 import '../controllers/conversation_selection_controller.dart';
 import '../controllers/live_run_controller.dart';
 import '../models.dart';
+import '../provider_catalog.dart';
+import '../saved_run_resume.dart';
 import '../services/api_client.dart';
 import '../services/direct_byok_client.dart';
 import '../services/direct_settings_store.dart';
 import '../services/local_conversation_store.dart';
 import '../services/settings_store.dart';
+import '../utils/format.dart';
+import '../widgets/home_dialogs.dart';
 import '../widgets/turn_view.dart';
 import 'app_settings_screen.dart';
 import 'settings_screen.dart';
 import 'usage_screen.dart';
 
-const _providerOrder = ['claude', 'gemini', 'chatgpt', 'grok'];
-const _providerLabels = {
-  'claude': 'Claude',
-  'gemini': 'Gemini',
-  'chatgpt': 'ChatGPT',
-  'grok': 'Grok',
-};
-
-enum _BillableConfirmationAction { cancel, confirmOnce, disableFuture }
+part 'home_screen_view.dart';
 
 const _promptTemplates = <String, String>{
   '比較': '次の選択肢を、評価軸・長所・短所・不確実性ごとに比較してください。\n\n',
@@ -111,13 +108,16 @@ class _HomeScreenState extends State<HomeScreen> {
   final _pendingAttachments = <AttachmentRecord>[];
   final _selection = ConversationSelectionController();
   final _run = LiveRunController();
+  late final _search = ConversationSearchController(
+    client: () => _client,
+    onChanged: _onSearchChanged,
+  );
 
   ApiClient? _client;
   ConnectionSettings? _connection;
   DirectSettings? _directSettings;
   ServerSettings? _server;
   List<ConversationSummary> _summaries = const [];
-  List<ConversationSummary>? _searchResults;
   String _tier = 'balanced';
   String _defaultReasoningMode = 'auto';
   String? _reasoningModeOverride;
@@ -128,13 +128,9 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _loading = false;
   bool _uploadingAttachment = false;
   bool _cancelPending = false;
-  bool _searching = false;
   String _error = '';
-  String _searchError = '';
   int _bootstrapEpoch = 0;
-  int _searchEpoch = 0;
   Timer? _scrollTimer;
-  Timer? _searchTimer;
 
   ConversationRecord? get _conversation => _selection.conversation;
   LiveTurn? get _liveTurn => _run.turn;
@@ -146,6 +142,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _directSettings?.showTokenUsageLedger ?? true;
   String? get _terminalReloadConversationId =>
       _run.terminalReloadConversationId;
+  List<ConversationSummary>? get _searchResults => _search.results;
+  bool get _searching => _search.searching;
+  String get _searchError => _search.error;
   String get _reasoningMode => _reasoningModeOverride ?? _defaultReasoningMode;
   String get _effortSelection => _reasoningModeOverride ?? 'default';
 
@@ -176,10 +175,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _bootstrapEpoch++;
     _selection.invalidate();
     unawaited(_run.dispose());
-    _searchEpoch++;
+    _search.dispose();
     _client?.close();
     _scrollTimer?.cancel();
-    _searchTimer?.cancel();
     _messageController.dispose();
     _searchController
       ..removeListener(_scheduleSearch)
@@ -190,63 +188,17 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  void _scheduleSearch({bool immediate = false}) {
-    _searchTimer?.cancel();
-    final query = _searchController.text.trim();
-    final epoch = ++_searchEpoch;
-    if (query.isEmpty) {
-      if (!mounted) return;
-      setState(() {
-        _searchResults = null;
-        _searching = false;
-        _searchError = '';
-      });
-      return;
-    }
-    if (!mounted) return;
-    setState(() {
-      _searchResults = null;
-      _searching = true;
-      _searchError = '';
-    });
-    if (immediate) {
-      unawaited(_runSearch(query, epoch));
-    } else {
-      _searchTimer = Timer(
-        const Duration(milliseconds: 350),
-        () => unawaited(_runSearch(query, epoch)),
-      );
-    }
+  // 検索の実体はcontrollers/conversation_search_controller.dartへ移設。
+  void _scheduleSearch({bool immediate = false}) =>
+      _search.schedule(_searchController.text, immediate: immediate);
+
+  void _onSearchChanged() {
+    if (mounted) setState(() {});
   }
 
-  Future<void> _runSearch(String query, int epoch) async {
-    final client = _client;
-    if (client == null) {
-      if (!mounted || epoch != _searchEpoch) return;
-      setState(() {
-        _searchResults = const [];
-        _searching = false;
-        _searchError = '実行方式を設定すると回答本文まで全文検索できます。';
-      });
-      return;
-    }
-    try {
-      final result = await client.searchConversations(query, limit: 50);
-      if (!mounted || epoch != _searchEpoch) return;
-      setState(() {
-        _searchResults = result.results;
-        _searching = false;
-        _searchError = '';
-      });
-    } catch (error) {
-      if (!mounted || epoch != _searchEpoch) return;
-      setState(() {
-        _searchResults = const [];
-        _searching = false;
-        _searchError = '全文検索に失敗しました: $error';
-      });
-    }
-  }
+  /// part側(home_screen_view.dart)のUI builderから状態を更新するための橋渡し。
+  /// extensionはStateのサブクラスではなくsetState直接呼び出しがprotected警告になるため。
+  void _rebuild(VoidCallback fn) => setState(fn);
 
   Future<void> _bootstrap() async {
     if (_sending || _liveTurn != null) {
@@ -340,17 +292,14 @@ class _HomeScreenState extends State<HomeScreen> {
       _client = null;
       _selection.clear();
       _run.reset();
-      _searchEpoch++;
-      _searchTimer?.cancel();
+      _search.invalidate();
       setState(() {
         _connection = attemptedConnection;
         _directSettings = attemptedDirectSettings;
         _server = null;
         _summaries = const [];
-        _searchResults = null;
         _selectedProviders.clear();
         _loading = false;
-        _searching = false;
         _error = '実行環境を初期化できないため接続を無効化しました: $error';
       });
     }
@@ -540,7 +489,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final value = await showDialog<String>(
       context: context,
       builder: (context) =>
-          _MemoryEditorDialog(initialText: conversation.memory.text),
+          MemoryEditorDialog(initialText: conversation.memory.text),
     );
     if (value == null || !mounted) return;
     try {
@@ -674,72 +623,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _showPolicyBlocked(PolicyScanResult policy) async {
-    final labels = policy.findings
-        .where((finding) => finding.severity == 'block')
-        .map((finding) => finding.label)
-        .toSet()
-        .toList(growable: false);
+    // ダイアログ本体はwidgets/home_dialogs.dartへ移設。置換後の反映処理のみここに残す。
     final redacted = policy.redactedText.trim();
-    final replace = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        icon: const Icon(Icons.gpp_bad_outlined),
-        title: const Text('秘密情報らしい文字列を検出しました'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const Text('この文面は外部AIへ送信されません。検出理由:'),
-              const SizedBox(height: 8),
-              if (labels.isEmpty)
-                const Text('• 秘密情報らしい文字列')
-              else
-                for (final label in labels) Text('• $label'),
-              const SizedBox(height: 16),
-              const Text(
-                'マスク済み文面',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 6),
-              DecoratedBox(
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: SelectableText(
-                    redacted.isEmpty ? '⟪REDACTED⟫' : redacted,
-                  ),
-                ),
-              ),
-              if (policy.disclaimer.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                Text(
-                  policy.disclaimer,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('送信せず戻る'),
-          ),
-          FilledButton.icon(
-            onPressed: redacted.isEmpty
-                ? null
-                : () => Navigator.pop(context, true),
-            icon: const Icon(Icons.find_replace_outlined),
-            label: const Text('マスク済み文面へ置換'),
-          ),
-        ],
-      ),
-    );
+    final replace = await showPolicyBlockedDialog(context, policy);
     if (replace == true && mounted) {
       setState(() {
         _messageController
@@ -749,142 +635,6 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       _messageFocusNode.requestFocus();
     }
-  }
-
-  Future<_BillableConfirmationAction> _confirmBillableRun(
-    RunPlan plan,
-    PolicyScanResult policy, {
-    required bool allowDisableFuture,
-  }) async {
-    final participants = plan.billableParticipants;
-    final liveTokens = plan.maxOutputTokens['live_total'] ?? 0;
-    final allCalls = plan.calls['total'] ?? 0;
-    final retryEnvelope = plan.retryEnvelope;
-    final sensitiveConfirmation = policy.action == 'confirm';
-    final personalDataLabels = policy.findings
-        .where((finding) => finding.severity == 'confirm')
-        .map((finding) => finding.label)
-        .toSet()
-        .toList(growable: false);
-    return await showDialog<_BillableConfirmationAction>(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) => AlertDialog(
-            icon: const Icon(Icons.payments_outlined),
-            title: Text(
-              sensitiveConfirmation ? '個人情報らしい内容を外部送信します' : '実APIを使用します',
-            ),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('以下の外部API呼び出しは、各社との契約に応じて課金される可能性があります。'),
-                  const SizedBox(height: 14),
-                  for (final participant in participants)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Text(
-                        '• ${participant.label} / ${participant.model}: '
-                        '最大${participant.maxCalls}回',
-                      ),
-                    ),
-                  const Divider(height: 24),
-                  Text('課金対象APIの最大呼出回数: ${plan.maxLiveCalls}回'),
-                  Text('会議全体の最大Provider呼出回数: $allCalls回'),
-                  Text('課金対象呼出の最大出力token合計: $liveTokens'),
-                  if (plan.inputEnvelope.liveWithRetries > 0)
-                    Text(
-                      '課金対象呼出の入力送信量（再試行込み）: '
-                      '${_formatBytes(plan.inputEnvelope.liveWithRetries)}',
-                    ),
-                  const SizedBox(height: 8),
-                  if (plan.costEstimate.available &&
-                      plan.costEstimate.totalUsd != null) ...[
-                    Text(
-                      '利用者設定価格による最大見積: '
-                      '\$${plan.costEstimate.totalUsd}',
-                      style: Theme.of(context).textTheme.titleSmall,
-                    ),
-                    if (plan.costEstimate.priceVersion != null)
-                      Text(
-                        '価格版: ${plan.costEstimate.priceVersion}',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    if (plan.budget.configured) ...[
-                      if (plan.budget.perRunLimitUsd != null)
-                        Text('1会議上限: \$${plan.budget.perRunLimitUsd}'),
-                      if (plan.budget.todayRemainingUsd != null)
-                        Text('実行前の日次残り: \$${plan.budget.todayRemainingUsd}'),
-                    ],
-                    const SizedBox(height: 6),
-                    const Text(
-                      '金額は明示価格表と安全側token上限による推定で、請求書やcredit残高ではありません。',
-                    ),
-                  ] else
-                    const Text(
-                      '入力token数・料金・思考tokenはProvider仕様で変わるため、'
-                      'この確認は金額上限を保証しません。',
-                    ),
-                  if (plan.inputEnvelope.disclaimer.isNotEmpty)
-                    Text(
-                      plan.inputEnvelope.disclaimer,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  if (retryEnvelope.hasRetries) ...[
-                    const SizedBox(height: 10),
-                    Text(
-                      '再試行込み最大Provider実行回数: '
-                      '${retryEnvelope.totalProviderExecutions}回 '
-                      '（追加${retryEnvelope.additionalHttpAttempts}回）',
-                    ),
-                    Text(
-                      '再試行込み最大出力token合計: '
-                      '${retryEnvelope.maxOutputTokens}',
-                    ),
-                    if (retryEnvelope.disclaimer.isNotEmpty)
-                      Text(
-                        retryEnvelope.disclaimer,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                  ],
-                  if (personalDataLabels.isNotEmpty) ...[
-                    const SizedBox(height: 14),
-                    Text(
-                      '送信前に確認してください: ${personalDataLabels.join('、')}',
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.error,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () =>
-                    Navigator.pop(context, _BillableConfirmationAction.cancel),
-                child: const Text('キャンセル'),
-              ),
-              if (allowDisableFuture)
-                TextButton(
-                  onPressed: () => Navigator.pop(
-                    context,
-                    _BillableConfirmationAction.disableFuture,
-                  ),
-                  child: const Text('実行して次回から表示しない'),
-                ),
-              FilledButton(
-                onPressed: () => Navigator.pop(
-                  context,
-                  _BillableConfirmationAction.confirmOnce,
-                ),
-                child: const Text('確認して実行'),
-              ),
-            ],
-          ),
-        ) ??
-        _BillableConfirmationAction.cancel;
   }
 
   bool _requiresBillableConfirmation(RunPlan plan, PolicyScanResult policy) =>
@@ -897,16 +647,18 @@ class _HomeScreenState extends State<HomeScreen> {
     PolicyScanResult policy,
   ) async {
     if (!_requiresBillableConfirmation(plan, policy)) return true;
-    final action = await _confirmBillableRun(
-      plan,
-      policy,
+    // ダイアログ本体はwidgets/home_dialogs.dartへ移設。設定保存フローのみここに残す。
+    final action = await showBillableRunConfirmationDialog(
+      context,
+      plan: plan,
+      policy: policy,
       allowDisableFuture:
           policy.action != 'confirm' &&
           widget.directRepository != null &&
           _directSettings != null,
     );
-    if (!mounted || action == _BillableConfirmationAction.cancel) return false;
-    if (action == _BillableConfirmationAction.disableFuture) {
+    if (!mounted || action == BillableConfirmationAction.cancel) return false;
+    if (action == BillableConfirmationAction.disableFuture) {
       return _disableFutureLiveApiConfirmation();
     }
     return true;
@@ -964,7 +716,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = '先に設定画面でバックエンドへ接続するか、Direct BYOKを設定してください。');
       return;
     }
-    final providers = _providerOrder
+    final providers = providerOrder
         .where(_selectedProviders.contains)
         .toList(growable: false);
     final conversationId = _selectedId;
@@ -1093,14 +845,6 @@ class _HomeScreenState extends State<HomeScreen> {
             : '送信前の安全確認に失敗しました: $error';
       });
     }
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    final kib = bytes / 1024;
-    if (kib < 1024) return '${kib.toStringAsFixed(kib >= 100 ? 0 : 1)} KiB';
-    final mib = kib / 1024;
-    return '${mib.toStringAsFixed(mib >= 100 ? 0 : 2)} MiB';
   }
 
   Future<void> _pickAttachments() async {
@@ -1240,11 +984,11 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted || _liveTurn?.requestId != live.requestId) return;
       setState(() {
         if (result.terminalOutcome.isNotEmpty) live.error = '';
-        live.phase = _cancelRunStatus(result);
+        live.phase = cancelRunStatus(result);
       });
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(_cancelRunNotice(result))));
+        ..showSnackBar(SnackBar(content: Text(cancelRunNotice(result))));
     } catch (error) {
       if (!mounted || _liveTurn?.requestId != live.requestId) return;
       setState(() {
@@ -1269,41 +1013,9 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final resume = turn.resumeRequest;
-    final rawRequestTier = resume['tier']?.toString() ?? 'balanced';
-    final requestTier = {'low', 'balanced', 'high'}.contains(rawRequestTier)
-        ? rawRequestTier
-        : 'balanced';
-    final rawReasoningMode =
-        resume['reasoning_mode']?.toString() ??
-        turn.options['reasoning_mode']?.toString() ??
-        'auto';
-    final requestReasoningMode =
-        {'auto', 'low', 'medium', 'high'}.contains(rawReasoningMode)
-        ? rawReasoningMode
-        : 'auto';
-    final rawRequestedProviders = resume['providers'];
-    final requestedProviders = rawRequestedProviders is List
-        ? _providerOrder
-              .where(
-                rawRequestedProviders
-                    .map((item) => item.toString())
-                    .toSet()
-                    .contains,
-              )
-              .toList(growable: false)
-        : null;
-    final attachmentIds = resume['attachment_ids'] is List
-        ? (resume['attachment_ids'] as List)
-              .map((item) => item.toString())
-              .toList(growable: false)
-        : const <String>[];
-    final displayProviders = _providerOrder
-        .where(turn.providers.toSet().contains)
-        .toList(growable: false);
-    final rawEffectiveTier = turn.options['tier']?.toString() ?? requestTier;
-    final effectiveTier = {'low', 'balanced', 'high'}.contains(rawEffectiveTier)
-        ? rawEffectiveTier
-        : requestTier;
+    // tier/reasoning_mode/providers/attachment_idsのバリデーション・正規化は
+    // saved_run_resume.dartの純関数へ移設(挙動はunitテストで固定)。
+    final params = SavedRunResume.fromTurn(turn);
     setState(() {
       _savedRunActionIds.add(turn.requestId);
       _run.beginRequest();
@@ -1314,24 +1026,24 @@ class _HomeScreenState extends State<HomeScreen> {
         message: turn.message.isNotEmpty ? turn.message : turn.cleanMessage,
         conversationId: conversationId,
         requestId: turn.requestId,
-        tier: requestTier,
-        reasoningMode: requestReasoningMode,
+        tier: params.requestTier,
+        reasoningMode: params.requestReasoningMode,
         debate: resume['debate'] == true,
-        providers: requestedProviders,
+        providers: params.requestedProviders,
         synthesize: resume['synthesize'] != false,
         blind: resume['blind'] == true,
         webSearch: resume['web_search'] == true,
         confirmLiveApi: resume['confirm_live_api'] == true,
         confirmSensitiveData: resume['confirm_sensitive_data'] == true,
-        attachmentIds: attachmentIds,
+        attachmentIds: params.attachmentIds,
       );
       if (!mounted) return;
       final live = LiveTurn(
         requestId: stream.requestId,
         message: turn.message.isNotEmpty ? turn.message : turn.cleanMessage,
-        providers: displayProviders,
-        tier: effectiveTier,
-        reasoningMode: requestReasoningMode,
+        providers: params.displayProviders,
+        tier: params.effectiveTier,
+        reasoningMode: params.requestReasoningMode,
         debate: turn.options['debate'] == true,
         synthesize: turn.options['synthesize'] != false,
         blind: turn.options['blind'] == true,
@@ -1341,7 +1053,7 @@ class _HomeScreenState extends State<HomeScreen> {
         conversationId: stream.conversationId.isNotEmpty
             ? stream.conversationId
             : conversationId,
-        attachmentIds: attachmentIds,
+        attachmentIds: params.attachmentIds,
       );
       setState(() {
         _savedRunActionIds.remove(turn.requestId);
@@ -1384,7 +1096,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text(_cancelRunNotice(result))));
+        ..showSnackBar(SnackBar(content: Text(cancelRunNotice(result))));
     } catch (error) {
       if (!mounted) return;
       await _refresh();
@@ -1789,913 +1501,4 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
-
-  PreferredSizeWidget _appBar(bool wide, bool compact) {
-    final safeMock = _server != null && !_server!.liveApiEnabled;
-    final directByok = _server?.mode == 'direct-byok';
-    final settingsLocked =
-        _sending || _uploadingAttachment || _liveTurn != null;
-    return AppBar(
-      titleSpacing: wide ? 20 : null,
-      title: (safeMock || directByok) && compact
-          ? Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text('Clage Cook'),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      directByok ? Icons.phone_android : Icons.lock_outline,
-                      size: 12,
-                    ),
-                    const SizedBox(width: 3),
-                    Text(
-                      directByok ? 'DIRECT · 端末内保存' : 'SAFE MOCK',
-                      style: const TextStyle(fontSize: 10),
-                    ),
-                  ],
-                ),
-              ],
-            )
-          : const Text('Clage Cook'),
-      actions: [
-        if (_server != null && !compact)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 10),
-            child: Tooltip(
-              message: safeMock
-                  ? '外部API呼び出しはサーバー側で施錠されています'
-                  : directByok
-                  ? '端末から各社APIへ直接接続し、会話を端末内へ保存します'
-                  : '開発用サーバー経由の実行です',
-              child: Chip(
-                avatar: Icon(
-                  safeMock
-                      ? Icons.lock_outline
-                      : directByok
-                      ? Icons.phone_android
-                      : _server!.mode == 'mock'
-                      ? Icons.science_outlined
-                      : Icons.cloud_done_outlined,
-                  size: 17,
-                ),
-                label: Text(
-                  safeMock
-                      ? 'SAFE MOCK'
-                      : directByok
-                      ? 'DIRECT · LOCAL'
-                      : _server!.mode.toUpperCase(),
-                ),
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-          ),
-        IconButton(
-          tooltip: '利用状況と予算',
-          onPressed: _openUsage,
-          icon: const Icon(Icons.monitor_heart_outlined),
-        ),
-        IconButton(
-          tooltip: '更新',
-          onPressed: _loading || _uploadingAttachment ? null : _refresh,
-          icon: const Icon(Icons.refresh),
-        ),
-        IconButton(
-          tooltip: '接続とBYOK設定',
-          onPressed: settingsLocked ? null : _openSettings,
-          icon: const Icon(Icons.settings_outlined),
-        ),
-        const SizedBox(width: 4),
-      ],
-    );
-  }
-
-  Widget _sidebar(bool inDrawer) {
-    final query = _searchController.text.trim();
-    final summaries = query.isEmpty
-        ? _summaries
-        : _searchResults ?? const <ConversationSummary>[];
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            children: [
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: _uploadingAttachment
-                      ? null
-                      : () {
-                          if (inDrawer) Navigator.of(context).pop();
-                          _newConversation();
-                        },
-                  icon: const Icon(Icons.add_comment_outlined),
-                  label: const Text('新しい会話'),
-                ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _searchController,
-                focusNode: _searchFocusNode,
-                textInputAction: TextInputAction.search,
-                maxLength: 200,
-                maxLengthEnforcement: MaxLengthEnforcement.enforced,
-                decoration: InputDecoration(
-                  hintText: 'すべての回答を全文検索',
-                  helperText: 'Ctrl/Cmd+K · 最大200文字',
-                  prefixIcon: const Icon(Icons.search),
-                  suffixIcon: query.isEmpty
-                      ? null
-                      : IconButton(
-                          tooltip: 'クリア',
-                          onPressed: _searchController.clear,
-                          icon: const Icon(Icons.close),
-                        ),
-                  border: const OutlineInputBorder(),
-                  isDense: true,
-                ),
-              ),
-              if (_searching)
-                const Padding(
-                  padding: EdgeInsets.only(top: 8),
-                  child: LinearProgressIndicator(minHeight: 2),
-                ),
-              if (_searchError.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(
-                        Icons.warning_amber_rounded,
-                        size: 18,
-                        color: Theme.of(context).colorScheme.error,
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text(
-                          _searchError,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      ),
-                      IconButton(
-                        tooltip: '再検索',
-                        visualDensity: VisualDensity.compact,
-                        onPressed: () => _scheduleSearch(immediate: true),
-                        icon: const Icon(Icons.refresh, size: 18),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: summaries.isEmpty
-              ? Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Semantics(
-                      liveRegion: true,
-                      child: Text(
-                        query.isEmpty
-                            ? 'まだ会話がありません'
-                            : _searching
-                            ? '会話を検索しています…'
-                            : '回答本文を含め、一致する会話がありません',
-                        textAlign: TextAlign.center,
-                      ),
-                    ),
-                  ),
-                )
-              : ListView.builder(
-                  itemCount: summaries.length,
-                  itemBuilder: (context, index) {
-                    final item = summaries[index];
-                    return ListTile(
-                      selected: item.id == _selectedId,
-                      leading: const Icon(Icons.forum_outlined),
-                      title: Text(
-                        item.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      subtitle: Text(
-                        '${item.turnCount}ターン · ${_formatDate(item.updatedAt)}\n${item.preview}',
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      isThreeLine: true,
-                      onTap: _uploadingAttachment
-                          ? null
-                          : () {
-                              if (inDrawer) Navigator.of(context).pop();
-                              unawaited(_selectConversation(item.id));
-                            },
-                      trailing: PopupMenuButton<String>(
-                        tooltip: '会話メニュー',
-                        enabled: !_uploadingAttachment,
-                        onSelected: (action) {
-                          if (inDrawer) Navigator.of(context).pop();
-                          if (action == 'rename') {
-                            unawaited(_renameConversation(item));
-                          } else if (action == 'export') {
-                            unawaited(
-                              _copyConversationJson(item.id, item.title),
-                            );
-                          } else if (action == 'archive') {
-                            unawaited(
-                              _saveConversationArchive(item.id, item.title),
-                            );
-                          } else if (action == 'delete') {
-                            unawaited(_deleteConversation(item));
-                          }
-                        },
-                        itemBuilder: (_) => [
-                          const PopupMenuItem(
-                            value: 'rename',
-                            child: ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Icon(Icons.edit_outlined),
-                              title: Text('タイトル変更'),
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'export',
-                            enabled: !_exportingConversationIds.contains(
-                              item.id,
-                            ),
-                            child: const ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Icon(Icons.content_copy_outlined),
-                              title: Text('JSONをコピー'),
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'archive',
-                            enabled: !_exportingConversationIds.contains(
-                              item.id,
-                            ),
-                            child: const ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Icon(Icons.archive_outlined),
-                              title: Text('ZIPを保存'),
-                            ),
-                          ),
-                          const PopupMenuItem(
-                            value: 'delete',
-                            child: ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Icon(Icons.delete_outline),
-                              title: Text('削除'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-
-  Widget _chatPane() {
-    return Column(
-      children: [
-        if (_error.isNotEmpty) _errorBanner(_error),
-        if (_streamDisconnected && _liveTurn != null)
-          MaterialBanner(
-            content: const Text('サーバー側で継続中の可能性があります。再接続または停止を選べます。'),
-            actions: [
-              TextButton(
-                onPressed: _cancelLiveTurn,
-                child: const Text('停止を要求'),
-              ),
-              TextButton(
-                onPressed: _sending ? null : _resumeLiveTurn,
-                child: const Text('再接続'),
-              ),
-            ],
-          ),
-        if (_terminalReloadConversationId != null)
-          MaterialBanner(
-            content: const Text('会議は終了しました。保存済み結果だけを再読み込みしてください。'),
-            actions: [
-              TextButton(
-                onPressed: _loadingConversation
-                    ? null
-                    : _reloadTerminalConversation,
-                child: const Text('保存結果を再読込'),
-              ),
-            ],
-          ),
-        Expanded(child: _turnList()),
-        _composer(),
-      ],
-    );
-  }
-
-  Widget _turnList() {
-    if (_loadingConversation) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    final live = _liveTurn;
-    final turns = (_conversation?.turns ?? const <TurnRecord>[])
-        .where((turn) => turn.requestId != live?.requestId)
-        .toList(growable: false);
-    final showLive =
-        live != null &&
-        (_selectedId == live.conversationId || live.conversationId.isEmpty);
-    if (turns.isEmpty && !showLive) return _emptyState();
-    return ListView(
-      controller: _scrollController,
-      padding: const EdgeInsets.fromLTRB(16, 18, 16, 32),
-      children: [
-        if (_conversation != null)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 16),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _conversation!.title,
-                    style: Theme.of(context).textTheme.headlineSmall,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton.outlined(
-                  tooltip: '会話ZIPを保存',
-                  onPressed:
-                      _exportingConversationIds.contains(_conversation!.id)
-                      ? null
-                      : () => unawaited(
-                          _saveConversationArchive(
-                            _conversation!.id,
-                            _conversation!.title,
-                          ),
-                        ),
-                  icon: const Icon(Icons.archive_outlined),
-                ),
-                const SizedBox(width: 8),
-                IconButton.outlined(
-                  tooltip: _conversation!.memory.text.trim().isEmpty
-                      ? 'ローカルメモを追加'
-                      : 'ローカルメモを編集',
-                  onPressed: _sending ? null : _editConversationMemory,
-                  icon: Icon(
-                    _conversation!.memory.text.trim().isEmpty
-                        ? Icons.note_add_outlined
-                        : Icons.sticky_note_2,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton.outlined(
-                  tooltip: '会話JSONをコピー',
-                  onPressed:
-                      _exportingConversationIds.contains(_conversation!.id)
-                      ? null
-                      : () => unawaited(
-                          _copyConversationJson(
-                            _conversation!.id,
-                            _conversation!.title,
-                          ),
-                        ),
-                  icon: _exportingConversationIds.contains(_conversation!.id)
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.content_copy_outlined),
-                ),
-              ],
-            ),
-          ),
-        for (final turn in turns) ...[
-          SavedTurnView(
-            key: ValueKey(turn.requestId),
-            turn: turn,
-            actionPending: _savedRunActionIds.contains(turn.requestId),
-            onReconnect: turn.status == 'running'
-                ? () => unawaited(_reconnectSavedTurn(turn))
-                : null,
-            onCancel: turn.status == 'running'
-                ? () => unawaited(_cancelSavedTurn(turn))
-                : null,
-            regenerationPending: _regenerationActionIds.any(
-              (id) => id.startsWith('${turn.requestId}:'),
-            ),
-            onRegenerateAnswer: turn.status == 'completed'
-                ? (provider) => unawaited(
-                    _regenerateSavedTurn(
-                      turn,
-                      target: 'answer',
-                      provider: provider,
-                    ),
-                  )
-                : null,
-            onRegenerateSynthesis:
-                turn.status == 'completed' && !turn.synthesis.skipped
-                ? () =>
-                      unawaited(_regenerateSavedTurn(turn, target: 'synthesis'))
-                : null,
-            onForkEdit: turn.status == 'completed'
-                ? () => unawaited(_forkEditTurn(turn))
-                : null,
-            showTokenUsageLedger: _showTokenUsageLedger,
-          ),
-          const SizedBox(height: 24),
-          const Divider(),
-          const SizedBox(height: 20),
-        ],
-        if (showLive)
-          LiveTurnView(
-            key: ValueKey(live.requestId),
-            turn: live,
-            showTokenUsageLedger: _showTokenUsageLedger,
-          ),
-      ],
-    );
-  }
-
-  Widget _emptyState() {
-    final theme = Theme.of(context);
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(28),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 620),
-          child: Column(
-            children: [
-              Icon(
-                Icons.groups_2_outlined,
-                size: 76,
-                color: theme.colorScheme.primary,
-              ),
-              const SizedBox(height: 18),
-              Text('4つのAIを、1つの会議へ。', style: theme.textTheme.headlineSmall),
-              const SizedBox(height: 10),
-              const Text(
-                'Claude・Gemini・ChatGPT・Grokが並列で回答し、'
-                '最後に1つの回答へ統合します。Direct BYOKではAPIキーと端末内保存だけで動きます。',
-                textAlign: TextAlign.center,
-              ),
-              if (_server == null || _server!.activeWorkers.isEmpty) ...[
-                const SizedBox(height: 18),
-                FilledButton.icon(
-                  onPressed: _sending || _liveTurn != null
-                      ? null
-                      : _openSettings,
-                  icon: const Icon(Icons.settings_ethernet),
-                  label: const Text('実行方式を設定'),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _composerStrip({required Key key, required List<Widget> children}) {
-    return SizedBox(
-      key: key,
-      height: 48,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(mainAxisSize: MainAxisSize.min, children: children),
-      ),
-    );
-  }
-
-  Widget _composer() {
-    final theme = Theme.of(context);
-    final active = _server?.activeWorkers ?? const <String>[];
-    final webSearchAvailable = _server?.webSearch.enabled ?? false;
-    const compactSegmentStyle = ButtonStyle(
-      minimumSize: WidgetStatePropertyAll(Size(0, 40)),
-      padding: WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 6)),
-    );
-    final runActive = _liveTurn != null;
-    final preparing = _sending && !runActive;
-    final draftLocked = _loadingConversation || preparing;
-    final optionsLocked =
-        _loadingConversation || _uploadingAttachment || preparing;
-    final attachmentLocked =
-        _loadingConversation || _uploadingAttachment || _sending || runActive;
-    return Material(
-      key: const Key('composer'),
-      elevation: 8,
-      color: theme.colorScheme.surfaceContainer,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 1000),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _composerStrip(
-                  key: const Key('composer-quality-strip'),
-                  children: [
-                    if (runActive) ...[
-                      Chip(
-                        avatar: const Icon(Icons.edit_note, size: 17),
-                        label: const Text('次回'),
-                        visualDensity: VisualDensity.compact,
-                        side: BorderSide(color: theme.colorScheme.primary),
-                      ),
-                      const SizedBox(width: 6),
-                    ],
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: Text('品質', style: theme.textTheme.labelLarge),
-                    ),
-                    Semantics(
-                      label: 'モデルと出力枠の品質',
-                      child: SegmentedButton<String>(
-                        key: const Key('composer-tier-selector'),
-                        style: compactSegmentStyle,
-                        segments: const [
-                          ButtonSegment(value: 'low', label: Text('LOW')),
-                          ButtonSegment(
-                            value: 'balanced',
-                            label: Text('BALANCED'),
-                          ),
-                          ButtonSegment(value: 'high', label: Text('HIGH')),
-                        ],
-                        selected: {_tier},
-                        onSelectionChanged: optionsLocked
-                            ? null
-                            : (value) => setState(() => _tier = value.first),
-                        showSelectedIcon: false,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Tooltip(
-                      message: '相互批評を追加します。利用量と待ち時間が増えます。',
-                      child: FilterChip(
-                        label: const Text('DEBATE'),
-                        avatar: const Icon(Icons.forum_outlined, size: 17),
-                        selected: _debate,
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => setState(() => _debate = value),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                  ],
-                ),
-                _composerStrip(
-                  key: const Key('composer-effort-strip'),
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: Text('エフォート', style: theme.textTheme.labelLarge),
-                    ),
-                    Tooltip(
-                      message:
-                          '既定は${_defaultReasoningMode.toUpperCase()}です。変更は次の会議だけに適用します。',
-                      child: Semantics(
-                        label: '推論エフォート',
-                        child: SegmentedButton<String>(
-                          key: const Key('composer-effort-selector'),
-                          style: compactSegmentStyle,
-                          segments: const [
-                            ButtonSegment(value: 'default', label: Text('既定')),
-                            ButtonSegment(value: 'low', label: Text('LOW')),
-                            ButtonSegment(
-                              value: 'medium',
-                              label: Text('MEDIUM'),
-                            ),
-                            ButtonSegment(value: 'high', label: Text('HIGH')),
-                          ],
-                          selected: {_effortSelection},
-                          onSelectionChanged: optionsLocked
-                              ? null
-                              : (value) => setState(() {
-                                  _reasoningModeOverride =
-                                      value.first == 'default'
-                                      ? null
-                                      : value.first;
-                                }),
-                          showSelectedIcon: false,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Tooltip(
-                      message: webSearchAvailable
-                          ? '初回回答だけWeb検索を許可します。検索利用量が増える場合があります。'
-                          : '現在の実行環境はWeb検索に対応していません。',
-                      child: FilterChip(
-                        key: const Key('composer-web-toggle'),
-                        label: Text(_webSearch ? 'WEB ON' : 'WEB OFF'),
-                        avatar: Icon(
-                          _webSearch ? Icons.public : Icons.public_off_outlined,
-                          size: 17,
-                        ),
-                        selected: _webSearch,
-                        onSelected: optionsLocked || !webSearchAvailable
-                            ? null
-                            : (value) => setState(() => _webSearch = value),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Tooltip(
-                      message: '各回答を最後に1つへ統合します。',
-                      child: FilterChip(
-                        label: const Text('統合'),
-                        avatar: const Icon(Icons.auto_awesome, size: 17),
-                        selected: _synthesize,
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => setState(() => _synthesize = value),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Tooltip(
-                      message: '批評と統合へAI名を渡さず、ブランド先入観を減らします。',
-                      child: FilterChip(
-                        label: const Text('BLIND'),
-                        avatar: const Icon(
-                          Icons.visibility_off_outlined,
-                          size: 17,
-                        ),
-                        selected: _blind,
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => setState(() => _blind = value),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    for (final provider in _providerOrder.where(
-                      active.contains,
-                    )) ...[
-                      FilterChip(
-                        label: Text(_providerLabels[provider] ?? provider),
-                        selected: _selectedProviders.contains(provider),
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => setState(() {
-                                if (value) {
-                                  _selectedProviders.add(provider);
-                                } else {
-                                  _selectedProviders.remove(provider);
-                                }
-                              }),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      const SizedBox(width: 6),
-                    ],
-                  ],
-                ),
-                if (_pendingAttachments.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: [
-                      for (final attachment in _pendingAttachments)
-                        InputChip(
-                          avatar: Icon(
-                            attachment.kind == 'image'
-                                ? Icons.image_outlined
-                                : attachment.kind == 'pdf'
-                                ? Icons.picture_as_pdf_outlined
-                                : Icons.description_outlined,
-                            size: 17,
-                          ),
-                          label: Text(
-                            '${attachment.name} · ${_formatBytes(attachment.sizeBytes)}',
-                          ),
-                          onDeleted: attachmentLocked
-                              ? null
-                              : () => unawaited(
-                                  _removePendingAttachment(attachment),
-                                ),
-                        ),
-                    ],
-                  ),
-                ],
-                const SizedBox(height: 4),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    PopupMenuButton<String>(
-                      tooltip: '質問テンプレートを挿入',
-                      enabled: !draftLocked,
-                      icon: const Icon(Icons.auto_fix_high_outlined),
-                      onSelected: (label) =>
-                          _insertPromptTemplate(_promptTemplates[label]!),
-                      itemBuilder: (context) => [
-                        for (final entry in _promptTemplates.entries)
-                          PopupMenuItem(
-                            value: entry.key,
-                            child: ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: const Icon(Icons.add_comment_outlined),
-                              title: Text(entry.key),
-                              subtitle: Text(
-                                entry.value.trim(),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    IconButton(
-                      tooltip: '添付を追加',
-                      onPressed: attachmentLocked ? null : _pickAttachments,
-                      icon: _uploadingAttachment
-                          ? const SizedBox.square(
-                              dimension: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.attach_file),
-                    ),
-                    const SizedBox(width: 4),
-                    Expanded(
-                      child: TextField(
-                        controller: _messageController,
-                        focusNode: _messageFocusNode,
-                        minLines: 1,
-                        maxLines: 6,
-                        enabled: !draftLocked,
-                        textCapitalization: TextCapitalization.sentences,
-                        decoration: InputDecoration(
-                          hintText: '質問を入力…',
-                          prefixIcon: runActive
-                              ? const Tooltip(
-                                  message: '生成中の会議とは別の、次回用の下書きです。',
-                                  child: Icon(Icons.edit_note),
-                                )
-                              : null,
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton.filled(
-                      tooltip: runActive
-                          ? (_cancelPending ? '会議を停止中' : '会議を停止')
-                          : '会議を開始',
-                      onPressed: runActive
-                          ? (_cancelPending ? null : _cancelLiveTurn)
-                          : (draftLocked || _uploadingAttachment
-                                ? null
-                                : _send),
-                      icon: _cancelPending
-                          ? const SizedBox.square(
-                              dimension: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : runActive
-                          ? const Icon(Icons.stop)
-                          : _sending
-                          ? const Icon(Icons.hourglass_top)
-                          : const Icon(Icons.send),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _errorBanner(String message) {
-    final colors = Theme.of(context).colorScheme;
-    return Material(
-      color: colors.errorContainer,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        child: Row(
-          children: [
-            Icon(Icons.error_outline, color: colors.onErrorContainer),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                message,
-                style: TextStyle(color: colors.onErrorContainer),
-              ),
-            ),
-            IconButton(
-              tooltip: '閉じる',
-              onPressed: () => setState(() => _error = ''),
-              icon: Icon(Icons.close, color: colors.onErrorContainer),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _MemoryEditorDialog extends StatefulWidget {
-  const _MemoryEditorDialog({required this.initialText});
-
-  final String initialText;
-
-  @override
-  State<_MemoryEditorDialog> createState() => _MemoryEditorDialogState();
-}
-
-class _MemoryEditorDialogState extends State<_MemoryEditorDialog> {
-  late final TextEditingController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = TextEditingController(text: widget.initialText);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('ローカルメモ'),
-    content: SizedBox(
-      width: 620,
-      child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('会話の目的・制約・用語などを保存します。各ターンの初回回答へ参考データとして渡されます。'),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _controller,
-              minLines: 6,
-              maxLines: 14,
-              maxLength: 20000,
-              autofocus: true,
-              decoration: const InputDecoration(
-                hintText: '例: 対象読者、採用済み方針、避けるべき案…',
-                border: OutlineInputBorder(),
-              ),
-              onChanged: (_) => setState(() {}),
-            ),
-            const Text('APIキーなどの秘密候補は保存時にマスクされます。'),
-          ],
-        ),
-      ),
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('キャンセル'),
-      ),
-      FilledButton(
-        onPressed: () => Navigator.pop(context, _controller.text),
-        child: Text(_controller.text.trim().isEmpty ? 'クリア' : '保存'),
-      ),
-    ],
-  );
-}
-
-String _cancelRunStatus(CancelRunResult result) =>
-    switch (result.terminalOutcome) {
-      'completed' => '完了が先に確定しました',
-      'failed' => '停止前に処理失敗が確定しました',
-      'cancelled' => result.alreadyDone ? 'すでに停止しています' : 'ローカル停止処理が完了しました',
-      _ =>
-        result.alreadyDone
-            ? 'すでに処理は終了しています'
-            : (result.cancelled ? 'ローカル停止処理が完了しました' : '停止要求済み'),
-    };
-
-String _cancelRunNotice(CancelRunResult result) =>
-    switch (result.terminalOutcome) {
-      'completed' => '停止要求より先に会議の完了が確定しました。保存済み結果を確認できます。',
-      'failed' => '停止要求より先に処理失敗が確定しました。保存済みの実行状態を確認してください。',
-      _ =>
-        result.warning.isNotEmpty
-            ? result.warning
-            : '停止要求後も、外部Provider側の処理や課金が続く可能性があります。',
-    };
-
-String _formatDate(String value) {
-  final parsed = DateTime.tryParse(value)?.toLocal();
-  if (parsed == null) return '';
-  String two(int number) => number.toString().padLeft(2, '0');
-  return '${parsed.year}/${two(parsed.month)}/${two(parsed.day)} '
-      '${two(parsed.hour)}:${two(parsed.minute)}';
 }

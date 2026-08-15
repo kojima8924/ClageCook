@@ -6,6 +6,7 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models.dart';
+import '../provider_catalog.dart';
 import 'insights_panel.dart';
 
 /// 保存済みの1ターンを、ユーザー発言・各Provider回答・統合回答の順で表示する。
@@ -105,7 +106,7 @@ class LiveTurnView extends StatelessWidget {
     return _TurnView(
       message: turn.message,
       answers: turn.answers,
-      providerNames: names.isEmpty ? _providerOrder : names,
+      providerNames: names.isEmpty ? providerOrder : names,
       synthesis: turn.synthesis,
       insights: turn.insights,
       livePhase: turn.phase,
@@ -119,15 +120,6 @@ class LiveTurnView extends StatelessWidget {
     );
   }
 }
-
-const _providerOrder = ['claude', 'gemini', 'chatgpt', 'grok'];
-
-const _providerLabels = {
-  'claude': 'Claude',
-  'gemini': 'Gemini',
-  'chatgpt': 'ChatGPT',
-  'grok': 'Grok',
-};
 
 const _providerColors = {
   'claude': Color(0xFFD97757),
@@ -186,7 +178,7 @@ class _TurnView extends StatelessWidget {
       for (final entry in answers.entries)
         if (entry.value.usage.isNotEmpty)
           {
-            'source': _providerLabels[entry.key] ?? entry.key,
+            'source': providerLabels[entry.key] ?? entry.key,
             'model': entry.value.model,
             'phase': entry.value.round > 1 ? '回答 + DEBATE' : '回答',
             'usage': entry.value.usage,
@@ -194,7 +186,7 @@ class _TurnView extends StatelessWidget {
       if (synthesis != null && synthesis!.usage.isNotEmpty)
         {
           'source':
-              '統合 · ${_providerLabels[synthesis!.source] ?? synthesis!.source}',
+              '統合 · ${providerLabels[synthesis!.source] ?? synthesis!.source}',
           'model': synthesis!.model,
           'phase': '統合',
           'usage': synthesis!.usage,
@@ -572,7 +564,7 @@ class _AnswerHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final label = _providerLabels[provider] ?? provider;
+    final label = providerLabels[provider] ?? provider;
     final status = _answerStatus(answer, pending: pending);
     final metadata = _compactAnswerMetadata(
       answer,
@@ -1049,7 +1041,7 @@ class _AttemptHistoryTile extends StatelessWidget {
     final text = result?.text.trim() ?? '';
     final title = attempt.original
         ? '最初の保存回答'
-        : '${_providerLabels[provider] ?? provider} · ${_attemptStatusLabel(attempt.status)}';
+        : '${providerLabels[provider] ?? provider} · ${_attemptStatusLabel(attempt.status)}';
     final leading = Icon(
       attempt.usageMayBeIncomplete
           ? Icons.warning_amber_rounded
@@ -1151,7 +1143,7 @@ class _SynthesisCard extends StatelessWidget {
     final current = synthesis;
     final failed = current != null && !current.ok && !current.skipped;
     final source = current?.source ?? '';
-    final sourceLabel = _providerLabels[source] ?? source;
+    final sourceLabel = providerLabels[source] ?? source;
     return Card(
       margin: EdgeInsets.zero,
       color: colors.secondaryContainer,
@@ -1407,7 +1399,7 @@ class _Markdown extends StatelessWidget {
 
 List<String> _orderedProviders(Iterable<String> names) {
   final present = names.where((name) => name.isNotEmpty).toSet();
-  return [..._providerOrder.where(present.remove), ...present.toList()..sort()];
+  return [...providerOrder.where(present.remove), ...present.toList()..sort()];
 }
 
 String _elapsedLabel(double seconds) {
