@@ -14,6 +14,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from model_capabilities import CLAUDE_EFFORT_MODEL_PREFIXES
 from providers import (
     AnthropicProvider,
     GeminiProvider,
@@ -67,27 +68,142 @@ _ENV_KEYS = {
 }
 
 
+# 設定値の読み取りで「指定値と実効値が食い違った」ものを記録する。不正値を
+# 黙って既定へ落としたり、範囲外を黙ってクランプすると、利用者は自分の設定が
+# 効いていないことに気付けない。起動時にまとめて警告するための帯域外の記録。
+ENV_ADJUSTMENTS: list[dict[str, str]] = []
+
+
+def _record_adjustment(name: str, requested: str, effective: object, reason: str) -> None:
+    ENV_ADJUSTMENTS.append(
+        {
+            "name": name,
+            "requested": requested,
+            "effective": str(effective),
+            "reason": reason,
+        }
+    )
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    _record_adjustment(name, raw, default, "not_a_boolean")
+    return default
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
     try:
-        value = int(os.getenv(name, str(default)))
+        value = int(raw)
     except ValueError:
-        value = default
-    return max(minimum, min(value, maximum))
+        _record_adjustment(name, raw, default, "not_an_integer")
+        return default
+    clamped = max(minimum, min(value, maximum))
+    if clamped != value:
+        _record_adjustment(
+            name,
+            raw,
+            clamped,
+            f"outside_allowed_range[{minimum},{maximum}]",
+        )
+    return clamped
 
 
 def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
     try:
-        value = float(os.getenv(name, str(default)))
+        value = float(raw)
     except ValueError:
-        value = default
-    return max(minimum, min(value, maximum))
+        _record_adjustment(name, raw, default, "not_a_number")
+        return default
+    clamped = max(minimum, min(value, maximum))
+    if clamped != value:
+        _record_adjustment(
+            name,
+            raw,
+            clamped,
+            f"outside_allowed_range[{minimum},{maximum}]",
+        )
+    return clamped
+
+
+# ベンダー標準名のためCLAGE_接頭辞を付けない環境変数。他は全てCLAGE_付き。
+VENDOR_ENV_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "XAI_API_KEY",
+    "ANTHROPIC_ADMIN_KEY",
+    "OPENAI_ADMIN_KEY",
+    "XAI_MANAGEMENT_KEY",
+    "XAI_TEAM_ID",
+)
+
+# 0.2.0で CLAGE_ 接頭辞へ統一した際の旧名 → 新名。汎用名(HISTORY_TURNS等)は
+# docker-composeや共有シェル環境で他プロセスと衝突するため廃止した。旧名を
+# 黙って無視すると設定が効かないことに気付けないので、起動時に警告する。
+RENAMED_ENV_NAMES = {
+    "INCLUDE_MOCK_PROVIDERS": "CLAGE_INCLUDE_MOCK_PROVIDERS",
+    "HTTP_TIMEOUT_SEC": "CLAGE_HTTP_TIMEOUT_SEC",
+    "HTTP_RETRIES": "CLAGE_HTTP_RETRIES",
+    "MOCK_DELAY_SEC": "CLAGE_MOCK_DELAY_SEC",
+    "MAX_MESSAGE_CHARS": "CLAGE_MAX_MESSAGE_CHARS",
+    "MAX_PROVIDER_CALLS_PER_RUN": "CLAGE_MAX_PROVIDER_CALLS_PER_RUN",
+    "MAX_OUTPUT_TOKENS_PER_RUN": "CLAGE_MAX_OUTPUT_TOKENS_PER_RUN",
+    "MAX_INPUT_BYTES_PER_RUN": "CLAGE_MAX_INPUT_BYTES_PER_RUN",
+    "HISTORY_TURNS": "CLAGE_HISTORY_TURNS",
+    "HISTORY_MAX_CHARS": "CLAGE_HISTORY_MAX_CHARS",
+    "PEER_MAX_CHARS": "CLAGE_PEER_MAX_CHARS",
+    "MAX_CONCURRENT_RUNS": "CLAGE_MAX_CONCURRENT_RUNS",
+    "RATE_LIMIT_PER_MINUTE": "CLAGE_RATE_LIMIT_PER_MINUTE",
+    "SSE_PING_SEC": "CLAGE_SSE_PING_SEC",
+    "RUN_RETENTION_SEC": "CLAGE_RUN_RETENTION_SEC",
+    "SYNTHESIZER_PROVIDER": "CLAGE_SYNTHESIZER_PROVIDER",
+    **{
+        f"SYNTHESIZER_MODEL_{tier}": f"CLAGE_SYNTHESIZER_MODEL_{tier}"
+        for tier in ("LOW", "BALANCED", "HIGH")
+    },
+    **{
+        f"{provider}_MODEL_{tier}": f"CLAGE_{provider}_MODEL_{tier}"
+        for provider in ("CLAUDE", "GEMINI", "CHATGPT", "GROK")
+        for tier in ("LOW", "BALANCED", "HIGH")
+    },
+    **{
+        f"{provider}_MAX_OUTPUT_TOKENS_{tier}": (
+            f"CLAGE_{provider}_MAX_OUTPUT_TOKENS_{tier}"
+        )
+        for provider in ("CLAUDE", "GEMINI", "CHATGPT", "GROK")
+        for tier in ("LOW", "BALANCED", "HIGH")
+    },
+}
+
+
+def env_adjustment_for(name: str) -> dict[str, str] | None:
+    """指定した環境変数が、指定値と違う実効値になっていれば記録を返す。"""
+    for adjustment in ENV_ADJUSTMENTS:
+        if adjustment["name"] == name:
+            return adjustment
+    return None
+
+
+def deprecated_env_names() -> list[tuple[str, str]]:
+    """現在の環境に残っている旧名の (旧名, 新名) 一覧を返す。"""
+    return [
+        (old, new)
+        for old, new in sorted(RENAMED_ENV_NAMES.items())
+        if os.getenv(old) is not None and os.getenv(new) is None
+    ]
 
 
 AUTH_TOKEN = os.getenv("CLAGE_AUTH_TOKEN", "").strip()
@@ -101,13 +217,13 @@ CORS_ORIGIN_REGEX = os.getenv(
     r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
 ).strip()
 DATA_DIR = Path(os.getenv("CLAGE_DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
-INCLUDE_MOCKS_WHEN_MIXED = _env_bool("INCLUDE_MOCK_PROVIDERS", False)
+INCLUDE_MOCKS_WHEN_MIXED = _env_bool("CLAGE_INCLUDE_MOCK_PROVIDERS", False)
 LIVE_API_ENABLED = _env_bool("CLAGE_LIVE_API_ENABLED", False)
-HTTP_TIMEOUT_SEC = _env_float("HTTP_TIMEOUT_SEC", 180.0, 5.0, 900.0)
+HTTP_TIMEOUT_SEC = _env_float("CLAGE_HTTP_TIMEOUT_SEC", 600.0, 5.0, 1800.0)
 # 生成APIは応答喪失時に同じ処理を再度課金され得るため、自動再試行は既定OFF。
-HTTP_RETRIES = _env_int("HTTP_RETRIES", 0, 0, 4)
-MOCK_DELAY_SEC = _env_float("MOCK_DELAY_SEC", 0.08, 0.0, 5.0)
-MAX_MESSAGE_CHARS = _env_int("MAX_MESSAGE_CHARS", 50_000, 1_000, 500_000)
+HTTP_RETRIES = _env_int("CLAGE_HTTP_RETRIES", 0, 0, 4)
+MOCK_DELAY_SEC = _env_float("CLAGE_MOCK_DELAY_SEC", 0.08, 0.0, 5.0)
+MAX_MESSAGE_CHARS = _env_int("CLAGE_MAX_MESSAGE_CHARS", 50_000, 1_000, 500_000)
 TIERS = ("low", "balanced", "high")
 REASONING_MODES = ("auto", "low", "medium", "high")
 REASONING_POLICY_VERSION = 1
@@ -124,22 +240,11 @@ _DEFAULT_MAX_OUTPUT_TOKENS = {
 
 # AUTOは質問文を分類せず、model familyごとの推奨値だけを使う。これにより
 # 回答内容へ文体・結論の方向性を加えず、plan時に決定論的に解決できる。
+# Claudeのeffort対応modelはmodel_capabilities.pyの表が唯一のソース。
+# providers/anthropic.pyの実送信判定と同じ表を参照する(issue #21-1)。
 _AUTO_REASONING_POLICIES = {
     "claude": (
-        (
-            (
-                "claude-fable-5",
-                "claude-mythos-5",
-                "claude-mythos-preview",
-                "claude-opus-4-5",
-                "claude-opus-4-6",
-                "claude-opus-4-7",
-                "claude-opus-4-8",
-                "claude-sonnet-4-6",
-                "claude-sonnet-5",
-            ),
-            "high",
-        ),
+        (CLAUDE_EFFORT_MODEL_PREFIXES, "high"),
         (("claude-haiku-",), None),
         (
             ("claude-sonnet-", "claude-opus-", "claude-fable-", "claude-mythos-"),
@@ -156,7 +261,7 @@ _AUTO_REASONING_POLICIES = {
 MAX_OUTPUT_TOKENS = {
     provider: {
         tier: _env_int(
-            f"{provider.upper()}_MAX_OUTPUT_TOKENS_{tier.upper()}",
+            f"CLAGE_{provider.upper()}_MAX_OUTPUT_TOKENS_{tier.upper()}",
             default,
             128,
             128_000,
@@ -165,28 +270,41 @@ MAX_OUTPUT_TOKENS = {
     }
     for provider, tiers in _DEFAULT_MAX_OUTPUT_TOKENS.items()
 }
-MAX_PROVIDER_CALLS_PER_RUN = _env_int("MAX_PROVIDER_CALLS_PER_RUN", 9, 1, 100)
+MAX_PROVIDER_CALLS_PER_RUN = _env_int("CLAGE_MAX_PROVIDER_CALLS_PER_RUN", 9, 1, 100)
 MAX_OUTPUT_TOKENS_PER_RUN = _env_int(
-    "MAX_OUTPUT_TOKENS_PER_RUN", 196_608, 128, 1_000_000
+    "CLAGE_MAX_OUTPUT_TOKENS_PER_RUN", 196_608, 128, 1_000_000
 )
 MAX_INPUT_BYTES_PER_RUN = _env_int(
-    "MAX_INPUT_BYTES_PER_RUN", 3_200_000, 1_024, 100_000_000
+    "CLAGE_MAX_INPUT_BYTES_PER_RUN", 3_200_000, 1_024, 100_000_000
 )
-HISTORY_TURNS = _env_int("HISTORY_TURNS", 10, 0, 50)
-HISTORY_MAX_CHARS = _env_int("HISTORY_MAX_CHARS", 60_000, 2_000, 500_000)
-PEER_MAX_CHARS = _env_int("PEER_MAX_CHARS", 12_000, 1_000, 100_000)
-MAX_CONCURRENT_RUNS = _env_int("MAX_CONCURRENT_RUNS", 2, 1, 20)
-RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 10, 1, 600)
-SSE_PING_SEC = _env_float("SSE_PING_SEC", 15.0, 2.0, 60.0)
-RUN_RETENTION_SEC = _env_int("RUN_RETENTION_SEC", 3600, 60, 86_400)
+HISTORY_TURNS = _env_int("CLAGE_HISTORY_TURNS", 10, 0, 50)
+HISTORY_MAX_CHARS = _env_int("CLAGE_HISTORY_MAX_CHARS", 60_000, 2_000, 500_000)
+PEER_MAX_CHARS = _env_int("CLAGE_PEER_MAX_CHARS", 12_000, 1_000, 100_000)
+MAX_CONCURRENT_RUNS = _env_int("CLAGE_MAX_CONCURRENT_RUNS", 2, 1, 20)
+RATE_LIMIT_PER_MINUTE = _env_int("CLAGE_RATE_LIMIT_PER_MINUTE", 10, 1, 600)
+SSE_PING_SEC = _env_float("CLAGE_SSE_PING_SEC", 15.0, 2.0, 60.0)
+RUN_RETENTION_SEC = _env_int("CLAGE_RUN_RETENTION_SEC", 3600, 60, 86_400)
 PRICE_TABLE_FILE = os.getenv("CLAGE_PRICE_TABLE_FILE", "").strip()
 PER_RUN_BUDGET_USD = os.getenv("CLAGE_PER_RUN_BUDGET_USD", "").strip()
 DAILY_BUDGET_USD = os.getenv("CLAGE_DAILY_BUDGET_USD", "").strip()
-BUDGET_UNKNOWN_POLICY = os.getenv(
-    "CLAGE_BUDGET_UNKNOWN_POLICY", "block"
-).strip().lower()
-if BUDGET_UNKNOWN_POLICY not in {"block", "allow"}:
-    BUDGET_UNKNOWN_POLICY = "invalid"
+
+def _env_choice(name: str, default: str, allowed: frozenset[str]) -> str:
+    """列挙型の設定値。不正値は帯域内の魔法値にせず、記録して既定へ落とす。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in allowed:
+        return value
+    _record_adjustment(name, raw, default, "not_an_allowed_choice")
+    return default
+
+
+BUDGET_UNKNOWN_POLICY = _env_choice(
+    "CLAGE_BUDGET_UNKNOWN_POLICY",
+    "block",
+    frozenset({"block", "allow"}),
+)
 BUDGET_UTC_OFFSET = os.getenv("CLAGE_BUDGET_UTC_OFFSET", "+00:00").strip()
 MAX_UNRECONCILED_RESERVATIONS = _env_int(
     "CLAGE_MAX_UNRECONCILED_RESERVATIONS", 10, 1, 1000
@@ -392,7 +510,7 @@ def model_for(
     override = (runtime.get("models") or {}).get(name, {}).get(tier)
     if isinstance(override, str) and override:
         return override
-    env_name = f"{name.upper()}_MODEL_{tier.upper()}"
+    env_name = f"CLAGE_{name.upper()}_MODEL_{tier.upper()}"
     return os.getenv(env_name, DEFAULT_MODELS[name][tier]).strip() or DEFAULT_MODELS[name][tier]
 
 
@@ -479,7 +597,7 @@ def synthesizer_name(*, runtime: dict[str, Any] | None = None) -> str:
     requested = (
         str(runtime_requested).strip().lower()
         if runtime_requested not in {None, "auto"}
-        else os.getenv("SYNTHESIZER_PROVIDER", "auto").strip().lower()
+        else os.getenv("CLAGE_SYNTHESIZER_PROVIDER", "auto").strip().lower()
     )
     if requested in WORKERS and has_key(requested):
         return requested
@@ -528,7 +646,7 @@ def synthesizer_model_for(
     runtime_override = (runtime.get("synthesizer_models") or {}).get(tier)
     if isinstance(runtime_override, str) and runtime_override:
         return runtime_override
-    override = os.getenv(f"SYNTHESIZER_MODEL_{tier.upper()}", "").strip()
+    override = os.getenv(f"CLAGE_SYNTHESIZER_MODEL_{tier.upper()}", "").strip()
     return override or model_for(name, tier, runtime=runtime)
 
 

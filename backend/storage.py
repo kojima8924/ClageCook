@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -11,6 +12,19 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+import turn_state
+
+
+logger = logging.getLogger("clage_cook")
+
+
+#: 会話JSONの現行schema。1 → 2 で `event_log` を廃止し、turnの
+#: cancelled / failed / interrupted を `status` からの派生値へ格下げした。
+SCHEMA_VERSION = 2
+
+#: 読み込みを許す既知のschema。未知versionは黙って誤読せず拒否する。
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 
 def _sync_sanitized_value(current: Any, sanitized: Any) -> Any:
@@ -46,8 +60,59 @@ class ConversationNotFound(KeyError):
     pass
 
 
+class ConversationCorrupt(RuntimeError):
+    """ファイルは存在するが読み取れない。「無い」と嘘をつかず区別する。
+
+    `ConversationNotFound` を継承しない。既存の `except ConversationNotFound`
+    が黙って404へ潰すと、正本が壊れている事実が利用者に届かないため。
+    """
+
+    def __init__(self, conversation_id: str, reason: str) -> None:
+        super().__init__(conversation_id)
+        self.conversation_id = conversation_id
+        self.reason = reason
+
+
+class RequestIndexIncomplete(RuntimeError):
+    """破損会話があるため、request_idが未使用であることを証明できない。
+
+    破損ファイルのrequest_idはindexから落ちる。この状態で「indexに無い＝
+    新規」と判断すると、保存済みturnの再実行防波堤を素通りして同じ
+    request_idが再課金され得る。判断できないことを明示して止める。
+    """
+
+    def __init__(self, request_id: str, corrupt_ids: tuple[str, ...]) -> None:
+        super().__init__(request_id)
+        self.request_id = request_id
+        self.corrupt_ids = corrupt_ids
+
+
+class ConversationSchemaUnsupported(RuntimeError):
+    """未知のschema_version。旧versionの想定で誤読するより読まない方が安全。"""
+
+    def __init__(self, conversation_id: str, schema_version: Any) -> None:
+        super().__init__(conversation_id)
+        self.conversation_id = conversation_id
+        self.schema_version = schema_version
+
+
 class AmbiguousRequestId(RuntimeError):
     """同じrequest_idがbranch snapshotを含む複数会話に存在する。"""
+
+
+def _migrate_conversation(conversation_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    """既知schemaを現行形式へその場で引き上げる。未知versionは拒否する。"""
+    raw = data.get("schema_version", 1)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConversationSchemaUnsupported(conversation_id, raw)
+    if raw not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ConversationSchemaUnsupported(conversation_id, raw)
+    if raw < SCHEMA_VERSION:
+        # schema_version 1: event_log を読み捨て、派生booleanは status へ畳む。
+        for turn in data.get("turns") or []:
+            turn_state.normalize_turn_for_storage(turn)
+        data["schema_version"] = SCHEMA_VERSION
+    return data
 
 
 class ConversationStore:
@@ -63,6 +128,7 @@ class ConversationStore:
         self._sanitizer = sanitizer
         self._request_index: dict[str, set[str]] = {}
         self._conversation_requests: dict[str, set[str]] = {}
+        self._corrupt: tuple[str, ...] = ()
         self._revision = 0
         self._rebuild_request_index()
 
@@ -90,7 +156,7 @@ class ConversationStore:
     ) -> dict[str, Any]:
         now = utc_now()
         conversation = {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "id": (
                 self._validate_id(conversation_id)
                 if conversation_id is not None
@@ -120,7 +186,7 @@ class ConversationStore:
         parent_title = str(parent.get("title") or "新しい会話").strip()
         title = f"{parent_title} · 分岐"[:120]
         conversation = {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "id": str(uuid.uuid4()),
             "title": title,
             "created_at": now,
@@ -148,15 +214,20 @@ class ConversationStore:
                 raise ConversationNotFound(conversation_id)
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ConversationNotFound(conversation_id) from exc
-        if not isinstance(data, dict) or data.get("id") != self._validate_id(conversation_id):
-            raise ConversationNotFound(conversation_id)
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ConversationCorrupt(conversation_id, "unreadable") from exc
+            except json.JSONDecodeError as exc:
+                raise ConversationCorrupt(conversation_id, "invalid_json") from exc
+        canonical_id = self._validate_id(conversation_id)
+        if not isinstance(data, dict):
+            raise ConversationCorrupt(conversation_id, "not_an_object")
+        if data.get("id") != canonical_id:
+            raise ConversationCorrupt(conversation_id, "id_mismatch")
         if not isinstance(data.get("turns"), list):
             data["turns"] = []
         if not isinstance(data.get("memory"), dict):
             data["memory"] = {"revision": 0, "text": "", "updated_at": ""}
-        return data
+        return _migrate_conversation(canonical_id, data)
 
     def save(self, conversation: dict[str, Any]) -> None:
         conversation_id = self._validate_id(str(conversation.get("id", "")))
@@ -167,6 +238,10 @@ class ConversationStore:
                 snapshot = deepcopy(conversation)
                 updated_at = utc_now()
                 snapshot["updated_at"] = updated_at
+                snapshot["schema_version"] = SCHEMA_VERSION
+                # 保存する状態は status だけ。派生boolean・event_logは持たせない。
+                for turn in snapshot.get("turns") or []:
+                    turn_state.normalize_turn_for_storage(turn)
                 if self._sanitizer is not None:
                     sanitized = self._sanitizer(snapshot)
                     if not isinstance(sanitized, dict):
@@ -201,38 +276,72 @@ class ConversationStore:
             )
             self._revision += 1
 
-    def load_all(self) -> list[dict[str, Any]]:
-        """保存済み会話を各ファイル1回のparseでsnapshot化する。"""
+    def scan_all(self) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """保存済み会話と、読めなかったファイルの一覧をまとめて返す。
+
+        破損ファイルは**その場に残す**(正本を勝手に動かさない)。読み飛ばした
+        事実だけを呼出側へ返し、黙って一覧から消さない。
+        """
         conversations: list[dict[str, Any]] = []
+        corrupt: list[dict[str, str]] = []
         with self._lock:
             paths = list(self.data_dir.glob("*.json"))
         # saveは同一filesystem上のos.replaceで公開されるため、列挙後の各read/parseで
         # store全体のlockを保持する必要はない。大規模scanが通常saveを止めないようにする。
-        for path in paths:
+        for path in sorted(paths):
+            reason = ""
+            data: Any = None
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(data, dict) or not isinstance(
-                    data.get("turns"), list
-                ):
-                    continue
-                canonical_id = self._validate_id(str(data.get("id", "")))
-                if path.stem != canonical_id:
-                    continue
-                if not isinstance(data.get("memory"), dict):
-                    data["memory"] = {
-                        "revision": 0,
-                        "text": "",
-                        "updated_at": "",
-                    }
-                conversations.append(data)
-            except (
-                OSError,
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                ConversationNotFound,
-            ):
+            except (OSError, UnicodeDecodeError):
+                reason = "unreadable"
+            except json.JSONDecodeError:
+                reason = "invalid_json"
+            if not reason:
+                if not isinstance(data, dict):
+                    reason = "not_an_object"
+                elif not isinstance(data.get("turns"), list):
+                    reason = "missing_turns"
+                else:
+                    try:
+                        canonical_id = self._validate_id(str(data.get("id", "")))
+                    except ConversationNotFound:
+                        reason = "invalid_id"
+                    else:
+                        if path.stem != canonical_id:
+                            reason = "id_mismatch"
+            if reason:
+                corrupt.append({"id": path.stem, "file": path.name, "reason": reason})
                 continue
+            if not isinstance(data.get("memory"), dict):
+                data["memory"] = {
+                    "revision": 0,
+                    "text": "",
+                    "updated_at": "",
+                }
+            try:
+                conversations.append(_migrate_conversation(canonical_id, data))
+            except ConversationSchemaUnsupported:
+                corrupt.append(
+                    {
+                        "id": path.stem,
+                        "file": path.name,
+                        "reason": "unsupported_schema_version",
+                    }
+                )
+        with self._lock:
+            self._corrupt = tuple(item["id"] for item in corrupt)
+        return conversations, corrupt
+
+    def load_all(self) -> list[dict[str, Any]]:
+        """保存済み会話を各ファイル1回のparseでsnapshot化する。"""
+        conversations, _corrupt = self.scan_all()
         return conversations
+
+    def corrupt_ids(self) -> tuple[str, ...]:
+        """直近のscanで読めなかった会話ID。空なら破損は検出されていない。"""
+        with self._lock:
+            return self._corrupt
 
     def list(self) -> list[dict[str, Any]]:
         summaries = [self.summary(data) for data in self.load_all()]
@@ -324,6 +433,7 @@ class ConversationStore:
             if turn is not None:
                 matches.append((str(data.get("updated_at", "")), data, turn))
         if not matches:
+            self._assert_request_index_complete(request_id)
             return None
         if len(matches) > 1:
             raise AmbiguousRequestId(request_id)
@@ -333,15 +443,18 @@ class ConversationStore:
     def recover_interrupted_turns(self) -> int:
         """前プロセスが残したrunningターンを、再実行せず中断として確定する。"""
         recovered = 0
+        skipped: list[str] = []
         with self._lock:
             paths = list(self.data_dir.glob("*.json"))
             for path in paths:
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                     if not isinstance(data, dict) or not isinstance(data.get("turns"), list):
+                        skipped.append(path.name)
                         continue
                     canonical_id = self._validate_id(str(data.get("id", "")))
                     if path.stem != canonical_id:
+                        skipped.append(path.name)
                         continue
                     file_recovered = 0
                     for turn in data["turns"]:
@@ -363,10 +476,9 @@ class ConversationStore:
                                 file_recovered += 1
                         if turn.get("status") != "running":
                             continue
+                        # 状態は status 単一ソース。派生boolean(interrupted /
+                        # cancelled / failed)は保存せず応答生成時に算出する。
                         turn["status"] = "interrupted"
-                        turn["interrupted"] = True
-                        turn["cancelled"] = False
-                        turn["failed"] = True
                         turn["usage_may_be_incomplete"] = True
                         synthesis = turn.get("synthesis")
                         if not isinstance(synthesis, dict) or synthesis.get("pending") is True:
@@ -388,15 +500,50 @@ class ConversationStore:
                     json.JSONDecodeError,
                     ConversationNotFound,
                 ):
+                    skipped.append(path.name)
                     continue
+        if skipped:
+            # 中断確定できなかった＝runningのまま残る可能性がある。黙って
+            # 完了扱いにせず、対象ファイルを明示する。
+            logger.warning(
+                "could not recover interrupted turns in %s unreadable file(s) %s",
+                len(skipped),
+                skipped,
+            )
         return recovered
 
+    def _assert_request_index_complete(self, request_id: str) -> None:
+        """「indexに無い＝未使用」と言い切れるときだけ、黙って通す。
+
+        破損会話が1件でもあるとそのrequest_idはindexから落ちているため、
+        未使用であることを証明できない。既知の破損があるときだけ再scanし
+        (健全時は追加I/Oゼロ)、復旧済みなら自動的に通常動作へ戻る。
+        """
+        if not self.corrupt_ids():
+            return
+        self._rebuild_request_index()
+        corrupt = self.corrupt_ids()
+        if not corrupt:
+            return
+        with self._lock:
+            if request_id in self._request_index:
+                return
+        raise RequestIndexIncomplete(request_id, corrupt)
+
     def _rebuild_request_index(self) -> None:
+        conversations, corrupt = self.scan_all()
         with self._lock:
             self._request_index.clear()
             self._conversation_requests.clear()
-            for conversation in self.load_all():
+            for conversation in conversations:
                 self._index_conversation_locked(conversation)
+        if corrupt:
+            logger.warning(
+                "conversation index is incomplete: %s unreadable file(s) %s. "
+                "request_id reuse cannot be detected for them.",
+                len(corrupt),
+                [item["file"] for item in corrupt],
+            )
 
     def _index_conversation_locked(self, conversation: dict[str, Any]) -> None:
         conversation_id = self._validate_id(str(conversation.get("id", "")))

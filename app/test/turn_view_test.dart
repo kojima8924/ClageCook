@@ -350,4 +350,51 @@ void main() {
     await tester.tap(find.byTooltip('Claudeの回答を再生成'));
     expect(regenerated, 1);
   });
+
+  testWidgets('ライトテーマでもProvider名は4.5:1のコントラストを満たす', (tester) async {
+    final turn = TurnRecord.fromJson({
+      'request_id': 'contrast-request',
+      'message': '色の確認',
+      'clean_message': '色の確認',
+      'options': {
+        'providers': ['chatgpt', 'grok'],
+      },
+      'status': 'completed',
+      'answers': {
+        'chatgpt': {'source': 'chatgpt', 'ok': true, 'text': '回答A'},
+        'grok': {'source': 'grok', 'ok': true, 'text': '回答B'},
+      },
+      'synthesis': {'ok': true, 'text': '統合', 'source': 'chatgpt'},
+    });
+    final theme = ThemeData(
+      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF4966A6)),
+      useMaterial3: true,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: theme,
+        home: Scaffold(body: SavedTurnView(turn: turn)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    for (final label in ['ChatGPT', 'Grok']) {
+      // 先頭が回答カードの見出し(統合カードのチップにも同じ名前が出る)。
+      final color = tester.widget<Text>(find.text(label).first).style?.color;
+      expect(color, isNotNull, reason: '$labelの表示色を取得できません');
+      expect(
+        _contrast(color!, theme.colorScheme.surface),
+        greaterThanOrEqualTo(4.5),
+        reason: '$labelのブランド色がライトテーマで読みにくい',
+      );
+    }
+  });
+}
+
+double _contrast(Color first, Color second) {
+  final a = first.computeLuminance();
+  final b = second.computeLuminance();
+  final lighter = a > b ? a : b;
+  final darker = a > b ? b : a;
+  return (lighter + 0.05) / (darker + 0.05);
 }

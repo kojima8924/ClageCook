@@ -6,9 +6,9 @@ import '../services/api_client.dart';
 import '../services/settings_store.dart';
 
 typedef SettingsApiClientFactory =
-    ApiClient Function(ConnectionSettings settings);
+    ClageApiClient Function(ConnectionSettings settings);
 
-ApiClient _defaultSettingsApiClientFactory(ConnectionSettings settings) =>
+ClageApiClient _defaultSettingsApiClientFactory(ConnectionSettings settings) =>
     ApiClient(settings);
 
 const _webTokenStorageWarning =

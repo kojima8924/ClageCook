@@ -6,40 +6,13 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import '../models.dart';
+import 'api_contract.dart';
+import 'local_conversation_store.dart';
 
-class ApiException implements Exception {
-  const ApiException(this.message, {this.statusCode});
+export 'api_contract.dart';
 
-  final String message;
-  final int? statusCode;
-
-  @override
-  String toString() => message;
-}
-
-class SseEvent {
-  const SseEvent({required this.event, required this.data, this.id = ''});
-
-  final String event;
-  final Map<String, dynamic> data;
-  final String id;
-}
-
-class ChatStream {
-  const ChatStream({
-    required this.conversationId,
-    required this.requestId,
-    required this.events,
-    required this.idleTimeout,
-  });
-
-  final String conversationId;
-  final String requestId;
-  final Stream<SseEvent> events;
-  final Duration idleTimeout;
-}
-
-class ApiClient {
+/// 開発用reference serverへHTTP/SSEで接続する [ClageApiClient] 実装。
+class ApiClient implements ClageApiClient {
   ApiClient(
     ConnectionSettings settings, {
     http.Client? client,
@@ -72,11 +45,52 @@ class ApiClient {
       'Authorization': 'Bearer ${_settings.token.trim()}',
   };
 
+  List<LocalConversationDefect> _storageDefects =
+      const <LocalConversationDefect>[];
+
+  /// 直近の一覧で読めなかった会話。
+  ///
+  /// この実行方式では正本がserver側にあるため、`GET /api/conversations` の
+  /// `corrupt` をそのまま載せ替える。件数を黙って捨てると、利用者には
+  /// 「会話が消えた」ようにしか見えない(issue #18)。
+  @override
+  List<LocalConversationDefect> get storageDefects => _storageDefects;
+
+  /// 端末内ストレージの隔離・index再構築に対応するか。
+  ///
+  /// 隔離もindex再構築も端末内storage専用の操作で、serverの正本には行わない。
+  /// bannerは件数と理由だけを出し、復旧ボタンは出さない。
+  @override
+  bool get supportsLocalStorageRepair => false;
+
+  /// 実行中のrunへ後からSSEで再接続できるか。
+  ///
+  /// runの状態をプロセス内に持つ実行方式でだけ真になる。UIは
+  /// `turn.status` の文字列ではなくこの能力で再接続導線を出し分ける。
+  @override
+  bool get supportsRunReconnect => true;
+
+  @override
+  bool get supportsBudgetReconciliation => true;
+
+  /// 破損した会話をmanifestから外し、中身は隔離して保持する。
+  @override
+  Future<int> quarantineDefectiveConversations(Iterable<String> ids) =>
+      throw const ApiException('この実行環境では端末内ストレージを修復できません。');
+
+  /// 残っているrecordから会話indexを組み直す。
+  @override
+  Future<int> rebuildConversationIndex() =>
+      throw const ApiException('この実行環境では端末内ストレージを修復できません。');
+
+  @override
   Future<Map<String, dynamic>> health() => _getMap('/api/health');
 
+  @override
   Future<ServerSettings> serverSettings() async =>
       ServerSettings.fromJson(await _getMap('/api/settings'));
 
+  @override
   Future<ServerSettings> updateRuntimeSettings({
     required int expectedRevision,
     required Map<String, Map<String, String?>> models,
@@ -91,9 +105,11 @@ class ApiClient {
     }),
   );
 
+  @override
   Future<UsageTelemetrySnapshot> usageTelemetry() async =>
       UsageTelemetrySnapshot.fromJson(await _getMap('/api/telemetry'));
 
+  @override
   Future<BudgetSnapshot> releaseBudgetReconciliation({
     required String requestId,
     required String note,
@@ -109,6 +125,7 @@ class ApiClient {
     return BudgetSnapshot.fromJson(Map<String, dynamic>.from(finance));
   }
 
+  @override
   Future<RunPlan> planChat({
     required String message,
     String? conversationId,
@@ -138,11 +155,13 @@ class ApiClient {
     return RunPlan.fromJson(await _postMap('/api/plan', payload));
   }
 
+  @override
   Future<PolicyScanResult> scanPolicy(String text) async =>
       PolicyScanResult.fromJson(
         await _postMap('/api/policy/scan', {'text': text}),
       );
 
+  @override
   Future<RunPlan> regenerationPlan({
     required String conversationId,
     required String turnRequestId,
@@ -155,6 +174,7 @@ class ApiClient {
     ),
   );
 
+  @override
   Future<ConversationRecord> regenerate({
     required String conversationId,
     required String turnRequestId,
@@ -182,11 +202,15 @@ class ApiClient {
     return ConversationRecord.fromJson(Map<String, dynamic>.from(conversation));
   }
 
+  @override
   Future<List<ConversationSummary>> conversations() async {
-    final response = await _get('/api/conversations');
-    final data = _decode(response);
-    if (data is! List) throw const ApiException('会話一覧の形式が不正です');
-    return data
+    final data = await _getMap('/api/conversations');
+    final items = data['items'];
+    if (items is! List) throw const ApiException('会話一覧の形式が不正です');
+    // 読めなかったファイルは部分失敗として扱う。健全な会話は返したうえで、
+    // 件数と理由だけを別途UIへ渡す。
+    _storageDefects = _decodeDefects(data['corrupt']);
+    return items
         .whereType<Map>()
         .map(
           (item) =>
@@ -195,6 +219,25 @@ class ApiClient {
         .toList(growable: false);
   }
 
+  /// `GET /api/conversations` の `corrupt` をUI共通のdefectへ載せ替える。
+  ///
+  /// server側の破損はファイル単位で、端末内storageのようなrevisionを持たない。
+  /// どのrevisionだったか不明であることを表す0を入れる。
+  static List<LocalConversationDefect> _decodeDefects(Object? corrupt) {
+    if (corrupt is! List) return const <LocalConversationDefect>[];
+    return corrupt
+        .whereType<Map>()
+        .map(
+          (item) => LocalConversationDefect(
+            conversationId: item['id']?.toString() ?? '',
+            storageRevision: 0,
+            reason: item['reason']?.toString() ?? 'unknown',
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  @override
   Future<ConversationSearchResult> searchConversations(
     String query, {
     int limit = 30,
@@ -203,21 +246,24 @@ class ApiClient {
     if (trimmed.isEmpty) {
       return const ConversationSearchResult(query: '', results: []);
     }
-    final data = await _postMap('/api/search', {
+    final data = await _postMap('/api/conversations/search', {
       'q': trimmed,
       'limit': limit.clamp(1, 100),
     });
     return ConversationSearchResult.fromJson(data);
   }
 
+  @override
   Future<ConversationRecord> conversation(String id) async =>
       ConversationRecord.fromJson(await _getMap('/api/conversations/$id'));
 
+  @override
   Future<ConversationRecord> createDraftConversation() async =>
       ConversationRecord.fromJson(
         await _postMap('/api/conversations', const {}),
       );
 
+  @override
   Future<AttachmentRecord> uploadAttachment({
     required String conversationId,
     required String name,
@@ -241,6 +287,7 @@ class ApiClient {
     return AttachmentRecord.fromJson(Map<String, dynamic>.from(data));
   }
 
+  @override
   Future<void> deleteAttachment({
     required String conversationId,
     required String attachmentId,
@@ -256,6 +303,7 @@ class ApiClient {
     _ensureSuccess(response);
   }
 
+  @override
   Future<ConversationRecord> forkConversationAtTurn({
     required String conversationId,
     required String turnRequestId,
@@ -266,6 +314,7 @@ class ApiClient {
     ),
   );
 
+  @override
   Future<String> exportConversationJson(String id) async {
     final data = _decode(await _get('/api/conversations/$id/export'));
     if (data is! Map) throw const ApiException('エクスポートの形式が不正です');
@@ -274,11 +323,13 @@ class ApiClient {
     ).convert(Map<String, dynamic>.from(data));
   }
 
+  @override
   Future<Uint8List> exportConversationArchive(String id) async {
-    final response = await _get('/api/conversations/$id/export.zip');
+    final response = await _get('/api/conversations/$id/export?format=zip');
     return response.bodyBytes;
   }
 
+  @override
   Future<void> deleteConversation(String id) async {
     final response = await _client
         .delete(Uri.parse('$baseUrl/api/conversations/$id'), headers: _headers)
@@ -286,6 +337,7 @@ class ApiClient {
     _ensureSuccess(response);
   }
 
+  @override
   Future<ConversationSummary> renameConversation(
     String id,
     String title,
@@ -303,6 +355,7 @@ class ApiClient {
     return ConversationSummary.fromJson(Map<String, dynamic>.from(data));
   }
 
+  @override
   Future<ConversationRecord> updateConversationMemory({
     required String id,
     required int expectedRevision,
@@ -314,6 +367,7 @@ class ApiClient {
     }),
   );
 
+  @override
   Future<CancelRunResult> cancelRun(String requestId) async {
     final response = await _client
         .post(
@@ -327,6 +381,7 @@ class ApiClient {
     return CancelRunResult.fromJson(Map<String, dynamic>.from(data));
   }
 
+  @override
   Future<ChatStream> startChat({
     required String message,
     String? conversationId,
@@ -546,8 +601,17 @@ class ApiClient {
       final data = jsonDecode(body);
       if (data is Map && data['detail'] != null) {
         final detail = data['detail'];
-        if (detail is String) return detail;
-        return jsonEncode(detail);
+        // backendのHTTPエラーは必ず `{code, message, ...}`(docs/API_ERRORS.md)。
+        // 生JSONを利用者へ見せず、表示用の message だけを取り出す。
+        if (detail is Map) {
+          final message = detail['message']?.toString().trim() ?? '';
+          if (message.isNotEmpty) return message;
+          final code = detail['code']?.toString().trim() ?? '';
+          if (code.isNotEmpty) return 'HTTP $statusCode: $code';
+        } else if (detail is String && detail.trim().isNotEmpty) {
+          // 契約外の応答(古いserver・前段のproxy)でも文字列なら読める形で出す。
+          return detail;
+        }
       }
     } on FormatException {
       // Fall back to a bounded plain-text response below.
@@ -596,6 +660,7 @@ class ApiClient {
     if (attachmentIds.isNotEmpty) 'attachment_ids': attachmentIds,
   };
 
+  @override
   void close() => _client.close();
 }
 
@@ -611,74 +676,4 @@ class _BoundedErrorBody {
   final bool timedOut;
   final bool truncated;
   final Object? readError;
-}
-
-class SseDecoder {
-  static const keepAliveEvent = '_keepalive';
-
-  static Stream<SseEvent> decode(
-    Stream<List<int>> input, {
-    bool emitKeepAlive = false,
-  }) async* {
-    var event = 'message';
-    var lastEventId = '';
-    var dataLines = <String>[];
-
-    await for (final line
-        in input.transform(utf8.decoder).transform(const LineSplitter())) {
-      if (line.isEmpty) {
-        if (dataLines.isNotEmpty) {
-          yield _event(event, lastEventId, dataLines);
-        }
-        event = 'message';
-        dataLines = <String>[];
-        continue;
-      }
-      if (line.startsWith(':')) {
-        if (emitKeepAlive) {
-          yield const SseEvent(event: keepAliveEvent, data: {});
-        }
-        continue;
-      }
-      final separator = line.indexOf(':');
-      final field = separator < 0 ? line : line.substring(0, separator);
-      var value = separator < 0 ? '' : line.substring(separator + 1);
-      if (value.startsWith(' ')) value = value.substring(1);
-      switch (field) {
-        case 'event':
-          event = value;
-          break;
-        case 'id':
-          // Per the SSE specification the last event ID persists across
-          // events, an empty id resets it, and values containing NUL are
-          // ignored.
-          if (!value.contains('\u0000')) lastEventId = value;
-          break;
-        case 'data':
-          dataLines.add(value);
-          break;
-      }
-    }
-    if (dataLines.isNotEmpty) yield _event(event, lastEventId, dataLines);
-  }
-
-  static SseEvent _event(String event, String id, List<String> lines) {
-    final raw = lines.join('\n');
-    try {
-      final decoded = jsonDecode(raw);
-      return SseEvent(
-        event: event.isEmpty ? 'message' : event,
-        id: id,
-        data: decoded is Map
-            ? Map<String, dynamic>.from(decoded)
-            : {'value': decoded},
-      );
-    } on FormatException {
-      return SseEvent(
-        event: event.isEmpty ? 'message' : event,
-        id: id,
-        data: {'raw': raw},
-      );
-    }
-  }
 }

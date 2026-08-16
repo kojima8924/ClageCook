@@ -3,6 +3,13 @@
 
 from __future__ import annotations
 
+from model_capabilities import (
+    CLAUDE_ADAPTIVE_THINKING_MODEL_PREFIXES as _EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES,
+    CLAUDE_DYNAMIC_WEB_SEARCH_MODEL_PREFIXES as _DYNAMIC_WEB_SEARCH_MODEL_PREFIXES,
+    CLAUDE_EFFORT_MODEL_PREFIXES as _EFFORT_MODEL_PREFIXES,
+    matches_model_prefix as _matches_model,
+)
+
 from .base import (
     CompletionRequest,
     CompletionResult,
@@ -16,35 +23,6 @@ from .base import (
 
 
 _EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_EFFORT_MODEL_PREFIXES = (
-    "claude-fable-5",
-    "claude-mythos-5",
-    "claude-mythos-preview",
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-)
-_EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES = (
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-)
-_DYNAMIC_WEB_SEARCH_MODEL_PREFIXES = (
-    "claude-fable-5",
-    "claude-mythos-5",
-    "claude-mythos-preview",
-    *_EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES,
-)
-
-
-def _matches_model(model: str, prefixes: tuple[str, ...]) -> bool:
-    normalized = model.strip().lower()
-    return any(normalized.startswith(prefix) for prefix in prefixes)
 
 
 class AnthropicProvider(HttpProvider):

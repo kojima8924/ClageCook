@@ -21,9 +21,16 @@ toggleで維持しています。Directとreferenceはsecret、履歴の正本�
 - `lib/services/direct_settings_store.dart`: execution mode、reasoning、4社key、model override、統合役
 - `lib/services/local_conversation_store.dart`: immutableな端末内conversation repository
 - `lib/services/direct_provider_client.dart`: 4社公式APIのrequest/response adapter
-- `lib/services/direct_byok_client.dart`: 既存 `ApiClient` 契約へ合わせた端末内orchestrator
-- `lib/screens/app_settings_screen.dart`: Direct / reference切替、折りたたみProvider key/model、reasoning/統合役
-- `lib/screens/home_screen.dart`: 共通会話UI、2段composer、run snapshot、prompt template、会議実行
+- `lib/services/api_contract.dart`: 実行方式が共有するAPI契約 `ClageApiClient` とSSE型。
+  reference serverとDirect BYOKはこの契約だけを共有し、互いの実装を継承しない
+- `lib/services/policy_scanner.dart`: 送信前の秘密検出。ルール表の仕様は
+  `docs/policy_rules.json` にあり、backend `policy.py` と同一であることをtestで固定
+- `lib/services/direct_byok_client.dart`: `ClageApiClient` を実装する端末内orchestrator。
+  会議実行・plan・prompt・添付・純粋関数は `lib/services/direct/` のpartへ分割
+- `lib/screens/app_settings_screen.dart`: 折りたたみProvider key/model（最上部）、reasoning/統合役、
+  Direct / reference切替（最下部）、固定保存bar、未保存破棄の確認
+- `lib/screens/home_screen.dart`: 共通会話UI、参加AI行＋折りたたみoption composer、run snapshot、
+  prompt template、会議実行
 - `lib/widgets/turn_view.dart`: 1行回答header、本文 / 批評前回答 / immutable attempt accordion
 - `lib/services/api_client.dart`: reference server REST/SSE client
 - `lib/services/settings_store.dart`: reference URL + Bearerのorigin-bound保存
@@ -88,9 +95,12 @@ medium/high/provider-defaultを解決します。明示LOW/MEDIUM/HIGHも対応m
 
 ### モバイルUIとrun snapshot
 
-composerは高さを固定した2本の横scroll stripです。1段目はLOW / BALANCED / HIGHとDEBATE、2段目は
-既定 / LOW / MEDIUM / HIGHのeffort、WEB ON / OFF、統合、BLIND、active Providerを表示します。
-狭いAndroid幅でもoptionを非表示にせず横scrollで到達させます。AUTOは設定画面だけにあります。
+composerは高さを固定した横scroll stripの積み重ねです。最上段は常時表示の「参加AI」行で、
+active Providerのchip（空ならAPIキー設定への導線）と「詳細」開閉buttonを置きます。「詳細」を開くと
+1段目にLOW / BALANCED / HIGHとDEBATE・統合、2段目に既定 / LOW / MEDIUM / HIGHのeffort、
+WEB ON / OFF、BLINDが出ます。既定は畳んだ状態（横向きや小型端末で会話領域を潰さないため）。
+各stripは見出しと末尾buttonを固定し、中身だけを横scrollさせます。AUTOは設定画面だけにあります。
+参加Providerが空のsendは、候補ゼロ（キー未設定）と未選択を書き分けて原因と設定導線を示します。
 
 `_send()` はpreflightより前にmessage、conversation ID、tier、reasoning、DEBATE、統合、BLIND、Web、
 Provider順、添付IDをlocal snapshotへ取り、`LiveTurn` に同じ値を保持します。plan / policy scan / 確認 /
@@ -208,7 +218,10 @@ Reference serverはDirectの必須componentではありません。以下は開�
 - `planning.py`: call/output/input/retry/cost/budget plan
 - `orchestrator.py`: 並列回答、DEBATE、BLIND、統合
 - `providers/`: 4社API、mock、usage/completion/rate-limit正規化
-- `storage.py`: 1会話1JSON、atomic replace、会話lock
+- `storage.py`: 1会話1JSON、atomic replace、会話lock、schema_version検証と移行
+- `turn_state.py`: turnの `status` 単一ソース化と、API応答用の派生boolean算出
+- `api_errors.py`: `{code, message}` へ統一したHTTPエラー生成(codeの表は `docs/API_ERRORS.md`)
+- `model_capabilities.py`: Claude model familyのcapability表(config と providers の唯一のソース)
 - `runs.py`: background run、SSE replay、cancel、retention
 - `regeneration.py`: immutable regeneration state
 - `finance.py`: budget reservation/settle/reconciliation(durable台帳)
@@ -218,7 +231,7 @@ Reference serverはDirectの必須componentではありません。以下は開�
 - `scrubbing.py` / `policy.py`: 公開pathの再帰scrub、送信前policy
 
 `CLAGE_LIVE_API_ENABLED=false` は4 mockです。live=trueではBearer必須、設定済み実Providerだけが参加し、
-未設定を暗黙mockへしません。`INCLUDE_MOCK_PROVIDERS=true` だけが明示混在です。
+未設定を暗黙mockへしません。`CLAGE_INCLUDE_MOCK_PROVIDERS=true` だけが明示混在です。
 
 Backendも `reasoning_mode=auto|low|medium|high` を受理します。AUTO policyは質問を分類しません。
 BackendのLOW/BALANCED/HIGH上限はClaude/ChatGPT/Grokが4,096/8,192/16,384、
@@ -238,6 +251,38 @@ Reference固有の主な保証:
 ReferenceのHTTP retry既定値は0ですがenvで変更可能です。partial後の自動継続はありません。
 Web tool料金はtoken price tableで完全見積できず、budget時はunknown-cost policyを通します。
 
+### 会話JSONのschemaとturnのフィールド
+
+`schema_version` は現在 **2**。`storage.load()` / `scan_all()` は読み取り時に検証し、
+既知の 1 は読み込み時に 2 へ移行、**未知versionは黙って読まず拒否**します
+(`conversation_schema_unsupported`)。1 → 2 の変更点は
+「`event_log` の廃止」と「turnの `cancelled` / `failed` / `interrupted` を
+`status` からの派生値へ格下げ」の2点です。
+
+turnの状態は **`status` が単一のソース**です。取り得る値は
+`running` / `completed` / `cancelled` / `failed` / `interrupted`。
+`cancelled` / `failed` / `interrupted` は**保存せず**、API応答を作るときに
+`turn_state.derived_flags()` で算出します(値の対応は同モジュール参照)。
+`usage_may_be_incomplete` は派生値ではなく「Providerのusage(課金根拠)を
+観測できたか」という課金台帳側の事実なので保存し続けます。
+
+turnの任意フィールドが「いつ存在するか」:
+
+| フィールド | 存在する条件 |
+| --- | --- |
+| `request_id` / `status` / `message` / `clean_message` / `options` / `answers` / `insights` / `synthesis` / `created_at` | 常に(pendingで作られた時点から) |
+| `request_fingerprint` / `budget_reservation` / `execution_snapshot` / `attachment_ids` / `attachment_conversation_id` / `attachments` | 常に(pending保存時に確定) |
+| `resume_request` | 常に。完了時もpendingから引き継ぐ(0.2.0以前は完了turnからだけ消えていた) |
+| `usage_may_be_incomplete` | 常に |
+| `attempts` / `active_attempts` | そのturnで再生成を1回でも実行した後だけ |
+| `synthesis_stale` | 回答または統合を再生成した後だけ |
+| `branch`(会話単位) | 分岐で作られた会話だけ |
+
+SSE replayは保存turnのフィールドから**決定論的に組み立て直します**
+(`main._events_from_saved_turn`)。実行時のSSEを逐語再現した記録ではないため、
+実行時の `Last-Event-ID` はこの列の添字と一致しません。保存turnからの再生は
+必ず先頭から流します(各イベントはsource単位で冪等)。
+
 ## Reference REST / SSE契約
 
 Directは同じDart methodを端末adapterで実装するため、以下のHTTP routeを呼びません。
@@ -247,10 +292,18 @@ Directは同じDart methodを端末adapterで実装するため、以下のHTTP 
 - `GET /api/health`, `GET /api/settings`, `PATCH /api/settings/runtime`
 - `GET /api/telemetry`, `POST /api/plan`, `POST /api/policy/scan`
 - `POST /api/chat`, `POST /api/runs/{request_id}/cancel`
-- conversation list/search/get/rename/delete/export/memory
+- conversation list(`{items, corrupt_count, corrupt}`)/get/rename/delete/memory
+- `POST /api/conversations/search`(`{query, items}`)、
+  `GET /api/conversations/{id}/export?format=json|md|zip`
 - attachment list/upload/get/delete
 - regeneration plan/run、turn fork
 - manual budget reconciliation
+
+一覧系は裸の配列を返さず `{"items": [...]}` 封筒に統一しています。エラーは全て
+`{"detail": {"code", "message", ...}}` で、codeの表は `docs/API_ERRORS.md`。
+主要な応答には Pydantic の `response_model`(`api_schemas.py`)が付いており、
+`/docs` のOpenAPIに実際の契約が出ます。会話・ターン・添付のモデルは
+`extra="allow"` なので、宣言外のキーを黙って落としません。
 
 ### SSE
 

@@ -6,18 +6,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// Logical storage partition for locally persisted conversations.
 ///
-/// Direct BYOK data and reference-server data deliberately use different
-/// namespaces. A reference-server namespace is also scoped to one normalized
-/// server URL, so changing servers cannot silently merge their histories.
+/// 現在はDirect BYOKだけが端末を正本にする。将来ほかの実行方式が端末保存を
+/// 持つときはnamespaceを増やし、履歴が混ざらないようにする。
 class LocalConversationNamespace {
   const LocalConversationNamespace._(this.identity);
 
   static const directByok = LocalConversationNamespace._('direct-byok');
-
-  factory LocalConversationNamespace.referenceServer(String serverUrl) {
-    final normalized = _normalizeReferenceServerUrl(serverUrl);
-    return LocalConversationNamespace._('reference-server:$normalized');
-  }
 
   final String identity;
 
@@ -53,20 +47,42 @@ class LocalConversationSummary {
   const LocalConversationSummary({
     required this.id,
     required this.title,
-    required this.createdAt,
     required this.updatedAt,
     required this.turnCount,
     required this.preview,
-    required this.storageRevision,
   });
+
+  /// 会話documentから一覧用の要約を作る。
+  ///
+  /// previewの作り方をここへ一本化し、呼び出し側ごとに違う要約が出るのを防ぐ。
+  factory LocalConversationSummary.fromDocument(
+    LocalConversationDocument document,
+  ) {
+    final value = document.value;
+    final turns = value['turns'] is List ? value['turns'] as List : const [];
+    var preview = '';
+    if (turns.isNotEmpty && turns.last is Map) {
+      final last = turns.last as Map;
+      final synthesis = last['synthesis'];
+      if (synthesis is Map) preview = synthesis['text']?.toString() ?? '';
+      if (preview.trim().isEmpty) {
+        preview = last['message']?.toString() ?? '';
+      }
+    }
+    return LocalConversationSummary(
+      id: document.id,
+      title: value['title']?.toString() ?? '新しい会話',
+      updatedAt: value['updated_at']?.toString() ?? '',
+      turnCount: turns.length,
+      preview: _truncate(preview.replaceAll(RegExp(r'\s+'), ' ').trim(), 160),
+    );
+  }
 
   final String id;
   final String title;
-  final String createdAt;
   final String updatedAt;
   final int turnCount;
   final String preview;
-  final int storageRevision;
 }
 
 class LocalConversationNotFound implements Exception {
@@ -104,6 +120,47 @@ class LocalConversationCorruption implements Exception {
   String toString() => 'ローカル会話ストレージが破損しています: $message';
 }
 
+/// 一覧・検索で読めなかった1件分の記録。
+///
+/// 破損は「読めない1件」の事実であり、他の健全な会話を巻き添えにしない。
+/// [storageRevision] が0のときは、manifest entry自体が壊れていて
+/// どのrevisionを指していたか分からないことを表す。
+class LocalConversationDefect {
+  const LocalConversationDefect({
+    required this.conversationId,
+    required this.storageRevision,
+    required this.reason,
+  });
+
+  final String conversationId;
+  final int storageRevision;
+  final String reason;
+
+  @override
+  String toString() => '$conversationId@$storageRevision: $reason';
+}
+
+/// [LocalConversationRepository.list] / [LocalConversationRepository.search]
+/// の戻り値。読めた分と読めなかった分を同時に返す。
+class LocalConversationListing {
+  const LocalConversationListing({
+    required this.items,
+    this.defects = const <LocalConversationDefect>[],
+  });
+
+  static const empty = LocalConversationListing(
+    items: <LocalConversationSummary>[],
+  );
+
+  final List<LocalConversationSummary> items;
+  final List<LocalConversationDefect> defects;
+
+  bool get hasDefects => defects.isNotEmpty;
+  int get length => items.length;
+  bool get isEmpty => items.isEmpty;
+  bool get isNotEmpty => items.isNotEmpty;
+}
+
 /// Persistence contract used by direct BYOK mode.
 ///
 /// Implementations must isolate each [namespace] and must not return mutable
@@ -123,9 +180,13 @@ abstract interface class LocalConversationRepository {
     int? expectedStorageRevision,
   });
 
-  Future<List<LocalConversationSummary>> list();
+  /// 読めた会話と、破損して読めなかった会話をまとめて返す。
+  ///
+  /// 破損1件で一覧全体を落とさない。健全な会話のexport・削除経路を残すため、
+  /// ここでは例外を投げない(特定の会話を開く [read] だけがfail-closedを保つ)。
+  Future<LocalConversationListing> list();
 
-  Future<List<LocalConversationSummary>> search(String query, {int limit = 30});
+  Future<LocalConversationListing> search(String query, {int limit = 30});
 
   Future<LocalConversationDocument> rename(
     String conversationId,
@@ -152,7 +213,21 @@ abstract interface class LocalConversationRepository {
 
   Future<String> exportJson(String conversationId);
 
+  /// 破損した会話をmanifestから外し、recordは隔離keyへ退避する。
+  ///
+  /// 端末が正本なので中身は削除しない。戻り値は隔離できた件数。
+  Future<int> quarantine(Iterable<String> conversationIds);
+
+  /// 残っているrecordからmanifestを組み直す。
+  ///
+  /// manifest自体が壊れたときの明示的な復旧操作で、自動実行はしない。
+  /// 戻り値は再登録できた会話の件数。
+  Future<int> rebuildManifestFromRecords();
+
   /// Removes immutable records no longer referenced by the commit manifest.
+  ///
+  /// 破損entryが残っている間は何も削除しない。隔離または再構築で
+  /// 破損が解消してから物理削除する。
   Future<void> compact();
 }
 
@@ -221,7 +296,9 @@ class SharedPreferencesLocalConversationRepository
     LocalConversationValueStore? valueStore,
     DateTime Function()? clock,
     String Function()? idFactory,
-    this.maxConversationBytes = 16 * 1024 * 1024,
+    // SharedPreferencesはprefs全体をメモリへ展開し、保存のたびに書き直す。
+    // 16 MiBの会話は現実的に扱えないため、分岐やexportを促す上限にする。
+    this.maxConversationBytes = 2 * 1024 * 1024,
     this.maxMemoryCharacters = 20 * 1000,
   }) : assert(maxConversationBytes > 0),
        assert(maxMemoryCharacters > 0),
@@ -247,6 +324,10 @@ class SharedPreferencesLocalConversationRepository
 
   String get _manifestKey => '$_rootKey.manifest';
   String get _recordRoot => '$_rootKey.record.';
+
+  /// 隔離recordの置き場。`_recordRoot` とは別prefixにして、
+  /// compact()やdelete()の物理削除が隔離分を巻き込まないようにする。
+  String get _quarantineRoot => '$_rootKey.quarantine.';
 
   @override
   Future<LocalConversationDocument> create({
@@ -295,48 +376,78 @@ class SharedPreferencesLocalConversationRepository
   });
 
   @override
-  Future<List<LocalConversationSummary>> list() => _mutex.protect(() async {
+  Future<LocalConversationListing> list() => _mutex.protect(() async {
     final manifest = await _readManifest();
     final summaries = <LocalConversationSummary>[];
+    final defects = <LocalConversationDefect>[...manifest.defects];
     for (final entry in manifest.entries.entries) {
-      final document = await _readCommitted(entry.key, entry.value);
-      summaries.add(_summary(document));
+      final read = await _tryReadCommitted(entry.key, entry.value);
+      switch (read) {
+        case _RecordOk(:final document):
+          summaries.add(LocalConversationSummary.fromDocument(document));
+        case _RecordCorrupt(:final reason):
+          defects.add(
+            LocalConversationDefect(
+              conversationId: entry.key,
+              storageRevision: entry.value,
+              reason: reason,
+            ),
+          );
+      }
     }
+    _sortSummaries(summaries);
+    return LocalConversationListing(
+      items: List.unmodifiable(summaries),
+      defects: List.unmodifiable(defects),
+    );
+  });
+
+  @override
+  Future<LocalConversationListing> search(String query, {int limit = 30}) =>
+      _mutex.protect(() async {
+        final terms = query
+            .trim()
+            .toLowerCase()
+            .split(RegExp(r'\s+'))
+            .where((term) => term.isNotEmpty)
+            .toList(growable: false);
+        if (terms.isEmpty) return LocalConversationListing.empty;
+        final boundedLimit = limit.clamp(1, 100);
+        final manifest = await _readManifest();
+        final matches = <LocalConversationSummary>[];
+        final defects = <LocalConversationDefect>[...manifest.defects];
+        for (final entry in manifest.entries.entries) {
+          final read = await _tryReadCommitted(entry.key, entry.value);
+          switch (read) {
+            case _RecordOk(:final document):
+              final haystack = _searchText(document.value).toLowerCase();
+              if (terms.every(haystack.contains)) {
+                matches.add(LocalConversationSummary.fromDocument(document));
+              }
+            case _RecordCorrupt(:final reason):
+              // 検索できない会話を黙って落とすと「消えた」ように見える。
+              defects.add(
+                LocalConversationDefect(
+                  conversationId: entry.key,
+                  storageRevision: entry.value,
+                  reason: reason,
+                ),
+              );
+          }
+        }
+        _sortSummaries(matches);
+        return LocalConversationListing(
+          items: List.unmodifiable(matches.take(boundedLimit)),
+          defects: List.unmodifiable(defects),
+        );
+      });
+
+  static void _sortSummaries(List<LocalConversationSummary> summaries) {
     summaries.sort((left, right) {
       final byUpdated = right.updatedAt.compareTo(left.updatedAt);
       return byUpdated != 0 ? byUpdated : left.id.compareTo(right.id);
     });
-    return List.unmodifiable(summaries);
-  });
-
-  @override
-  Future<List<LocalConversationSummary>> search(
-    String query, {
-    int limit = 30,
-  }) => _mutex.protect(() async {
-    final terms = query
-        .trim()
-        .toLowerCase()
-        .split(RegExp(r'\s+'))
-        .where((term) => term.isNotEmpty)
-        .toList(growable: false);
-    if (terms.isEmpty) return const <LocalConversationSummary>[];
-    final boundedLimit = limit.clamp(1, 100);
-    final manifest = await _readManifest();
-    final matches = <LocalConversationSummary>[];
-    for (final entry in manifest.entries.entries) {
-      final document = await _readCommitted(entry.key, entry.value);
-      final haystack = _searchText(document.value).toLowerCase();
-      if (terms.every(haystack.contains)) {
-        matches.add(_summary(document));
-      }
-    }
-    matches.sort((left, right) {
-      final byUpdated = right.updatedAt.compareTo(left.updatedAt);
-      return byUpdated != 0 ? byUpdated : left.id.compareTo(right.id);
-    });
-    return List.unmodifiable(matches.take(boundedLimit));
-  });
+  }
 
   @override
   Future<LocalConversationDocument> rename(
@@ -485,8 +596,81 @@ class SharedPreferencesLocalConversationRepository
   });
 
   @override
+  Future<int> quarantine(Iterable<String> conversationIds) =>
+      _mutex.protect(() async {
+        final requested = <String>{};
+        for (final raw in conversationIds) {
+          final id = raw.trim();
+          if (id.isNotEmpty) requested.add(id);
+        }
+        if (requested.isEmpty) return 0;
+        final manifest = await _readManifest();
+        final entries = Map<String, int>.from(manifest.entries);
+        final moved = <String, int>{};
+        for (final id in requested) {
+          final revision = entries.remove(id);
+          if (revision != null) moved[id] = revision;
+        }
+        // manifest entry自体が壊れていたIDも、manifestから外れる時点で
+        // 隔離済みとして数える(次の書き出しで不正entryは残らない)。
+        final defective = manifest.defects
+            .where((defect) => requested.contains(defect.conversationId))
+            .length;
+        if (moved.isEmpty && defective == 0) return 0;
+        await _writeManifest(
+          _Manifest(revision: manifest.revision + 1, entries: entries),
+        );
+        for (final entry in moved.entries) {
+          await _moveToQuarantine(entry.key, entry.value);
+        }
+        return moved.length + defective;
+      });
+
+  @override
+  Future<int> rebuildManifestFromRecords() => _mutex.protect(() async {
+    final manifest = await _readManifest();
+    final keys = await _valueStore.keys();
+    final recovered = <String, int>{};
+    for (final key in keys.where((key) => key.startsWith(_recordRoot))) {
+      final raw = await _valueStore.read(key);
+      if (raw == null || raw.isEmpty) continue;
+      dynamic decoded;
+      try {
+        decoded = jsonDecode(raw);
+      } on FormatException {
+        continue;
+      }
+      if (decoded is! Map ||
+          decoded['version'] != _formatVersion ||
+          decoded['namespace'] != namespace.identity ||
+          decoded['value'] is! Map) {
+        continue;
+      }
+      final id = decoded['conversation_id']?.toString() ?? '';
+      final revision = _positiveInt(decoded['storage_revision']);
+      if (revision == null || key != _recordKey(id, revision)) continue;
+      try {
+        _validateId(id);
+      } on ArgumentError {
+        continue;
+      }
+      final value = decoded['value'] as Map;
+      if (value['id']?.toString() != id) continue;
+      final current = recovered[id];
+      if (current == null || revision > current) recovered[id] = revision;
+    }
+    await _writeManifest(
+      _Manifest(revision: manifest.revision + 1, entries: recovered),
+    );
+    return recovered.length;
+  });
+
+  @override
   Future<void> compact() => _mutex.protect(() async {
     final manifest = await _readManifest();
+    // 破損entryが残っている間は、隔離・再構築で救出できる可能性のある
+    // recordを物理削除しない。
+    if (manifest.defects.isNotEmpty) return;
     final retained = <String>{
       for (final entry in manifest.entries.entries)
         _recordKey(entry.key, entry.value),
@@ -498,6 +682,15 @@ class SharedPreferencesLocalConversationRepository
       }
     }
   });
+
+  Future<void> _moveToQuarantine(String id, int revision) async {
+    final source = _recordKey(id, revision);
+    final raw = await _valueStore.read(source);
+    if (raw == null) return;
+    // 端末が正本なので中身は捨てない。読める形に戻せる可能性を残す。
+    await _valueStore.write(_quarantineKey(id, revision), raw);
+    await _valueStore.remove(source);
+  }
 
   Future<LocalConversationDocument> _commit(
     _Manifest manifest,
@@ -592,20 +785,41 @@ class SharedPreferencesLocalConversationRepository
       throw const LocalConversationCorruption('manifest indexが不正です');
     }
     final entries = <String, int>{};
+    final defects = <LocalConversationDefect>[];
     for (final entry in rawEntries.entries) {
       final id = entry.key.toString();
       final recordRevision = _positiveInt(entry.value);
+      // 1件のentry破損で全会話を失わない。壊れたentryはdefectとして持ち回り、
+      // 隔離またはmanifest再構築というユーザー操作で解消させる。
       try {
         _validateId(id);
       } on ArgumentError {
-        throw const LocalConversationCorruption('manifest entryのIDが不正です');
+        defects.add(
+          LocalConversationDefect(
+            conversationId: id,
+            storageRevision: 0,
+            reason: 'manifest entryのIDが不正です',
+          ),
+        );
+        continue;
       }
       if (recordRevision == null) {
-        throw const LocalConversationCorruption('manifest entryが不正です');
+        defects.add(
+          LocalConversationDefect(
+            conversationId: id,
+            storageRevision: 0,
+            reason: 'manifest entryのrevisionが不正です',
+          ),
+        );
+        continue;
       }
       entries[id] = recordRevision;
     }
-    return _Manifest(revision: revision, entries: entries);
+    return _Manifest(
+      revision: revision,
+      entries: entries,
+      defects: List.unmodifiable(defects),
+    );
   }
 
   Future<void> _writeManifest(_Manifest manifest) async {
@@ -623,21 +837,36 @@ class SharedPreferencesLocalConversationRepository
     );
   }
 
+  /// 特定の会話を開く経路。破損はfail-closedのまま例外にする。
   Future<LocalConversationDocument> _readCommitted(
     String id,
     int revision,
   ) async {
-    final raw = await _valueStore.read(_recordKey(id, revision));
+    final read = await _tryReadCommitted(id, revision);
+    return switch (read) {
+      _RecordOk(:final document) => document,
+      _RecordCorrupt(:final reason) => throw LocalConversationCorruption(
+        '$reason: $id@$revision',
+      ),
+    };
+  }
+
+  /// 一覧・検索用の読み取り。例外を制御フローに使わず結果で返す。
+  Future<_RecordRead> _tryReadCommitted(String id, int revision) async {
+    String? raw;
+    try {
+      raw = await _valueStore.read(_recordKey(id, revision));
+    } catch (error) {
+      return _RecordCorrupt('会話recordを読み出せません($error)');
+    }
     if (raw == null || raw.isEmpty) {
-      throw LocalConversationCorruption(
-        'manifestが参照する会話recordがありません: $id@$revision',
-      );
+      return const _RecordCorrupt('manifestが参照する会話recordがありません');
     }
     dynamic decoded;
     try {
       decoded = jsonDecode(raw);
     } on FormatException {
-      throw LocalConversationCorruption('会話recordがJSONではありません: $id');
+      return const _RecordCorrupt('会話recordがJSONではありません');
     }
     if (decoded is! Map ||
         decoded['version'] != _formatVersion ||
@@ -645,16 +874,23 @@ class SharedPreferencesLocalConversationRepository
         decoded['conversation_id'] != id ||
         decoded['storage_revision'] != revision ||
         decoded['value'] is! Map) {
-      throw LocalConversationCorruption('会話recordの形式が不正です: $id');
+      return const _RecordCorrupt('会話recordの形式が不正です');
     }
-    final value = _cloneMap(
-      Map<String, dynamic>.from(decoded['value'] as Map),
-      label: 'conversation',
-    );
+    final Map<String, dynamic> value;
+    try {
+      value = _cloneMap(
+        Map<String, dynamic>.from(decoded['value'] as Map),
+        label: 'conversation',
+      );
+    } on ArgumentError {
+      return const _RecordCorrupt('会話recordの本文がJSON objectではありません');
+    }
     if (value['id']?.toString() != id) {
-      throw LocalConversationCorruption('会話record内のIDが一致しません: $id');
+      return const _RecordCorrupt('会話record内のIDが一致しません');
     }
-    return LocalConversationDocument(value: value, storageRevision: revision);
+    return _RecordOk(
+      LocalConversationDocument(value: value, storageRevision: revision),
+    );
   }
 
   Future<LocalConversationDocument> _requiredDocument(
@@ -695,29 +931,6 @@ class SharedPreferencesLocalConversationRepository
       };
     }
     return value;
-  }
-
-  LocalConversationSummary _summary(LocalConversationDocument document) {
-    final value = document.value;
-    final turns = value['turns'] is List ? value['turns'] as List : const [];
-    var preview = '';
-    if (turns.isNotEmpty && turns.last is Map) {
-      final last = turns.last as Map;
-      final synthesis = last['synthesis'];
-      if (synthesis is Map) preview = synthesis['text']?.toString() ?? '';
-      if (preview.trim().isEmpty) {
-        preview = last['message']?.toString() ?? '';
-      }
-    }
-    return LocalConversationSummary(
-      id: document.id,
-      title: value['title']?.toString() ?? '新しい会話',
-      createdAt: value['created_at']?.toString() ?? '',
-      updatedAt: value['updated_at']?.toString() ?? '',
-      turnCount: turns.length,
-      preview: _truncate(preview.replaceAll(RegExp(r'\s+'), ' ').trim(), 160),
-      storageRevision: document.storageRevision,
-    );
   }
 
   String _searchText(Map<String, dynamic> conversation) {
@@ -788,6 +1001,9 @@ class SharedPreferencesLocalConversationRepository
 
   String _recordKey(String id, int revision) => '${_recordPrefix(id)}$revision';
 
+  String _quarantineKey(String id, int revision) =>
+      '$_quarantineRoot${base64Url.encode(utf8.encode(id))}.$revision';
+
   String _now() {
     final utc = _clock().toUtc();
     return DateTime.fromMillisecondsSinceEpoch(
@@ -805,10 +1021,36 @@ class SharedPreferencesLocalConversationRepository
 }
 
 class _Manifest {
-  const _Manifest({this.revision = 0, this.entries = const <String, int>{}});
+  const _Manifest({
+    this.revision = 0,
+    this.entries = const <String, int>{},
+    this.defects = const <LocalConversationDefect>[],
+  });
 
   final int revision;
   final Map<String, int> entries;
+
+  /// 解釈できなかったmanifest entry。書き戻すと消えるため、
+  /// [SharedPreferencesLocalConversationRepository.compact] は
+  /// これが残っている間、物理削除を行わない。
+  final List<LocalConversationDefect> defects;
+}
+
+/// recordの読み取り結果。例外を制御フローに使わないための小さな型。
+sealed class _RecordRead {
+  const _RecordRead();
+}
+
+class _RecordOk extends _RecordRead {
+  const _RecordOk(this.document);
+
+  final LocalConversationDocument document;
+}
+
+class _RecordCorrupt extends _RecordRead {
+  const _RecordCorrupt(this.reason);
+
+  final String reason;
 }
 
 class _AsyncMutex {
@@ -825,27 +1067,6 @@ class _AsyncMutex {
     });
     return completer.future;
   }
-}
-
-String _normalizeReferenceServerUrl(String value) {
-  var cleaned = value.trim();
-  final uri = Uri.tryParse(cleaned);
-  if (uri == null ||
-      !uri.hasAuthority ||
-      uri.host.isEmpty ||
-      (uri.scheme != 'http' && uri.scheme != 'https') ||
-      uri.userInfo.isNotEmpty ||
-      uri.hasQuery ||
-      uri.hasFragment) {
-    throw ArgumentError.value(value, 'serverUrl', '有効なHTTP(S) URLではありません');
-  }
-  while (cleaned.endsWith('/')) {
-    cleaned = cleaned.substring(0, cleaned.length - 1);
-  }
-  final normalized = Uri.parse(
-    cleaned,
-  ).replace(scheme: uri.scheme.toLowerCase(), host: uri.host.toLowerCase());
-  return normalized.toString();
 }
 
 String _validateId(String value) {

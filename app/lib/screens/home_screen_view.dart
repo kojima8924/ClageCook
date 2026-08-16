@@ -59,8 +59,9 @@ extension _HomeScreenView on _HomeScreenState {
                 label: Text(
                   safeMock
                       ? 'SAFE MOCK'
+                      // 同じ状態を指す語を1つに揃える(狭幅表示と同じ文言)。
                       : directByok
-                      ? 'DIRECT · LOCAL'
+                      ? 'DIRECT · 端末内保存'
                       : _server!.mode.toUpperCase(),
                 ),
                 visualDensity: VisualDensity.compact,
@@ -92,6 +93,15 @@ extension _HomeScreenView on _HomeScreenState {
     final summaries = query.isEmpty
         ? _summaries
         : _searchResults ?? const <ConversationSummary>[];
+    // キーボードショートカットの案内はキーボードのある環境だけに出す。
+    const desktopPlatforms = {
+      TargetPlatform.windows,
+      TargetPlatform.macOS,
+      TargetPlatform.linux,
+    };
+    final showShortcutHint = desktopPlatforms.contains(
+      Theme.of(context).platform,
+    );
     return Column(
       children: [
         Padding(
@@ -120,7 +130,9 @@ extension _HomeScreenView on _HomeScreenState {
                 maxLengthEnforcement: MaxLengthEnforcement.enforced,
                 decoration: InputDecoration(
                   hintText: 'すべての回答を全文検索',
-                  helperText: 'Ctrl/Cmd+K · 最大200文字',
+                  helperText: showShortcutHint
+                      ? 'Ctrl/Cmd+K · 最大200文字'
+                      : '最大200文字',
                   prefixIcon: const Icon(Icons.search),
                   suffixIcon: query.isEmpty
                       ? null
@@ -275,6 +287,35 @@ extension _HomeScreenView on _HomeScreenState {
                   },
                 ),
         ),
+        // ドロワーからも設定・利用状況へ行けるようにする(AppBarのアイコンだけだと
+        // 会話一覧を開いた状態から戻る操作が必要になる)。
+        if (inDrawer) ...[
+          const Divider(height: 1),
+          SafeArea(
+            top: false,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.settings_outlined),
+                  title: const Text('設定（APIキー・実行方式）'),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    unawaited(_openSettings());
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.monitor_heart_outlined),
+                  title: const Text('利用状況と予算'),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    unawaited(_openUsage());
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -283,18 +324,34 @@ extension _HomeScreenView on _HomeScreenState {
     return Column(
       children: [
         if (_error.isNotEmpty) _errorBanner(_error),
+        if (_storageDefects.isNotEmpty && !_storageDefectsDismissed)
+          StorageDefectBanner(
+            defects: _storageDefects,
+            repairable: _client?.supportsLocalStorageRepair ?? false,
+            busy: _repairingStorage,
+            onQuarantine: () =>
+                unawaited(_quarantineDefectiveConversations()),
+            onRebuild: () => unawaited(_rebuildConversationIndex()),
+            onDismiss: () => _rebuild(() => _storageDefectsDismissed = true),
+          ),
         if (_streamDisconnected && _liveTurn != null)
           MaterialBanner(
-            content: const Text('サーバー側で継続中の可能性があります。再接続または停止を選べます。'),
+            content: Text(
+              (_client?.supportsRunReconnect ?? false)
+                  ? 'サーバー側で継続中の可能性があります。再接続または停止を選べます。'
+                  : '接続が切れました。この実行方式では後から再接続できません。停止を要求できます。',
+            ),
             actions: [
               TextButton(
                 onPressed: _cancelLiveTurn,
                 child: const Text('停止を要求'),
               ),
-              TextButton(
-                onPressed: _sending ? null : _resumeLiveTurn,
-                child: const Text('再接続'),
-              ),
+              // 再接続できない実行方式では、押しても必ず失敗する選択肢を出さない。
+              if (_client?.supportsRunReconnect ?? false)
+                TextButton(
+                  onPressed: _sending ? null : _resumeLiveTurn,
+                  child: const Text('再接続'),
+                ),
             ],
           ),
         if (_terminalReloadConversationId != null)
@@ -395,16 +452,19 @@ extension _HomeScreenView on _HomeScreenState {
             key: ValueKey(turn.requestId),
             turn: turn,
             actionPending: _savedRunActionIds.contains(turn.requestId),
-            onReconnect: turn.status == 'running'
+            // 再接続導線は保存turnの文字列ではなく、実行方式の能力で出し分ける。
+            onReconnect:
+                turn.running &&
+                    (_client?.supportsRunReconnect ?? false)
                 ? () => unawaited(_reconnectSavedTurn(turn))
                 : null,
-            onCancel: turn.status == 'running'
+            onCancel: turn.running
                 ? () => unawaited(_cancelSavedTurn(turn))
                 : null,
             regenerationPending: _regenerationActionIds.any(
               (id) => id.startsWith('${turn.requestId}:'),
             ),
-            onRegenerateAnswer: turn.status == 'completed'
+            onRegenerateAnswer: turn.completed
                 ? (provider) => unawaited(
                     _regenerateSavedTurn(
                       turn,
@@ -414,13 +474,14 @@ extension _HomeScreenView on _HomeScreenState {
                   )
                 : null,
             onRegenerateSynthesis:
-                turn.status == 'completed' && !turn.synthesis.skipped
+                turn.completed && !turn.synthesis.skipped
                 ? () =>
                       unawaited(_regenerateSavedTurn(turn, target: 'synthesis'))
                 : null,
-            onForkEdit: turn.status == 'completed'
+            onForkEdit: turn.completed
                 ? () => unawaited(_forkEditTurn(turn))
                 : null,
+            onOpenSettings: _openSettings,
             showTokenUsageLedger: _showTokenUsageLedger,
           ),
           const SizedBox(height: 24),
@@ -431,6 +492,7 @@ extension _HomeScreenView on _HomeScreenState {
           LiveTurnView(
             key: ValueKey(live.requestId),
             turn: live,
+            onOpenSettings: _openSettings,
             showTokenUsageLedger: _showTokenUsageLedger,
           ),
       ],
@@ -439,6 +501,7 @@ extension _HomeScreenView on _HomeScreenState {
 
   Widget _emptyState() {
     final theme = Theme.of(context);
+    final needsSetup = _server == null || _server!.activeWorkers.isEmpty;
     return Center(
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(28),
@@ -459,14 +522,38 @@ extension _HomeScreenView on _HomeScreenState {
                 '最後に1つの回答へ統合します。Direct BYOKではAPIキーと端末内保存だけで動きます。',
                 textAlign: TextAlign.center,
               ),
-              if (_server == null || _server!.activeWorkers.isEmpty) ...[
-                const SizedBox(height: 18),
+              // 初回は「何をすればいいか」を手順で示す。キー登録前は送信できない。
+              if (needsSetup) ...[
+                const SizedBox(height: 22),
+                Card(
+                  margin: EdgeInsets.zero,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('はじめの3ステップ', style: theme.textTheme.titleSmall),
+                        const SizedBox(height: 10),
+                        for (final step in const [
+                          '1. 各社のAPIキーを登録する（1社からで動きます）',
+                          '2. 入力欄の上「参加AI」から会議に出すAIを選ぶ',
+                          '3. 質問を入力して送信ボタンを押す',
+                        ])
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 4),
+                            child: Text(step),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
                 FilledButton.icon(
                   onPressed: _sending || _liveTurn != null
                       ? null
                       : _openSettings,
-                  icon: const Icon(Icons.settings_ethernet),
-                  label: const Text('実行方式を設定'),
+                  icon: const Icon(Icons.key_outlined),
+                  label: const Text('APIキーを登録する'),
                 ),
               ],
             ],
@@ -476,15 +563,49 @@ extension _HomeScreenView on _HomeScreenState {
     );
   }
 
-  Widget _composerStrip({required Key key, required List<Widget> children}) {
+  /// composerの操作帯。見出しと末尾ボタンは固定し、中身だけ横スクロールさせる。
+  /// (見出しごとスクロールすると、右へ送るほど何の行か分からなくなるため)
+  Widget _composerStrip({
+    required Key key,
+    required String label,
+    required List<Widget> children,
+    Widget? trailing,
+  }) {
+    final theme = Theme.of(context);
     return SizedBox(
       key: key,
       height: 48,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(mainAxisSize: MainAxisSize.min, children: children),
+      child: Row(
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 4, right: 8),
+            child: Text(label, style: theme.textTheme.labelLarge),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(mainAxisSize: MainAxisSize.min, children: children),
+            ),
+          ),
+          ?trailing,
+        ],
       ),
     );
+  }
+
+  /// 折りたたみ中でも現在の設定が分かるよう、詳細ボタンのtooltipへ要約を出す。
+  String _composerOptionsSummary() {
+    final effort = _reasoningModeOverride == null
+        ? '既定(${_defaultReasoningMode.toUpperCase()})'
+        : _reasoningModeOverride!.toUpperCase();
+    return [
+      '品質 ${_tier.toUpperCase()}',
+      'エフォート $effort',
+      if (_debate) 'DEBATE',
+      if (_webSearch) 'WEB',
+      _synthesize ? '統合ON' : '統合OFF',
+      if (_blind) 'BLIND',
+    ].join(' · ');
   }
 
   Widget _composer() {
@@ -517,163 +638,200 @@ extension _HomeScreenView on _HomeScreenState {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 _composerStrip(
-                  key: const Key('composer-quality-strip'),
+                  key: const Key('composer-provider-strip'),
+                  label: '参加AI',
+                  trailing: Tooltip(
+                    message: '会議の詳細設定（${_composerOptionsSummary()}）',
+                    child: TextButton.icon(
+                      key: const Key('composer-options-toggle'),
+                      onPressed: () => _rebuild(
+                        () => _showComposerOptions = !_showComposerOptions,
+                      ),
+                      icon: Icon(
+                        _showComposerOptions
+                            ? Icons.expand_less
+                            : Icons.expand_more,
+                        size: 18,
+                      ),
+                      label: const Text('詳細'),
+                    ),
+                  ),
                   children: [
                     if (runActive) ...[
-                      Chip(
-                        avatar: const Icon(Icons.edit_note, size: 17),
-                        label: const Text('次回'),
-                        visualDensity: VisualDensity.compact,
-                        side: BorderSide(color: theme.colorScheme.primary),
+                      Tooltip(
+                        message: '生成中の会議とは別の、次回用の下書きです。',
+                        child: Chip(
+                          avatar: const Icon(Icons.edit_note, size: 17),
+                          label: const Text('次回'),
+                          visualDensity: VisualDensity.compact,
+                          side: BorderSide(color: theme.colorScheme.primary),
+                        ),
                       ),
                       const SizedBox(width: 6),
                     ],
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: Text('品質', style: theme.textTheme.labelLarge),
-                    ),
-                    Semantics(
-                      label: 'モデルと出力枠の品質',
-                      child: SegmentedButton<String>(
-                        key: const Key('composer-tier-selector'),
-                        style: compactSegmentStyle,
-                        segments: const [
-                          ButtonSegment(value: 'low', label: Text('LOW')),
-                          ButtonSegment(
-                            value: 'balanced',
-                            label: Text('BALANCED'),
-                          ),
-                          ButtonSegment(value: 'high', label: Text('HIGH')),
-                        ],
-                        selected: {_tier},
-                        onSelectionChanged: optionsLocked
-                            ? null
-                            : (value) => _rebuild(() => _tier = value.first),
-                        showSelectedIcon: false,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Tooltip(
-                      message: '相互批評を追加します。利用量と待ち時間が増えます。',
-                      child: FilterChip(
-                        label: const Text('DEBATE'),
-                        avatar: const Icon(Icons.forum_outlined, size: 17),
-                        selected: _debate,
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => _rebuild(() => _debate = value),
+                    if (active.isEmpty)
+                      ActionChip(
+                        key: const Key('composer-setup-providers'),
+                        avatar: const Icon(Icons.key_off_outlined, size: 17),
+                        label: const Text('APIキー未設定 — 設定する'),
+                        onPressed: optionsLocked ? null : _openSettings,
                         visualDensity: VisualDensity.compact,
-                      ),
-                    ),
+                      )
+                    else
+                      for (final provider in providerOrder.where(
+                        active.contains,
+                      )) ...[
+                        FilterChip(
+                          key: Key('composer-provider-$provider'),
+                          label: Text(providerLabels[provider] ?? provider),
+                          selected: _selectedProviders.contains(provider),
+                          onSelected: optionsLocked
+                              ? null
+                              : (value) => _rebuild(() {
+                                  if (value) {
+                                    _selectedProviders.add(provider);
+                                  } else {
+                                    _selectedProviders.remove(provider);
+                                  }
+                                }),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        const SizedBox(width: 6),
+                      ],
                   ],
                 ),
-                _composerStrip(
-                  key: const Key('composer-effort-strip'),
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: Text('エフォート', style: theme.textTheme.labelLarge),
-                    ),
-                    Tooltip(
-                      message:
-                          '既定は${_defaultReasoningMode.toUpperCase()}です。変更は次の会議だけに適用します。',
-                      child: Semantics(
-                        label: '推論エフォート',
+                if (_showComposerOptions) ...[
+                  _composerStrip(
+                    key: const Key('composer-quality-strip'),
+                    label: '品質',
+                    children: [
+                      Semantics(
+                        label: 'モデルと出力枠の品質',
                         child: SegmentedButton<String>(
-                          key: const Key('composer-effort-selector'),
+                          key: const Key('composer-tier-selector'),
                           style: compactSegmentStyle,
                           segments: const [
-                            ButtonSegment(value: 'default', label: Text('既定')),
                             ButtonSegment(value: 'low', label: Text('LOW')),
                             ButtonSegment(
-                              value: 'medium',
-                              label: Text('MEDIUM'),
+                              value: 'balanced',
+                              label: Text('BALANCED'),
                             ),
                             ButtonSegment(value: 'high', label: Text('HIGH')),
                           ],
-                          selected: {_effortSelection},
+                          selected: {_tier},
                           onSelectionChanged: optionsLocked
                               ? null
-                              : (value) => _rebuild(() {
-                                  _reasoningModeOverride =
-                                      value.first == 'default'
-                                      ? null
-                                      : value.first;
-                                }),
+                              : (value) => _rebuild(() => _tier = value.first),
                           showSelectedIcon: false,
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Tooltip(
-                      message: webSearchAvailable
-                          ? '初回回答だけWeb検索を許可します。検索利用量が増える場合があります。'
-                          : '現在の実行環境はWeb検索に対応していません。',
-                      child: FilterChip(
-                        key: const Key('composer-web-toggle'),
-                        label: Text(_webSearch ? 'WEB ON' : 'WEB OFF'),
-                        avatar: Icon(
-                          _webSearch ? Icons.public : Icons.public_off_outlined,
-                          size: 17,
+                      const SizedBox(width: 8),
+                      Tooltip(
+                        message: '相互批評を追加します。利用量と待ち時間が増えます。',
+                        child: FilterChip(
+                          label: const Text('DEBATE'),
+                          avatar: const Icon(Icons.forum_outlined, size: 17),
+                          selected: _debate,
+                          onSelected: optionsLocked
+                              ? null
+                              : (value) => _rebuild(() => _debate = value),
+                          visualDensity: VisualDensity.compact,
                         ),
-                        selected: _webSearch,
-                        onSelected: optionsLocked || !webSearchAvailable
-                            ? null
-                            : (value) => _rebuild(() => _webSearch = value),
-                        visualDensity: VisualDensity.compact,
                       ),
-                    ),
-                    const SizedBox(width: 6),
-                    Tooltip(
-                      message: '各回答を最後に1つへ統合します。',
-                      child: FilterChip(
-                        label: const Text('統合'),
-                        avatar: const Icon(Icons.auto_awesome, size: 17),
-                        selected: _synthesize,
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => _rebuild(() => _synthesize = value),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Tooltip(
-                      message: '批評と統合へAI名を渡さず、ブランド先入観を減らします。',
-                      child: FilterChip(
-                        label: const Text('BLIND'),
-                        avatar: const Icon(
-                          Icons.visibility_off_outlined,
-                          size: 17,
+                      const SizedBox(width: 6),
+                      Tooltip(
+                        message: '各回答を最後に1つへ統合します。',
+                        child: FilterChip(
+                          label: const Text('統合'),
+                          avatar: const Icon(Icons.auto_awesome, size: 17),
+                          selected: _synthesize,
+                          onSelected: optionsLocked
+                              ? null
+                              : (value) => _rebuild(() => _synthesize = value),
+                          visualDensity: VisualDensity.compact,
                         ),
-                        selected: _blind,
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => _rebuild(() => _blind = value),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    for (final provider in providerOrder.where(
-                      active.contains,
-                    )) ...[
-                      FilterChip(
-                        label: Text(providerLabels[provider] ?? provider),
-                        selected: _selectedProviders.contains(provider),
-                        onSelected: optionsLocked
-                            ? null
-                            : (value) => _rebuild(() {
-                                if (value) {
-                                  _selectedProviders.add(provider);
-                                } else {
-                                  _selectedProviders.remove(provider);
-                                }
-                              }),
-                        visualDensity: VisualDensity.compact,
                       ),
                       const SizedBox(width: 6),
                     ],
-                  ],
-                ),
+                  ),
+                  _composerStrip(
+                    key: const Key('composer-effort-strip'),
+                    label: 'エフォート',
+                    children: [
+                      Tooltip(
+                        message:
+                            '既定は${_defaultReasoningMode.toUpperCase()}です。変更は次の会議だけに適用します。',
+                        child: Semantics(
+                          label: '推論エフォート',
+                          child: SegmentedButton<String>(
+                            key: const Key('composer-effort-selector'),
+                            style: compactSegmentStyle,
+                            segments: const [
+                              ButtonSegment(
+                                value: 'default',
+                                label: Text('既定'),
+                              ),
+                              ButtonSegment(value: 'low', label: Text('LOW')),
+                              ButtonSegment(
+                                value: 'medium',
+                                label: Text('MEDIUM'),
+                              ),
+                              ButtonSegment(value: 'high', label: Text('HIGH')),
+                            ],
+                            selected: {_effortSelection},
+                            onSelectionChanged: optionsLocked
+                                ? null
+                                : (value) => _rebuild(() {
+                                    _reasoningModeOverride =
+                                        value.first == 'default'
+                                        ? null
+                                        : value.first;
+                                  }),
+                            showSelectedIcon: false,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Tooltip(
+                        message: webSearchAvailable
+                            ? '初回回答だけWeb検索を許可します。検索利用量が増える場合があります。'
+                            : '現在の実行環境はWeb検索に対応していません。',
+                        child: FilterChip(
+                          key: const Key('composer-web-toggle'),
+                          label: Text(_webSearch ? 'WEB ON' : 'WEB OFF'),
+                          avatar: Icon(
+                            _webSearch
+                                ? Icons.public
+                                : Icons.public_off_outlined,
+                            size: 17,
+                          ),
+                          selected: _webSearch,
+                          onSelected: optionsLocked || !webSearchAvailable
+                              ? null
+                              : (value) => _rebuild(() => _webSearch = value),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Tooltip(
+                        message: '批評と統合へAI名を渡さず、ブランド先入観を減らします。',
+                        child: FilterChip(
+                          label: const Text('BLIND'),
+                          avatar: const Icon(
+                            Icons.visibility_off_outlined,
+                            size: 17,
+                          ),
+                          selected: _blind,
+                          onSelected: optionsLocked
+                              ? null
+                              : (value) => _rebuild(() => _blind = value),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                    ],
+                  ),
+                ],
                 if (_pendingAttachments.isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Wrap(
@@ -792,27 +950,53 @@ extension _HomeScreenView on _HomeScreenState {
     );
   }
 
+  /// APIキー・認証・接続が原因のエラーは、設定画面への復帰導線を添える。
+  /// (原因表示だけだと初見が行き止まりになるため)
+  bool _errorNeedsSettings(String message) => const [
+    'APIキー',
+    '認証',
+    '401',
+    '実行方式',
+    '接続',
+  ].any(message.contains);
+
   Widget _errorBanner(String message) {
     final colors = Theme.of(context).colorScheme;
+    final needsSettings = _errorNeedsSettings(message);
     return Material(
       color: colors.errorContainer,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        child: Row(
+        padding: EdgeInsets.fromLTRB(14, 8, 4, needsSettings ? 4 : 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(Icons.error_outline, color: colors.onErrorContainer),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                message,
-                style: TextStyle(color: colors.onErrorContainer),
+            Row(
+              children: [
+                Icon(Icons.error_outline, color: colors.onErrorContainer),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    message,
+                    style: TextStyle(color: colors.onErrorContainer),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '閉じる',
+                  onPressed: () => _rebuild(() => _error = ''),
+                  icon: Icon(Icons.close, color: colors.onErrorContainer),
+                ),
+              ],
+            ),
+            if (needsSettings)
+              TextButton.icon(
+                key: const Key('error-open-settings'),
+                onPressed: _openSettings,
+                icon: const Icon(Icons.settings_outlined, size: 18),
+                label: const Text('設定を開いてAPIキーを確認'),
+                style: TextButton.styleFrom(
+                  foregroundColor: colors.onErrorContainer,
+                ),
               ),
-            ),
-            IconButton(
-              tooltip: '閉じる',
-              onPressed: () => _rebuild(() => _error = ''),
-              icon: Icon(Icons.close, color: colors.onErrorContainer),
-            ),
           ],
         ),
       ),

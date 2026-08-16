@@ -26,20 +26,32 @@ import orchestrator
 import policy
 import regeneration
 import main
+import api_schemas
+from api_errors import api_error
 from api_models import RegenerationPlanRequest, RegenerationRequest, _valid_request_id
 from runs import RunState
 from sanitizing import _scrub_public, _scrub_public_dict
-from storage import ConversationNotFound, utc_now
+import turn_state
+from storage import ConversationCorrupt, ConversationNotFound, utc_now
 
 
 logger = logging.getLogger("clage_cook")
 
-router = APIRouter()
+router = APIRouter(responses=api_schemas.ERROR_RESPONSES)
 
 
 def _check_auth(request: Request) -> None:
     """main.check_authへの遅延委譲(認証設定の一元管理を維持)。"""
     main.check_auth(request)
+
+
+def _regeneration_id_conflict() -> HTTPException:
+    """復旧手順: 新しいregeneration_idを振り直して再送する。"""
+    return api_error(
+        409,
+        "regeneration_id_conflict_fingerprint",
+        "regeneration_idが異なる要求で使用済みです",
+    )
 
 
 def _regeneration_target(
@@ -55,7 +67,11 @@ def _regeneration_target(
             synthesizer=config.synthesizer_name(),
         )
     except regeneration.TargetError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise api_error(
+            exc.status_code,
+            "regeneration_target_unavailable",
+            str(exc),
+        ) from exc
 
 
 def _regeneration_plan(
@@ -83,7 +99,12 @@ def _regeneration_plan(
             attachment_bundle=attachment_bundle,
         )
     except (regeneration.TargetError, regeneration.PlanError) as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        code = (
+            "regeneration_target_unavailable"
+            if isinstance(exc, regeneration.TargetError)
+            else "regeneration_plan_unavailable"
+        )
+        raise api_error(exc.status_code, code, str(exc)) from exc
 
 
 @router.post(
@@ -95,15 +116,14 @@ async def regeneration_plan(
     turn_request_id: str,
     req: RegenerationPlanRequest,
 ) -> dict[str, Any]:
-    canonical_id = main._canonical_conversation_id(conversation_id)
-    assert canonical_id is not None
+    canonical_id = main._require_conversation_id(conversation_id)
     if not _valid_request_id(turn_request_id):
-        raise HTTPException(status_code=404, detail="対象ターンが見つかりません")
+        raise api_error(404, "turn_not_found", "対象ターンが見つかりません")
     async with main._hold_conversation_lock(canonical_id):
         try:
             conversation_data = await main._blocking_call(main.store.load, canonical_id)
         except ConversationNotFound as exc:
-            raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
+            raise api_error(404, "conversation_not_found", "会話が見つかりません") from exc
         turn_index = main._turn_index_by_request_id(conversation_data, turn_request_id)
         result = await main._blocking_call(
             _regeneration_plan,
@@ -124,14 +144,12 @@ def _enforce_regeneration_confirmations(
         confirm_sensitive_data=req.confirm_sensitive_data,
     )
     if required:
-        raise HTTPException(
-            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
-            detail={
-                "code": "explicit_confirmation_required",
-                "message": "再生成の実API利用には明示確認が必要です。",
-                "required": required,
-                "plan": plan,
-            },
+        raise api_error(
+            status.HTTP_428_PRECONDITION_REQUIRED,
+            "explicit_confirmation_required",
+            "再生成の実API利用には明示確認が必要です。",
+            required=required,
+            plan=plan,
         )
 
 
@@ -154,6 +172,15 @@ async def _mark_regeneration_interrupted(
             )
         except (ConversationNotFound, HTTPException):
             return
+        except ConversationCorrupt:
+            # 終端処理の中なので例外を伝播させず、事実だけ必ず残す。
+            logger.error(
+                "cannot mark regeneration interrupted: conversation file is "
+                "unreadable conversation_id=%s regeneration_id=%s",
+                conversation_id,
+                regeneration_id,
+            )
+            return
         turn = conversation_data["turns"][turn_index]
         attempt = regeneration.find_attempt(turn, regeneration_id)
         if attempt is None or not regeneration.interrupt_attempt(
@@ -175,7 +202,7 @@ def _regeneration_result_payload(
     return _scrub_public_dict(
         {
             "attempt": attempt,
-            "conversation": conversation_data,
+            "conversation": turn_state.public_conversation(conversation_data),
             "replayed": replayed,
         }
     )
@@ -201,10 +228,7 @@ def _saved_regeneration_replay(
     if existing is None:
         return None
     if existing.get("request_fingerprint") != fingerprint:
-        raise HTTPException(
-            status_code=409,
-            detail="regeneration_idが異なる要求で使用済みです",
-        )
+        raise _regeneration_id_conflict()
     if existing.get("status") not in {"completed", "failed", "interrupted"}:
         return None
     return _regeneration_result_payload(
@@ -233,9 +257,10 @@ async def _execute_regeneration(
                         main.store.load, conversation_id
                     )
                 except ConversationNotFound as exc:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="会話が見つかりません",
+                    raise api_error(
+                        404,
+                        "conversation_not_found",
+                        "会話が見つかりません",
                     ) from exc
                 turn_index = main._turn_index_by_request_id(
                     conversation_data,
@@ -246,10 +271,7 @@ async def _execute_regeneration(
                 existing = regeneration.find_attempt(turn, req.regeneration_id)
                 if existing is not None:
                     if existing.get("request_fingerprint") != fingerprint:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="regeneration_idが異なる要求で使用済みです",
-                        )
+                        raise _regeneration_id_conflict()
                     if existing.get("status") in {
                         "completed",
                         "failed",
@@ -261,9 +283,10 @@ async def _execute_regeneration(
                             replayed=True,
                         )
                         return
-                    raise HTTPException(
-                        status_code=409,
-                        detail="同じ再生成attemptが実行中です",
+                    raise api_error(
+                        409,
+                        "regeneration_in_progress",
+                        "同じ再生成attemptが実行中です",
                     )
 
                 attachment_bundle = await main._blocking_call(
@@ -490,17 +513,26 @@ async def _execute_regeneration(
             )
     except asyncio.CancelledError:
         state.terminal_outcome = "cancelled"
-        if reserve_started and not budget_finalized:
-            await main._finalize_budget_after_abort(
+
+        async def finalize_cancellation() -> None:
+            nonlocal budget_finalized
+            if reserve_started and not budget_finalized:
+                await main._finalize_budget_after_abort(
+                    req.regeneration_id,
+                    dispatch_started=dispatch_started,
+                )
+                budget_finalized = True
+            await _mark_regeneration_interrupted(
+                conversation_id,
+                turn_request_id,
                 req.regeneration_id,
-                dispatch_started=dispatch_started,
+                cancelled=True,
             )
-        await _mark_regeneration_interrupted(
-            conversation_id,
-            turn_request_id,
-            req.regeneration_id,
-            cancelled=True,
-        )
+
+        # chat側(_execute_run)と同じく、二重cancelが予算清算とattempt確定を
+        # 分断しないよう完走を保証する。包まないと予約が未清算のまま残り、
+        # attemptがdispatchingで固まる(issue #22)。
+        await main._complete_critical(finalize_cancellation())
         state.failure_status = 409
         state.failure_detail = {
             "code": "regeneration_cancelled",
@@ -545,7 +577,10 @@ async def _execute_regeneration(
             type(exc).__name__,
         )
         state.failure_status = 500
-        state.failure_detail = "再生成に失敗しました"
+        state.failure_detail = {
+            "code": "regeneration_failed",
+            "message": "再生成に失敗しました",
+        }
 
         async def finalize_unexpected_failure() -> None:
             nonlocal budget_finalized
@@ -580,10 +615,9 @@ async def regenerate_turn_result(
     req: RegenerationRequest,
     request: Request,
 ) -> dict[str, Any]:
-    canonical_id = main._canonical_conversation_id(conversation_id)
-    assert canonical_id is not None
+    canonical_id = main._require_conversation_id(conversation_id)
     if not _valid_request_id(turn_request_id):
-        raise HTTPException(status_code=404, detail="対象ターンが見つかりません")
+        raise api_error(404, "turn_not_found", "対象ターンが見つかりません")
     fingerprint = regeneration.fingerprint(
         canonical_id,
         turn_request_id,
@@ -616,10 +650,7 @@ async def regenerate_turn_result(
         or state.request_fingerprint != fingerprint
         or state.conversation_id != canonical_id
     ):
-        raise HTTPException(
-            status_code=409,
-            detail="regeneration_idが異なる要求で使用済みです",
-        )
+        raise _regeneration_id_conflict()
 
     if created:
         try:
@@ -681,10 +712,15 @@ async def regenerate_turn_result(
     elif not state.done:
         await state.wait_finished()
     if state.failure_status is not None:
-        raise HTTPException(
-            status_code=state.failure_status,
-            detail=state.failure_detail,
-        )
+        detail = state.failure_detail
+        if not isinstance(detail, dict) or "code" not in detail:
+            # 統一封筒を壊さないための最後の砦(通常は到達しない)。
+            raise api_error(
+                state.failure_status,
+                "regeneration_failed",
+                "再生成に失敗しました",
+            )
+        raise HTTPException(status_code=state.failure_status, detail=detail)
     result = deepcopy(state.result) if isinstance(state.result, dict) else {}
     if not created and result:
         result["replayed"] = True

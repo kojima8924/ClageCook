@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models.dart';
 import '../services/direct_provider_client.dart';
@@ -42,6 +45,8 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
   late final Map<DirectProvider, String> _modelSelections;
   final Set<DirectProvider> _clearedKeys = {};
   var _saving = false;
+  // 未保存のまま戻ると入力が黙って消えるため、変更の有無を明示的に持つ。
+  var _dirty = false;
   String _error = '';
 
   @override
@@ -143,6 +148,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
         ),
       );
       if (!mounted) return;
+      _dirty = false;
       Navigator.of(context).pop(true);
     } catch (error) {
       if (mounted) setState(() => _error = '保存できませんでした: $error');
@@ -150,6 +156,40 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
       if (mounted) setState(() => _saving = false);
     }
   }
+
+  /// 未保存の入力を黙って捨てない。戻る操作の前に一度だけ確認する。
+  Future<bool> _confirmDiscard() async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.warning_amber_rounded),
+          title: const Text('保存していない変更があります'),
+          content: const Text('入力したAPIキーや設定はまだ保存されていません。破棄して前の画面へ戻りますか？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('編集を続ける'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('破棄して戻る'),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+
+  Future<void> _handlePop(bool didPop) async {
+    if (didPop) return;
+    final discard = await _confirmDiscard();
+    if (!discard || !mounted) return;
+    Navigator.of(context).pop(false);
+  }
+
+  void _markDirty(VoidCallback change) => setState(() {
+    change();
+    _dirty = true;
+  });
 
   Future<void> _openServerSettings() async {
     final changed = await Navigator.of(context).push<bool>(
@@ -207,83 +247,129 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final direct = _mode == ExecutionMode.directByok;
-    return Scaffold(
-      appBar: AppBar(title: const Text('接続とBYOK設定')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          Text('実行方式', style: theme.textTheme.titleLarge),
-          const SizedBox(height: 12),
-          if (widget.allowReferenceServer && widget.allowDirectByok)
-            SegmentedButton<ExecutionMode>(
-              segments: const [
-                ButtonSegment(
-                  value: ExecutionMode.directByok,
-                  icon: Icon(Icons.phone_android),
-                  label: Text('Direct BYOK'),
-                ),
-                ButtonSegment(
-                  value: ExecutionMode.referenceServer,
-                  icon: Icon(Icons.developer_mode),
-                  label: Text('開発用サーバー'),
-                ),
-              ],
-              selected: {_mode},
-              onSelectionChanged: _saving
-                  ? null
-                  : (values) => setState(() {
-                      _mode = values.first;
-                      _error = '';
-                    }),
-            )
-          else if (widget.allowDirectByok)
+    return PopScope(
+      canPop: !_dirty,
+      onPopInvokedWithResult: (didPop, _) => unawaited(_handlePop(didPop)),
+      child: Scaffold(
+        appBar: AppBar(title: const Text('設定')),
+        // 初回に必要な操作(APIキー入力)を最上部へ置く。実行方式などの
+        // 変更頻度が低い設定は下へ回す。
+        body: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+          children: [
             _SettingsNotice(
-              icon: Icons.verified_user_outlined,
-              color: theme.colorScheme.secondaryContainer,
-              text: '配布版はDirect BYOK専用です。開発用サーバー切替はDebug/Profileビルドだけで利用できます。',
-            )
-          else
-            _SettingsNotice(
-              icon: Icons.web_asset_off_outlined,
-              color: theme.colorScheme.errorContainer,
-              text:
-                  'Web版はAPIキーを保存せず、開発用サーバーだけを利用します。Direct BYOKはAndroid・iOS・Desktopで使用してください。',
+              icon: direct ? Icons.lock_outline : Icons.science_outlined,
+              color: direct
+                  ? theme.colorScheme.secondaryContainer
+                  : theme.colorScheme.tertiaryContainer,
+              // 送信先とデータ取扱いの開示は残したまま、2枚の注意カードを1枚へ
+              // まとめてAPIキー入力を1画面目に収める。
+              text: direct
+                  ? 'APIキーだけで各社のAPIへ端末から直接接続します。質問・添付・会議用の回答は選んだ各社へ送信され、'
+                        '料金とデータ取扱いは各社の規約に従います。会話はこの端末だけに保存され、'
+                        'Clage Cookの開発者サーバーは通信を中継しません。'
+                  : 'UI比較・検証用です。このリポジトリのOSS FastAPIサーバーへ接続します。',
             ),
-          const SizedBox(height: 12),
-          _SettingsNotice(
-            icon: direct ? Icons.lock_outline : Icons.science_outlined,
-            color: direct
-                ? theme.colorScheme.secondaryContainer
-                : theme.colorScheme.tertiaryContainer,
-            text: direct
-                ? 'APIキーだけで各社へ直接接続します。会話はこの端末だけに保存されます。'
-                : 'UI比較・検証用です。このリポジトリのOSS FastAPIサーバーへ接続します。',
-          ),
-          ..._conferenceDefaultFields(theme),
-          if (direct) ..._directFields(theme) else ..._serverFields(theme),
-          if (_error.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            _SettingsNotice(
-              icon: Icons.error_outline,
-              color: theme.colorScheme.errorContainer,
-              text: _error,
-            ),
+            if (direct) ..._directFields(theme) else ..._serverFields(theme),
+            ..._conferenceDefaultFields(theme),
+            ..._executionModeFields(theme),
           ],
-          const SizedBox(height: 20),
-          FilledButton.icon(
-            onPressed: _saving ? null : _save,
-            icon: _saving
-                ? const SizedBox.square(
-                    dimension: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.save_outlined),
-            label: const Text('実行方式を保存'),
-          ),
-        ],
+        ),
+        // 保存ボタンは最下部まで送らず固定する(画面外の保存は押し忘れの原因)。
+        bottomNavigationBar: _saveBar(theme),
       ),
     );
   }
+
+  Widget _saveBar(ThemeData theme) => Material(
+    elevation: 8,
+    color: theme.colorScheme.surfaceContainer,
+    child: SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 保存エラーは保存ボタンの近くに出す(一覧末尾だと画面外で気付けない)。
+            if (_error.isNotEmpty) ...[
+              _SettingsNotice(
+                icon: Icons.error_outline,
+                color: theme.colorScheme.errorContainer,
+                text: _error,
+              ),
+              const SizedBox(height: 10),
+            ],
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _dirty ? '未保存の変更があります' : '変更はありません',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: _dirty
+                          ? theme.colorScheme.error
+                          : theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                FilledButton.icon(
+                  onPressed: _saving ? null : _save,
+                  icon: _saving
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.save_outlined),
+                  label: const Text('設定を保存'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  List<Widget> _executionModeFields(ThemeData theme) => [
+    const SizedBox(height: 28),
+    Text('実行方式', style: theme.textTheme.titleLarge),
+    const SizedBox(height: 12),
+    if (widget.allowReferenceServer && widget.allowDirectByok)
+      SegmentedButton<ExecutionMode>(
+        segments: const [
+          ButtonSegment(
+            value: ExecutionMode.directByok,
+            icon: Icon(Icons.phone_android),
+            label: Text('Direct BYOK'),
+          ),
+          ButtonSegment(
+            value: ExecutionMode.referenceServer,
+            icon: Icon(Icons.developer_mode),
+            label: Text('開発用サーバー'),
+          ),
+        ],
+        selected: {_mode},
+        onSelectionChanged: _saving
+            ? null
+            : (values) => _markDirty(() {
+                _mode = values.first;
+                _error = '';
+              }),
+      )
+    else if (widget.allowDirectByok)
+      _SettingsNotice(
+        icon: Icons.verified_user_outlined,
+        color: theme.colorScheme.secondaryContainer,
+        text: '配布版はDirect BYOK専用です。開発用サーバー切替はDebug/Profileビルドだけで利用できます。',
+      )
+    else
+      _SettingsNotice(
+        icon: Icons.web_asset_off_outlined,
+        color: theme.colorScheme.errorContainer,
+        text: 'Web版はAPIキーを保存せず、開発用サーバーだけを利用します。Direct BYOKはAndroid・iOS・Desktopで使用してください。',
+      ),
+  ];
 
   List<Widget> _conferenceDefaultFields(ThemeData theme) => [
     const SizedBox(height: 28),
@@ -305,7 +391,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
         DropdownMenuItem(value: ReasoningMode.high, child: Text('HIGH')),
       ],
       onChanged: (value) {
-        if (value != null) setState(() => _reasoningMode = value);
+        if (value != null) _markDirty(() => _reasoningMode = value);
       },
     ),
     const SizedBox(height: 6),
@@ -323,9 +409,10 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
         value: _showTokenUsageLedger,
         onChanged: _saving
             ? null
-            : (value) => setState(() => _showTokenUsageLedger = value),
+            : (value) => _markDirty(() => _showTokenUsageLedger = value),
         secondary: const Icon(Icons.receipt_long_outlined),
-        title: const Text('トークン利用量台帳を表示'),
+        // スイッチに幅を取られて不自然な位置で折り返すため、見出しは短くする。
+        title: const Text('利用量台帳'),
         subtitle: const Text(
           '会話内にProvider実測値の折りたたみ台帳を表示します。'
           'OFFでもusageの取得・端末保存・エクスポートは続きます。',
@@ -340,9 +427,9 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
         value: _showLiveApiConfirmation,
         onChanged: _saving
             ? null
-            : (value) => setState(() => _showLiveApiConfirmation = value),
+            : (value) => _markDirty(() => _showLiveApiConfirmation = value),
         secondary: const Icon(Icons.payments_outlined),
-        title: const Text('「実APIを使用します」の確認を表示'),
+        title: const Text('実API利用の確認'),
         subtitle: const Text(
           'OFFにすると通常の課金可能性の確認だけを省略します。'
           '秘密情報・個人情報などpolicy上必要な確認は常に表示します。',
@@ -352,18 +439,11 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
   ];
 
   List<Widget> _directFields(ThemeData theme) => [
-    const SizedBox(height: 28),
-    _SettingsNotice(
-      icon: Icons.outbound_outlined,
-      color: theme.colorScheme.surfaceContainerHighest,
-      text:
-          '選択した各社へ質問・添付・会議用の回答を端末から直接送信します。各社で料金とデータ取扱いが異なります。Clage Cookの開発者サーバーは通信を中継しません。',
-    ),
-    const SizedBox(height: 18),
-    Text('AIプロバイダー', style: theme.textTheme.titleLarge),
+    const SizedBox(height: 22),
+    Text('AIプロバイダー（APIキー）', style: theme.textTheme.titleLarge),
     const SizedBox(height: 4),
     const Text(
-      '閉じたままキー・接続確認・モデルの概要を確認できます。'
+      '使いたいAIの行を開いてAPIキーを入力し、画面下の「設定を保存」を押してください。1社だけでも会議は動きます。'
       '保存済みキーは画面へ読み戻さず、新規入力も常にマスク表示します。',
     ),
     const SizedBox(height: 12),
@@ -396,7 +476,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
             child: Text(DirectProviderClient.labels[provider]!),
           ),
       ],
-      onChanged: (value) => setState(() => _synthesizer = value),
+      onChanged: (value) => _markDirty(() => _synthesizer = value),
     ),
   ];
 
@@ -478,14 +558,17 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
             autocorrect: false,
             enableSuggestions: false,
             decoration: InputDecoration(
-              labelText: '$label APIキー（更新時だけ入力）',
-              helperText: hasSavedKey ? '空欄のままなら保存済み値を維持' : null,
+              labelText: '$label APIキー',
+              helperText: hasSavedKey
+                  ? '保存済みです。変更する時だけ入力してください（空欄なら現在のキーを維持）。'
+                  : '各社のコンソールで発行したキーを貼り付けてください。',
+              helperMaxLines: 2,
               border: const OutlineInputBorder(),
               prefixIcon: const Icon(Icons.key_outlined),
               suffixIcon: configured
                   ? IconButton(
                       tooltip: 'このキーを削除予定にする',
-                      onPressed: () => setState(() {
+                      onPressed: () => _markDirty(() {
                         _clearedKeys.add(provider);
                         _keyControllers[provider]!.clear();
                       }),
@@ -493,11 +576,20 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                     )
                   : null,
             ),
-            onChanged: (value) => setState(() {
+            onChanged: (value) => _markDirty(() {
               if (value.trim().isNotEmpty) {
                 _clearedKeys.remove(provider);
               }
             }),
+          ),
+          // キーの入手先が分からないと初回で詰まるため、発行ページを直接開けるようにする。
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => _openConsole(provider),
+              icon: const Icon(Icons.open_in_new, size: 18),
+              label: Text('$labelのAPIキー発行ページを開く'),
+            ),
           ),
           const SizedBox(height: 14),
           DropdownButtonFormField<String>(
@@ -528,7 +620,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
             ],
             onChanged: (value) {
               if (value == null) return;
-              setState(() {
+              _markDirty(() {
                 final previous = _modelSelections[provider];
                 _modelSelections[provider] = value;
                 if (value == _tierDefaultModelChoice) {
@@ -556,12 +648,20 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                 helperText: '公式APIで利用できるIDのみ入力してください。',
                 border: const OutlineInputBorder(),
               ),
-              onChanged: (_) => setState(() {}),
+              onChanged: (_) => _markDirty(() {}),
             ),
           ],
         ],
       ),
     );
+  }
+
+  Future<void> _openConsole(DirectProvider provider) async {
+    final uri = Uri.parse(_providerConsoleUrls[provider]!);
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!opened && mounted) {
+      setState(() => _error = 'ブラウザを開けませんでした: $uri');
+    }
   }
 
   String _modelSummary(DirectProvider provider) {
@@ -580,6 +680,14 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
 
 const _tierDefaultModelChoice = '__tier_default__';
 const _customModelChoice = '__custom__';
+
+/// 各社のAPIキー発行ページ。キーの入手先が分からないままでは初回導線が止まる。
+const _providerConsoleUrls = {
+  DirectProvider.claude: 'https://console.anthropic.com/settings/keys',
+  DirectProvider.gemini: 'https://aistudio.google.com/apikey',
+  DirectProvider.chatgpt: 'https://platform.openai.com/api-keys',
+  DirectProvider.grok: 'https://console.x.ai/',
+};
 
 String _modelSelectionFor(DirectProvider provider, String override) {
   final normalized = override.trim();

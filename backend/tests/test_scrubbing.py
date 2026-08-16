@@ -3,13 +3,13 @@
 from copy import deepcopy
 from typing import NamedTuple
 
-from scrubbing import KNOWN_SECRET_MARKER, scrub_public_data, scrub_text
+from scrubbing import KNOWN_SECRET_MARKER, scrub_public_data
 
 
 def test_known_secret_replacement_precedes_policy_scan():
     secret = "sk-proj-" + "a" * 32
 
-    scrubbed = scrub_text(
+    scrubbed = scrub_public_data(
         f"exact={secret} embedded=before-{secret}-after",
         known_secrets=[secret],
     )
@@ -22,7 +22,7 @@ def test_known_secret_replacement_precedes_policy_scan():
 def test_policy_scan_redacts_api_key_like_text_without_known_secrets():
     secret = "xai-" + "b" * 32
 
-    scrubbed = scrub_text(f"誤って貼った値: {secret}")
+    scrubbed = scrub_public_data(f"誤って貼った値: {secret}")
 
     assert secret not in scrubbed
     assert "REDACTED:xai_api_key" in scrubbed
@@ -31,7 +31,7 @@ def test_policy_scan_redacts_api_key_like_text_without_known_secrets():
 def test_confirm_only_personal_data_is_preserved():
     text = "連絡先は user@example.com です。"
 
-    assert scrub_text(text) == text
+    assert scrub_public_data(text) == text
 
 
 def test_nested_containers_keep_types_and_original_is_not_modified():

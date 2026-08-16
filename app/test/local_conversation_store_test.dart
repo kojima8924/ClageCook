@@ -41,10 +41,11 @@ void main() {
       expect(saved.storageRevision, 2);
       expect(saved.value['created_at'], '2026-07-19T01:02:03.456Z');
       expect(saved.value['updated_at'], '2026-07-19T01:03:00.000Z');
-      final summaries = await repository.list();
-      expect(summaries, hasLength(1));
-      expect(summaries.single.turnCount, 1);
-      expect(summaries.single.preview, '海のまとめです。');
+      final listing = await repository.list();
+      expect(listing.defects, isEmpty);
+      expect(listing.items, hasLength(1));
+      expect(listing.items.single.turnCount, 1);
+      expect(listing.items.single.preview, '海のまとめです。');
 
       final manifest = values.values.entries.singleWhere(
         (entry) => entry.key.endsWith('.manifest'),
@@ -116,52 +117,6 @@ void main() {
       expect((await repository.read(created.id))!.value['title'], 'old');
     });
 
-    test('direct BYOKとreference server、server同士の履歴を混在させない', () async {
-      final values = MemoryLocalConversationValueStore();
-      final direct = SharedPreferencesLocalConversationRepository(
-        namespace: LocalConversationNamespace.directByok,
-        valueStore: values,
-      );
-      final referenceA = SharedPreferencesLocalConversationRepository(
-        namespace: LocalConversationNamespace.referenceServer(
-          'https://Example.test/clage/',
-        ),
-        valueStore: values,
-      );
-      final referenceB = SharedPreferencesLocalConversationRepository(
-        namespace: LocalConversationNamespace.referenceServer(
-          'https://other.example.test',
-        ),
-        valueStore: values,
-      );
-
-      await direct.create(firstMessage: 'direct', conversationId: 'same-id');
-      await referenceA.create(
-        firstMessage: 'reference-a',
-        conversationId: 'same-id',
-      );
-      await referenceB.create(
-        firstMessage: 'reference-b',
-        conversationId: 'same-id',
-      );
-
-      expect((await direct.read('same-id'))!.value['title'], 'direct');
-      expect((await referenceA.read('same-id'))!.value['title'], 'reference-a');
-      expect((await referenceB.read('same-id'))!.value['title'], 'reference-b');
-      expect(
-        values.values.keys.where((key) => key.endsWith('.manifest')),
-        hasLength(3),
-      );
-      expect(
-        LocalConversationNamespace.referenceServer(
-          'https://Example.test/clage/',
-        ),
-        LocalConversationNamespace.referenceServer(
-          'https://example.test/clage',
-        ),
-      );
-    });
-
     test('検索、rename、memory更新、JSON exportをrevision付きで行う', () async {
       final values = MemoryLocalConversationValueStore();
       var now = DateTime.utc(2026, 7, 19, 2);
@@ -201,9 +156,9 @@ void main() {
         expectedStorageRevision: memory.storageRevision,
       );
 
-      expect(await repository.search('三分 湯温'), hasLength(1));
-      expect(await repository.search('アッサム'), hasLength(1));
-      expect(await repository.search('コーヒー'), isEmpty);
+      expect((await repository.search('三分 湯温')).items, hasLength(1));
+      expect((await repository.search('アッサム')).items, hasLength(1));
+      expect((await repository.search('コーヒー')).items, isEmpty);
       expect(renamed.value['memory'], containsPair('revision', 1));
       expect(renamed.value['memory'], containsPair('text', 'アッサムを使う'));
 
@@ -303,7 +258,7 @@ void main() {
       );
 
       expect(await repository.read(created.id), isNull);
-      expect(await repository.list(), isEmpty);
+      expect((await repository.list()).items, isEmpty);
       expect(
         values.values.keys.where((key) => key.contains('.record.')),
         isEmpty,
@@ -330,6 +285,104 @@ void main() {
         repository.read(created.id),
         throwsA(isA<LocalConversationCorruption>()),
       );
+    });
+
+    test('破損record 1件でも健全な会話の一覧・検索は返る', () async {
+      final values = MemoryLocalConversationValueStore();
+      final repository = SharedPreferencesLocalConversationRepository(
+        namespace: LocalConversationNamespace.directByok,
+        valueStore: values,
+      );
+      await repository.create(firstMessage: '健全な会話', conversationId: 'healthy');
+      await repository.create(firstMessage: '壊れる会話', conversationId: 'broken');
+      final brokenKey = values.values.keys.singleWhere(
+        (key) =>
+            key.contains('.record.') &&
+            key.contains(base64Url.encode(utf8.encode('broken'))),
+      );
+      values.values[brokenKey] = 'not-json';
+
+      final listing = await repository.list();
+      expect(listing.items.map((item) => item.id), ['healthy']);
+      expect(listing.defects, hasLength(1));
+      expect(listing.defects.single.conversationId, 'broken');
+      expect(listing.hasDefects, isTrue);
+
+      final searched = await repository.search('健全');
+      expect(searched.items.map((item) => item.id), ['healthy']);
+      expect(searched.defects, hasLength(1));
+
+      // 健全な会話は破損の巻き添えにならず、そのまま開いてexportできる。
+      expect((await repository.read('healthy'))!.value['title'], '健全な会話');
+      expect(await repository.exportJson('healthy'), contains('健全な会話'));
+      // 特定の会話を開く経路はfail-closedのまま。
+      await expectLater(
+        repository.read('broken'),
+        throwsA(isA<LocalConversationCorruption>()),
+      );
+    });
+
+    test('manifest entryが壊れても他の会話は読め、compactは物理削除を控える', () async {
+      final values = MemoryLocalConversationValueStore();
+      final repository = SharedPreferencesLocalConversationRepository(
+        namespace: LocalConversationNamespace.directByok,
+        valueStore: values,
+      );
+      await repository.create(firstMessage: '健全な会話', conversationId: 'healthy');
+      final manifestKey = values.values.keys.singleWhere(
+        (key) => key.endsWith('.manifest'),
+      );
+      final manifest =
+          jsonDecode(values.values[manifestKey]!) as Map<String, dynamic>;
+      (manifest['entries'] as Map)['broken'] = 'ゼロ';
+      values.values[manifestKey] = jsonEncode(manifest);
+      final orphan =
+          '${values.values.keys.firstWhere((key) => key.contains('.record.'))}999';
+      values.values[orphan] = '{"orphan":true}';
+
+      final listing = await repository.list();
+      expect(listing.items.map((item) => item.id), ['healthy']);
+      expect(listing.defects.single.conversationId, 'broken');
+
+      await repository.compact();
+      expect(values.values, contains(orphan));
+    });
+
+    test('quarantineはmanifestから外してもrecordを保持し、rebuildで復旧できる', () async {
+      final values = MemoryLocalConversationValueStore();
+      final repository = SharedPreferencesLocalConversationRepository(
+        namespace: LocalConversationNamespace.directByok,
+        valueStore: values,
+      );
+      await repository.create(firstMessage: '健全な会話', conversationId: 'healthy');
+      await repository.create(firstMessage: '壊れる会話', conversationId: 'broken');
+      final brokenKey = values.values.keys.singleWhere(
+        (key) =>
+            key.contains('.record.') &&
+            key.contains(base64Url.encode(utf8.encode('broken'))),
+      );
+      final brokenRaw = values.values[brokenKey]!;
+      values.values[brokenKey] = 'not-json';
+
+      expect(await repository.quarantine(const ['broken']), 1);
+      final afterQuarantine = await repository.list();
+      expect(afterQuarantine.items.map((item) => item.id), ['healthy']);
+      expect(afterQuarantine.defects, isEmpty);
+      // 端末が正本なので、隔離してもrecordは端末内に残す。
+      expect(
+        values.values.values.where((value) => value == 'not-json'),
+        hasLength(1),
+      );
+
+      // 壊れたrecordを直せば、明示操作でindexを組み直して復帰できる。
+      values.values[brokenKey] = brokenRaw;
+      expect(await repository.rebuildManifestFromRecords(), 2);
+      final rebuilt = await repository.list();
+      expect(
+        rebuilt.items.map((item) => item.id),
+        containsAll(['healthy', 'broken']),
+      );
+      expect(rebuilt.defects, isEmpty);
     });
 
     test('compactはmanifestから到達不能なcrash orphanだけを除去する', () async {
@@ -371,7 +424,7 @@ void main() {
       ]);
 
       expect(
-        (await first.list()).map((item) => item.id),
+        (await first.list()).items.map((item) => item.id),
         containsAll(['first', 'second']),
       );
     });

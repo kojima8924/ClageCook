@@ -29,16 +29,6 @@ def scrub_public_data(
     return _scrub(value, secret_pattern)
 
 
-def scrub_text(
-    value: str,
-    *,
-    known_secrets: Iterable[str] | str | None = None,
-) -> str:
-    """単一文字列へ既知secret置換とpolicy検査を順番に適用する。"""
-
-    return _scrub_text(value, _known_secret_pattern(known_secrets))
-
-
 def _known_secret_pattern(
     known_secrets: Iterable[str] | str | None,
 ) -> re.Pattern[str] | None:

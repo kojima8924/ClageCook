@@ -72,7 +72,7 @@ void main() {
     expect(find.byIcon(Icons.send), findsOneWidget);
   });
 
-  testWidgets('モバイルのcomposerは2段の操作帯と入力欄へ収まる', (tester) async {
+  testWidgets('モバイルのcomposerは参加AI帯と入力欄だけを既定表示する', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -81,6 +81,17 @@ void main() {
       ClageCookApp(repository: _MemorySettings(), autoload: false),
     );
 
+    // 参加AIの選択は常時表示、品質などの詳細は畳んでおく。
+    expect(find.byKey(const Key('composer-provider-strip')), findsOneWidget);
+    expect(find.text('参加AI'), findsOneWidget);
+    expect(find.byKey(const Key('composer-quality-strip')), findsNothing);
+    expect(find.byKey(const Key('composer-effort-strip')), findsNothing);
+    final collapsed = tester.getSize(find.byKey(const Key('composer'))).height;
+    expect(collapsed, lessThanOrEqualTo(140));
+
+    await tester.tap(find.byKey(const Key('composer-options-toggle')));
+    await tester.pumpAndSettle();
+
     expect(find.byKey(const Key('composer-quality-strip')), findsOneWidget);
     expect(find.byKey(const Key('composer-effort-strip')), findsOneWidget);
     expect(find.byKey(const Key('composer-tier-selector')), findsOneWidget);
@@ -88,8 +99,81 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(
       tester.getSize(find.byKey(const Key('composer'))).height,
-      lessThanOrEqualTo(180),
+      lessThanOrEqualTo(240),
     );
+  });
+
+  testWidgets('幅320の小型端末でもcomposerが破綻しない', (tester) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      ClageCookApp(repository: _MemorySettings(), autoload: false),
+    );
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+
+    await tester.tap(find.byKey(const Key('composer-options-toggle')));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(
+      tester.getSize(find.byKey(const Key('composer'))).width,
+      lessThanOrEqualTo(320),
+    );
+  });
+
+  testWidgets('参加できるAIが無い時は原因と設定導線を示す', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final paths = <String>[];
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        paths.add(request.url.path);
+        if (request.url.path == '/api/settings') {
+          return _widgetJsonResponse({
+            'mode': 'mixed',
+            'live_api_enabled': true,
+            'providers': <Object>[],
+            'active_workers': <Object>[],
+            'synthesizer': 'none',
+            'auth_required': false,
+          });
+        }
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // 候補が無い状態でもcomposerに設定導線を出す。
+    expect(find.byKey(const Key('composer-setup-providers')), findsOneWidget);
+
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField && widget.decoration?.hintText == '質問を入力…',
+      ),
+      'キー未設定の送信',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    // 「選んでください」ではなく真因(キー未設定)を出し、復帰導線を添える。
+    expect(find.textContaining('APIキーが1つも設定されていない'), findsOneWidget);
+    expect(find.byKey(const Key('error-open-settings')), findsOneWidget);
+    expect(paths, isNot(contains('/api/chat')));
+    client.close();
   });
 
   testWidgets('キーボードから全文検索と新規会話を呼び出せる', (tester) async {
@@ -138,7 +222,10 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('新しい会話'), findsOneWidget);
-    expect(find.textContaining('Ctrl/Cmd+K'), findsOneWidget);
+    // キーボードのないAndroidではPC専用ショートカットの案内を出さない。
+    expect(find.textContaining('Ctrl/Cmd+K'), findsNothing);
+    expect(find.text('最大200文字'), findsOneWidget);
+    expect(find.text('設定（APIキー・実行方式）'), findsOneWidget);
     expect(
       find.byWidgetPredicate(
         (widget) =>
@@ -301,6 +388,8 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('composer-options-toggle')));
+    await tester.pumpAndSettle();
 
     expect(find.text('品質'), findsOneWidget);
     expect(find.text('エフォート'), findsOneWidget);
@@ -423,10 +512,13 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('実APIを使用します'), findsOneWidget);
-    expect(find.text('実行して次回から表示しない'), findsOneWidget);
+    expect(find.text('次回からこの確認を表示しない'), findsOneWidget);
     expect(chatCalls, 0);
 
-    await tester.tap(find.text('実行して次回から表示しない'));
+    // 肯定ボタンと同格に並べず、チェックボックスの明示操作を要求する。
+    await tester.tap(find.byKey(const Key('billable-disable-future')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('確認して実行'));
     await tester.pumpAndSettle();
     expect(directRepository.value.showLiveApiConfirmation, isFalse);
     expect(chatCalls, 1);
@@ -504,7 +596,7 @@ void main() {
 
     expect(find.text('個人情報らしい内容を外部送信します'), findsOneWidget);
     expect(find.textContaining('個人情報らしい文字列'), findsOneWidget);
-    expect(find.text('実行して次回から表示しない'), findsNothing);
+    expect(find.byKey(const Key('billable-disable-future')), findsNothing);
     expect(chatCalls, 0);
 
     await tester.tap(find.text('確認して実行'));
@@ -545,7 +637,9 @@ void main() {
     );
     await tester.tap(find.byIcon(Icons.send));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('実行して次回から表示しない'));
+    await tester.tap(find.byKey(const Key('billable-disable-future')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('確認して実行'));
     await tester.pumpAndSettle();
 
     expect(chatCalls, 0);
@@ -619,7 +713,7 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse([_completedConversationSummary()]);
+          return _widgetJsonResponse(_conversationListBody([_completedConversationSummary()]));
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(_completedConversation());
@@ -674,7 +768,7 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse([_completedConversationSummary()]);
+          return _widgetJsonResponse(_conversationListBody([_completedConversationSummary()]));
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(_completedConversation());
@@ -710,7 +804,7 @@ void main() {
 
     expect(find.text('個人情報らしい内容を外部送信します'), findsOneWidget);
     expect(find.textContaining('個人情報らしい文字列'), findsOneWidget);
-    expect(find.text('実行して次回から表示しない'), findsNothing);
+    expect(find.byKey(const Key('billable-disable-future')), findsNothing);
     expect(regenerateBody, isNull);
 
     await tester.tap(find.text('確認して実行'));
@@ -817,6 +911,8 @@ void main() {
     expect(find.byIcon(Icons.stop), findsOneWidget);
     expect(tester.widget<TextField>(messageField).enabled, isTrue);
     await tester.enterText(messageField, '次回の下書き');
+    await tester.tap(find.byKey(const Key('composer-options-toggle')));
+    await tester.pumpAndSettle();
     final tierSelector = find.byKey(const Key('composer-tier-selector'));
     expect(
       tester.widget<SegmentedButton<String>>(tierSelector).onSelectionChanged,
@@ -964,7 +1060,7 @@ void main() {
     expect(find.text('保存後の結論'), findsOneWidget);
   });
 
-  testWidgets('再読込したrunningターンへraw requestのまま安全に再接続する', (tester) async {
+  testWidgets('再読込したrunningターンは保存済み同意を再送せず再確認する', (tester) async {
     tester.view.physicalSize = const Size(1200, 800);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -975,7 +1071,7 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse([
+          return _widgetJsonResponse(_conversationListBody([
             {
               'id': 'conversation-id',
               'title': '復旧会議',
@@ -983,7 +1079,7 @@ void main() {
               'turn_count': 1,
               'preview': '継続中',
             },
-          ]);
+          ]));
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(
@@ -1005,7 +1101,7 @@ void main() {
             },
           );
         }
-        return _preflightResponse(request, billable: false);
+        return _preflightResponse(request, billable: true);
       }),
     );
     await tester.pumpWidget(
@@ -1021,6 +1117,13 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.tap(find.text('実行へ再接続'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    // 保存されたconfirm_*をそのまま送り返さず、その場で課金確認を取り直す。
+    expect(resumedBody, isNull);
+    expect(find.text('実APIを使用します'), findsOneWidget);
+    await tester.tap(find.text('確認して実行'));
     await tester.pumpAndSettle();
 
     expect(resumedBody?['request_id'], 'saved-running-request');
@@ -1028,8 +1131,61 @@ void main() {
     expect(resumedBody?['tier'], 'balanced');
     expect(resumedBody?['providers'], isNull);
     expect(resumedBody?['confirm_live_api'], isTrue);
-    expect(resumedBody?['confirm_sensitive_data'], isTrue);
+    expect(resumedBody?['confirm_sensitive_data'], isFalse);
     expect(find.textContaining('サーバー停止で中断'), findsOneWidget);
+  });
+
+  testWidgets('再接続の課金確認をキャンセルすれば実行を再送しない', (tester) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    var chatCalls = 0;
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        if (request.url.path == '/api/conversations') {
+          return _widgetJsonResponse(_conversationListBody([
+            {
+              'id': 'conversation-id',
+              'title': '復旧会議',
+              'updated_at': '2026-07-18T00:00:00Z',
+              'turn_count': 1,
+              'preview': '継続中',
+            },
+          ]));
+        }
+        if (request.url.path == '/api/conversations/conversation-id') {
+          return _widgetJsonResponse(_savedRunningConversation(running: true));
+        }
+        if (request.url.path == '/api/chat') {
+          chatCalls++;
+        }
+        return _preflightResponse(request, billable: true);
+      }),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          repository: _MemorySettings(),
+          clientFactory: (_) => client,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('復旧会議'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('実行へ再接続'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('実APIを使用します'), findsOneWidget);
+    await tester.tap(find.text('キャンセル'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(chatCalls, 0);
+    expect(find.text('実行へ再接続'), findsOneWidget);
   });
 
   testWidgets('再読込したrunningターンの停止競合で失敗終端を通知する', (tester) async {
@@ -1043,7 +1199,7 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse([
+          return _widgetJsonResponse(_conversationListBody([
             {
               'id': 'conversation-id',
               'title': '停止会議',
@@ -1051,7 +1207,7 @@ void main() {
               'turn_count': 1,
               'preview': '継続中',
             },
-          ]);
+          ]));
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(
@@ -1250,7 +1406,7 @@ http.Response _preflightResponse(
         },
       });
     case '/api/conversations':
-      return _widgetJsonResponse(<Object>[]);
+      return _widgetJsonResponse(_conversationListBody(<Object>[]));
     case '/api/policy/scan':
       return _widgetJsonResponse({
         'action': policyAction,
@@ -1378,3 +1534,10 @@ class _SilentSseClient extends http.BaseClient {
     unawaited(_chat.close());
   }
 }
+
+/// `GET /api/conversations` の items 封筒(0.2.0で裸の配列から変更)。
+Map<String, Object> _conversationListBody(List<Object> items) => {
+  'items': items,
+  'corrupt_count': 0,
+  'corrupt': <Object>[],
+};

@@ -94,7 +94,7 @@ _RULES = (
         "block",
         re.compile(
             r"\b(?:OPENAI|ANTHROPIC|GEMINI|GOOGLE|XAI|CLAUDE|GROK|CLAGE)"
-            r"(?:_[A-Z0-9]+)*_(?:API_)?(?:KEY|TOKEN)\s*[:=]\s*[\"']?"
+            r"""(?:_[A-Z0-9]+)*_(?:API_)?(?:KEY|TOKEN)\s*[:=]\s*["']?"""
             r"([A-Za-z0-9._~+/-]{16,}={0,2})",
             re.IGNORECASE,
         ),
@@ -107,8 +107,8 @@ _RULES = (
         re.compile(
             r"\b(?:AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|DATABASE_URL|"
             r"[A-Z][A-Z0-9_]{1,64}(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|"
-            r"PRIVATE_KEY|ACCESS_TOKEN))\s*[:=]\s*[\"']?"
-            r"([^\s\"']{8,})",
+            r"""PRIVATE_KEY|ACCESS_TOKEN))\s*[:=]\s*["']?"""
+            r"""([^\s"']{8,})""",
             re.IGNORECASE,
         ),
         secret_group=1,

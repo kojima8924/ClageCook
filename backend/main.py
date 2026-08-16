@@ -21,7 +21,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import api_schemas
 import config
+from api_errors import api_error
 # 再export: 旧来のmain.PlanRequest等を参照するテスト・呼出元との互換維持。
 from api_models import (
     ChatRequest,
@@ -57,10 +59,15 @@ from runs import ConversationLockPool, RunRegistry, RunState, SlidingWindowLimit
 from runs import run_blocking as _blocking_call
 from storage import (
     AmbiguousRequestId,
+    ConversationCorrupt,
     ConversationNotFound,
+    SUPPORTED_SCHEMA_VERSIONS,
+    ConversationSchemaUnsupported,
     ConversationStore,
+    RequestIndexIncomplete,
     utc_now,
 )
+import turn_state
 from runtime_settings import RuntimeSettingsConflict, RuntimeSettingsError
 
 
@@ -134,7 +141,31 @@ class _SingleProcessGuard:
 _single_process_guard = _SingleProcessGuard(config.DATA_DIR / ".server.lock")
 
 
+def _warn_about_ineffective_environment() -> None:
+    """指定値がそのまま効いていない環境変数を、起動時に必ず可視化する。
+
+    不正値を黙って既定へ落としたり、範囲外を黙ってクランプすると、利用者は
+    自分の設定が効いていないことに気付けない(例: 上限1800を超える指定)。
+    """
+    for adjustment in config.ENV_ADJUSTMENTS:
+        logger.warning(
+            "environment variable %s=%r was not applied as given "
+            "(effective=%s, reason=%s)",
+            adjustment["name"],
+            adjustment["requested"],
+            adjustment["effective"],
+            adjustment["reason"],
+        )
+    for old_name, new_name in config.deprecated_env_names():
+        logger.warning(
+            "environment variable %s is no longer read. rename it to %s.",
+            old_name,
+            new_name,
+        )
+
+
 def _validate_startup_safety() -> None:
+    _warn_about_ineffective_environment()
     budget_guard.validate_configuration()
     if (config.LIVE_API_ENABLED or config.ADMIN_TELEMETRY_ENABLED) and not config.AUTH_TOKEN:
         raise RuntimeError(
@@ -181,6 +212,7 @@ app = FastAPI(
     version="0.2.0",
     description="BYOK multi-model AI conference API",
     lifespan=_lifespan,
+    responses=api_schemas.ERROR_RESPONSES,
 )
 
 
@@ -196,6 +228,75 @@ async def request_validation_error(
             "detail": {
                 "code": "invalid_request",
                 "message": "リクエスト形式が不正です。",
+            }
+        },
+    )
+
+
+@app.exception_handler(ConversationCorrupt)
+async def conversation_corrupt_error(
+    _request: Request,
+    error: ConversationCorrupt,
+) -> JSONResponse:
+    """ファイルはあるが読めない状態を、404『無い』と偽らずに区別して返す。"""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": {
+                "code": "conversation_corrupt",
+                "message": (
+                    "会話ファイルを読み取れません。"
+                    "データディレクトリの該当ファイルを確認してください。"
+                ),
+                "conversation_id": error.conversation_id,
+                "reason": error.reason,
+            }
+        },
+    )
+
+
+@app.exception_handler(ConversationSchemaUnsupported)
+async def conversation_schema_unsupported_error(
+    _request: Request,
+    error: ConversationSchemaUnsupported,
+) -> JSONResponse:
+    """未知のschema_versionを、旧形式の想定で黙って誤読しない。"""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": {
+                "code": "conversation_schema_unsupported",
+                "message": (
+                    "この会話ファイルのschema_versionをこのサーバーは読めません。"
+                    "対応バージョンのサーバーで開いてください。"
+                ),
+                "conversation_id": error.conversation_id,
+                "schema_version": error.schema_version,
+                "supported_schema_versions": list(SUPPORTED_SCHEMA_VERSIONS),
+            }
+        },
+    )
+
+
+@app.exception_handler(RequestIndexIncomplete)
+async def request_index_incomplete_error(
+    _request: Request,
+    error: RequestIndexIncomplete,
+) -> JSONResponse:
+    """破損会話がある間は、request_idの再実行判定ができないため止める。"""
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": {
+                "code": "request_index_incomplete",
+                "message": (
+                    "読み取れない会話ファイルがあるため、このrequest_idが"
+                    "実行済みかどうかを判定できません。二重課金を避けるため"
+                    "実行しませんでした。該当ファイルを修復または退避してから"
+                    "再試行してください。"
+                ),
+                "request_id": error.request_id,
+                "corrupt_conversation_ids": list(error.corrupt_ids),
             }
         },
     )
@@ -236,20 +337,48 @@ async def _hold_conversation_lock(conversation_id: str):
         yield
 
 
+def _conversation_not_found() -> HTTPException:
+    return api_error(404, "conversation_not_found", "会話が見つかりません")
+
+
+def _request_id_conflict_conversation() -> HTTPException:
+    """復旧手順: 正しい会話IDを指定して再送する。"""
+    return api_error(
+        409,
+        "request_id_conflict_conversation",
+        "request_idが別の会話で使用済みです",
+    )
+
+
+def _request_id_conflict_fingerprint() -> HTTPException:
+    """復旧手順: 新しいrequest_idを振り直して再送する。"""
+    return api_error(
+        409,
+        "request_id_conflict_fingerprint",
+        "request_idが異なるリクエストで使用済みです",
+    )
+
+
 def check_auth(request: Request) -> None:
     if not config.AUTH_TOKEN:
         return
     header = request.headers.get("authorization", "")
     supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
     if not supplied or not secrets.compare_digest(supplied, config.AUTH_TOKEN):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="認証に失敗しました")
+        raise api_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "unauthorized",
+            "認証に失敗しました",
+        )
 
 
 def _rate_limit_error() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        detail="1分あたりの会議開始上限を超えました",
+    return api_error(
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        "rate_limit_exceeded",
+        "1分あたりの会議開始上限を超えました",
         headers={"Retry-After": "60"},
+        retry_after_sec=60,
     )
 
 
@@ -263,15 +392,11 @@ def _plan_from_request(req: PlanRequest) -> dict[str, Any]:
     conversation: dict[str, Any] | None = None
     attachment_bundle: tuple[str, list[dict[str, Any]]] | None = None
     if req.conversation_id is not None:
-        canonical_id = _canonical_conversation_id(req.conversation_id)
-        assert canonical_id is not None
+        canonical_id = _require_conversation_id(req.conversation_id)
         try:
             conversation = store.load(canonical_id)
         except ConversationNotFound as exc:
-            raise HTTPException(
-                status_code=404,
-                detail="会話が見つかりません",
-            ) from exc
+            raise _conversation_not_found() from exc
         try:
             attachment_bundle = attachment_store.build_context(
                 canonical_id, req.attachment_ids
@@ -279,12 +404,10 @@ def _plan_from_request(req: PlanRequest) -> dict[str, Any]:
         except attachments.AttachmentError as exc:
             raise _attachment_http_exception(exc) from exc
     elif req.attachment_ids:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "code": "attachment_conversation_required",
-                "message": "添付には保存先の会話が必要です",
-            },
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "attachment_conversation_required",
+            "添付には保存先の会話が必要です",
         )
     return _plan_from_snapshot(
         req,
@@ -418,13 +541,11 @@ def _enforce_run_limits(plan: dict[str, Any]) -> None:
     else:
         code = "run_limit_exceeded"
         message = "会議の最大実行量が設定上限を超えています。"
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail={
-            "code": code,
-            "message": message,
-            "plan": plan,
-        },
+    raise api_error(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        code,
+        message,
+        plan=plan,
     )
 
 
@@ -442,17 +563,15 @@ def _enforce_explicit_confirmations(plan: dict[str, Any], req: ChatRequest) -> N
         missing.append("confirm_sensitive_data")
     if not missing:
         return
-    raise HTTPException(
-        status_code=status.HTTP_428_PRECONDITION_REQUIRED,
-        detail={
-            "code": "explicit_confirmation_required",
-            "message": (
+    raise api_error(
+        status.HTTP_428_PRECONDITION_REQUIRED,
+        "explicit_confirmation_required",
+        (
                 "実APIまたは個人情報らしい文字列の外部送信には、"
                 "明示的な確認フラグが必要です。"
             ),
-            "required": missing,
-            "plan": plan,
-        },
+        required=missing,
+        plan=plan,
     )
 
 
@@ -500,12 +619,10 @@ async def _reject_destructive_change_during_run(conversation_id: str) -> None:
     async with _active_conversation_guard:
         active_request_id = _active_conversation_runs.get(conversation_id)
     if active_request_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "conversation_busy",
-                "message": "この会話では生成処理中のため、分岐または削除は完了後に再試行してください。",
-            },
+        raise api_error(
+            status.HTTP_409_CONFLICT,
+            "conversation_busy",
+            "この会話では生成処理中のため、分岐または削除は完了後に再試行してください。",
         )
 
 
@@ -598,110 +715,97 @@ def _new_run_state(
     )
 
 
-def _events_from_saved_turn(conversation: dict[str, Any], turn: dict[str, Any]) -> list:
-    journal = turn.get("event_log")
-    if isinstance(journal, list) and all(
-        isinstance(item, dict)
-        and isinstance(item.get("event"), str)
-        and isinstance(item.get("data"), dict)
-        for item in journal
-    ):
-        events = []
-        for item in journal:
-            event = str(item["event"])
-            data = deepcopy(item["data"])
-            if event == "meta":
-                data["replayed"] = True
-            events.append((event, data))
-        saved_status = str(turn.get("status") or "completed")
-        terminal_failure = turn.get("cancelled") or saved_status in {
-            "running",
-            "failed",
-            "interrupted",
-        }
-        if terminal_failure:
-            cancelled = bool(turn.get("cancelled"))
-            interrupted = saved_status in {"running", "interrupted"}
-            events.append(
-                (
-                    "error",
-                    {
-                        "request_id": turn.get("request_id"),
-                        "message": (
-                            "会議がキャンセルされました"
-                            if cancelled
-                            else "前回の会議はサーバー停止またはエラーで完了しませんでした"
-                        ),
-                        **({"cancelled": True} if cancelled else {}),
-                        **({"interrupted": True} if interrupted else {}),
-                    },
-                )
-            )
-        events.append(
-            (
-                "done",
-                {
-                    "request_id": turn.get("request_id"),
-                    "conversation": store.summary(conversation),
-                    "replayed": True,
-                    **(
-                        {
-                            "failed": True,
-                            **(
-                                {"cancelled": True}
-                                if turn.get("cancelled")
-                                else {}
-                            ),
-                            **(
-                                {"interrupted": True}
-                                if saved_status in {"running", "interrupted"}
-                                else {}
-                            ),
-                        }
-                        if terminal_failure
-                        else {}
-                    ),
-                },
-            )
-        )
-        return events
+def _turn_outcome(turn: dict[str, Any]) -> dict[str, bool]:
+    """保存turnのstatusから、SSE replayの終端判定を算出する。"""
+    return turn_state.replay_outcome(turn_state.normalized_status(turn))
 
+
+def _events_from_saved_turn(
+    conversation: dict[str, Any],
+    turn: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """保存turnのフィールドだけからreplayイベント列を決定論的に組み立てる。
+
+    0.2.0までは、完了turnがSSEイベントの丸ごとコピー(`event_log`)を併せ持ち、
+    replayはそちらを優先していた。しかし再生成は answers / synthesis /
+    insights を更新しても `event_log` を書き換えないため、再生成後に同じ
+    request_id を再送すると**再生成前の古い回答が再生される**という
+    「答えが2箇所にある」不整合が起きていた。
+
+    現在は保存turnのフィールドを唯一のソースとし、`event_log` は保存も参照も
+    しない。これにより再生成後のreplayが必ず最新の保存内容と一致する。
+    """
     options = turn.get("options") or {}
+    answers = turn.get("answers") or {}
+    request_id = turn.get("request_id")
     events: list[tuple[str, dict[str, Any]]] = [
         (
             "meta",
             {
-                "request_id": turn.get("request_id"),
+                "request_id": request_id,
                 "conversation_id": conversation["id"],
-                "backends": options.get("providers") or list((turn.get("answers") or {}).keys()),
+                "backends": options.get("providers") or list(answers.keys()),
                 "mode": config.mode(),
                 "tier": options.get("tier", "balanced"),
                 "debate": bool(options.get("debate")),
                 "blind": bool(options.get("blind")),
                 "web_search": bool(options.get("web_search")),
+                "reasoning_mode": options.get("reasoning_mode", "auto"),
                 "synthesizer": config.synthesizer_name(),
                 "provider_status": config.statuses(),
                 "replayed": True,
             },
         )
     ]
+    # 並びは常にconfig.WORKERS順。保存dictの挿入順に依存させない。
     for source in config.WORKERS:
-        answer = (turn.get("answers") or {}).get(source)
+        answer = answers.get(source)
         if isinstance(answer, dict):
-            events.append(("answer", answer))
+            events.append(("answer", deepcopy(answer)))
     insights = turn.get("insights")
     if isinstance(insights, dict):
-        events.append(("insights", insights))
+        events.append(("insights", deepcopy(insights)))
     synthesis = turn.get("synthesis")
     if isinstance(synthesis, dict):
-        events.append(("synthesis", synthesis))
+        events.append(("synthesis", deepcopy(synthesis)))
+
+    outcome = _turn_outcome(turn)
+    if outcome["failed"]:
+        events.append(
+            (
+                "error",
+                {
+                    "request_id": request_id,
+                    "message": (
+                        "会議がキャンセルされました"
+                        if outcome["cancelled"]
+                        else "前回の会議はサーバー停止またはエラーで完了しませんでした"
+                    ),
+                    **({"cancelled": True} if outcome["cancelled"] else {}),
+                    **({"interrupted": True} if outcome["interrupted"] else {}),
+                },
+            )
+        )
     events.append(
         (
             "done",
             {
-                "request_id": turn.get("request_id"),
+                "request_id": request_id,
                 "conversation": store.summary(conversation),
                 "replayed": True,
+                **(
+                    {
+                        "failed": True,
+                        **({"cancelled": True} if outcome["cancelled"] else {}),
+                        **(
+                            {"interrupted": True}
+                            if outcome["interrupted"]
+                            else {}
+                        ),
+                    }
+                    if outcome["failed"]
+                    else {}
+                ),
             },
         )
     )
@@ -758,7 +862,6 @@ def _new_pending_turn(
         },
         "status": "running",
         "usage_may_be_incomplete": True,
-        "event_log": [],
     }
 
 
@@ -806,14 +909,10 @@ def _sync_partial_turn_from_events(
     turn["insights"] = insights
     if synthesis is not None:
         turn["synthesis"] = synthesis
+    # 状態は status 単一ソース。cancelled / failed / interrupted は保存せず、
+    # API応答生成時に turn_state.derived_flags() で算出する。
     turn["status"] = run_status
-    turn["cancelled"] = run_status == "cancelled"
-    turn["failed"] = run_status == "failed"
     turn["usage_may_be_incomplete"] = run_status != "completed"
-    turn["event_log"] = [
-        {"event": event, "data": deepcopy(data)}
-        for event, data in state.events
-    ]
 
 
 async def _persist_incomplete_chat_turn(
@@ -833,6 +932,16 @@ async def _persist_incomplete_chat_turn(
                 state.request_id,
             )
         except (ConversationNotFound, HTTPException):
+            return None
+        except ConversationCorrupt:
+            # 終端処理の中なので例外を伝播させず、事実だけ必ず残す。
+            logger.error(
+                "cannot persist %s turn: conversation file is unreadable "
+                "conversation_id=%s request_id=%s",
+                run_status,
+                state.conversation_id,
+                state.request_id,
+            )
             return None
         current = conversation["turns"][turn_index]
         if current.get("status") == "completed":
@@ -965,13 +1074,12 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
                 turn["request_fingerprint"] = state.request_fingerprint
                 turn["budget_reservation"] = deepcopy(reservation)
                 turn["execution_snapshot"] = deepcopy(execution_snapshot)
-                turn["event_log"] = [
-                    {"event": event, "data": deepcopy(data)}
-                    for event, data in state.events
-                ]
+                # orchestratorの戻り値でpending turn全体が差し替わるため、
+                # pendingにしか無いフィールドは明示的に引き継ぐ。以前は
+                # resume_requestが完了turnからだけ消えていた。
+                turn["resume_request"] = deepcopy(pending["resume_request"])
+                turn["created_at"] = pending["created_at"]
                 turn["status"] = "completed"
-                turn["cancelled"] = False
-                turn["failed"] = False
                 turn["usage_may_be_incomplete"] = False
                 turns[pending_index] = turn
 
@@ -1072,11 +1180,16 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
 def _resolve_request_id(req: ChatRequest, request: Request) -> str:
     header_request_id = request.headers.get("x-request-id")
     if header_request_id is not None and not _valid_request_id(header_request_id):
-        raise HTTPException(status_code=422, detail="X-Request-IDが不正です")
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "invalid_request_id",
+            "X-Request-IDが不正です",
+        )
     if req.request_id and header_request_id and req.request_id != header_request_id:
-        raise HTTPException(
-            status_code=400,
-            detail="request_idとX-Request-IDが一致しません",
+        raise api_error(
+            400,
+            "request_id_header_mismatch",
+            "request_idとX-Request-IDが一致しません",
         )
     return req.request_id or header_request_id or str(uuid.uuid4())
 
@@ -1088,19 +1201,37 @@ def _last_event_index(request: Request) -> int:
     try:
         value = int(raw, 10)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Last-Event-IDが不正です") from exc
+        raise api_error(
+            400,
+            "invalid_last_event_id",
+            "Last-Event-IDが不正です",
+        ) from exc
     if value < 0:
-        raise HTTPException(status_code=400, detail="Last-Event-IDが不正です")
+        raise api_error(
+            400,
+            "invalid_last_event_id",
+            "Last-Event-IDが不正です",
+        )
     return value
 
 
-def _canonical_conversation_id(conversation_id: str | None) -> str | None:
-    if conversation_id is None:
-        return None
+def _require_conversation_id(conversation_id: str) -> str:
+    """path parameterの会話IDを正規化する。不正形式は404で、必ずstrを返す。
+
+    呼出側の `assert canonical_id is not None` を不要にする非Optional版
+    (assertは `python -O` で消えるため、契約の担保に使うべきではない)。
+    """
     try:
         return str(uuid.UUID(conversation_id))
     except (ValueError, TypeError, AttributeError) as exc:
-        raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
+        raise _conversation_not_found() from exc
+
+
+def _canonical_conversation_id(conversation_id: str | None) -> str | None:
+    """会話IDが任意(=Noneあり得る)なrequest bodyのための版。"""
+    if conversation_id is None:
+        return None
+    return _require_conversation_id(conversation_id)
 
 
 def _rate_limit_key(request: Request) -> str:
@@ -1122,7 +1253,11 @@ def _stream_response(state: RunState, start_index: int = 0) -> StreamingResponse
     )
 
 
-@app.get("/api/health", dependencies=[Depends(check_auth)])
+@app.get(
+    "/api/health",
+    dependencies=[Depends(check_auth)],
+    response_model=api_schemas.HealthResponse,
+)
 def health() -> dict[str, Any]:
     result = {
         "ok": True,
@@ -1154,18 +1289,17 @@ def update_runtime_settings(req: RuntimeSettingsUpdateRequest) -> dict[str, Any]
             synthesizer_models=req.synthesizer_models,
         )
     except RuntimeSettingsConflict as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "runtime_settings_conflict",
-                "message": str(exc),
-                "settings": config.public_settings(),
-            },
-        ) from exc
+        raise api_error(
+            status.HTTP_409_CONFLICT,
+            "runtime_settings_conflict",
+            str(exc),
+            settings=config.public_settings(),
+        )
     except RuntimeSettingsError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "invalid_runtime_settings", "message": str(exc)},
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "invalid_runtime_settings",
+            str(exc),
         ) from exc
     result = config.public_settings()
     result["finance"] = budget_guard.public_snapshot(store)
@@ -1188,13 +1322,18 @@ async def usage_telemetry() -> dict[str, Any]:
 @app.post(
     "/api/budget/reconciliation/{request_id}/release",
     dependencies=[Depends(check_auth)],
+    response_model=api_schemas.OkResponse,
 )
 def release_budget_reconciliation(
     request_id: str,
     req: ReconciliationReleaseRequest,
 ) -> dict[str, Any]:
     if not _valid_request_id(request_id):
-        raise HTTPException(status_code=404, detail="対象の予算予約が見つかりません")
+        raise api_error(
+            404,
+            "reservation_not_found",
+            "対象の予算予約が見つかりません",
+        )
     scrubbed_note = _scrub_public(req.note.strip())
     note = scrubbed_note if isinstance(scrubbed_note, str) else ""
     try:
@@ -1210,10 +1349,7 @@ def release_budget_reconciliation(
             if exc.code == "reservation_not_found"
             else status.HTTP_409_CONFLICT
         )
-        raise HTTPException(
-            status_code=status_code,
-            detail={"code": exc.code, "message": str(exc)},
-        ) from exc
+        raise api_error(status_code, exc.code, str(exc)) from exc
     result = {
         "ok": True,
         "reservation": reservation,
@@ -1247,12 +1383,10 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             preferred_conversation_id=requested_conversation_id,
         )
     except AmbiguousRequestId as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "request_id_ambiguous",
-                "message": "request_idが複数の分岐会話に存在します。会話IDを指定してください。",
-            },
+        raise api_error(
+            409,
+            "request_id_ambiguous",
+            "request_idが複数の分岐会話に存在します。会話IDを指定してください。",
         ) from exc
     if found is not None:
         found_conversation, found_turn = found
@@ -1260,23 +1394,17 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             requested_conversation_id is not None
             and requested_conversation_id != found_conversation["id"]
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="request_idが別の会話で使用済みです",
-            )
+            raise _request_id_conflict_conversation()
         saved_fingerprint = found_turn.get("request_fingerprint")
         if isinstance(saved_fingerprint, str) and saved_fingerprint != fingerprint:
-            raise HTTPException(
-                status_code=409,
-                detail="request_idが異なるリクエストで使用済みです",
-            )
+            raise _request_id_conflict_fingerprint()
         candidate_conversation_id = str(found_conversation["id"])
         create_conversation = False
     elif requested_conversation_id is not None:
         try:
             await _blocking_call(store.load, requested_conversation_id)
         except ConversationNotFound as exc:
-            raise HTTPException(status_code=404, detail="会話が見つかりません") from exc
+            raise _conversation_not_found() from exc
         candidate_conversation_id = requested_conversation_id
         create_conversation = False
     else:
@@ -1295,18 +1423,12 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             ),
         )
         if state.kind != "chat" or state.request_fingerprint != fingerprint:
-            raise HTTPException(
-                status_code=409,
-                detail="request_idが異なるリクエストで使用済みです",
-            )
+            raise _request_id_conflict_fingerprint()
         if (
             requested_conversation_id is not None
             and requested_conversation_id != state.conversation_id
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="request_idが別の会話で使用済みです",
-            )
+            raise _request_id_conflict_conversation()
         if created:
             found_conversation, found_turn = found
             for event, data in _events_from_saved_turn(
@@ -1315,14 +1437,20 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             ):
                 await state.publish(event, data)
             await state.finish()
+            state.replayed_from_storage = True
+        # 保存turnからの再生は、実行時のSSEを逐語再現した記録ではなく
+        # 保存フィールドから組み立て直した正規列である(event_log廃止)。
+        # 実行時のLast-Event-IDはこの列の添字と一致しないため、そのまま
+        # 適用すると終端のdoneを取りこぼす。再生は必ず先頭から流す。
+        # 各イベントはsource単位で冪等なので、再送しても表示は壊れない。
+        if state.replayed_from_storage:
+            return _stream_response(state, 0)
         if start_index > len(state.events):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "resume_not_available",
-                    "message": "指定されたLast-Event-IDを再開できません",
-                    "max_event_id": len(state.events),
-                },
+            raise api_error(
+                409,
+                "resume_not_available",
+                "指定されたLast-Event-IDを再開できません",
+                max_event_id=len(state.events),
             )
         return _stream_response(state, start_index)
 
@@ -1332,37 +1460,27 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             resumable.kind != "chat"
             or resumable.request_fingerprint != fingerprint
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="request_idが異なるリクエストで使用済みです",
-            )
+            raise _request_id_conflict_fingerprint()
         if (
             requested_conversation_id is not None
             and requested_conversation_id != resumable.conversation_id
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="request_idが別の会話で使用済みです",
-            )
+            raise _request_id_conflict_conversation()
         if start_index > len(resumable.events):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "resume_not_available",
-                    "message": "指定されたLast-Event-IDを再開できません",
-                    "max_event_id": len(resumable.events),
-                },
+            raise api_error(
+                409,
+                "resume_not_available",
+                "指定されたLast-Event-IDを再開できません",
+                max_event_id=len(resumable.events),
             )
         return _stream_response(resumable, start_index)
 
     if start_index > 0:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "resume_not_available",
-                "message": "指定されたLast-Event-IDを再開できません",
-                "max_event_id": 0,
-            },
+        raise api_error(
+            409,
+            "resume_not_available",
+            "指定されたLast-Event-IDを再開できません",
+            max_event_id=0,
         )
     run_plan = await _blocking_call(_plan_from_request, req)
     _enforce_run_limits(run_plan)
@@ -1377,15 +1495,12 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         ),
     )
     if state.kind != "chat" or state.request_fingerprint != fingerprint:
-        raise HTTPException(
-            status_code=409,
-            detail="request_idが異なるリクエストで使用済みです",
-        )
+        raise _request_id_conflict_fingerprint()
     if (
         requested_conversation_id is not None
         and requested_conversation_id != state.conversation_id
     ):
-        raise HTTPException(status_code=409, detail="request_idが別の会話で使用済みです")
+        raise _request_id_conflict_conversation()
 
     if created:
         try:
@@ -1409,6 +1524,7 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             for event, data in _events_from_saved_turn(conversation_data, saved_turn):
                 await state.publish(event, data)
             await state.finish()
+            state.replayed_from_storage = True
         else:
             try:
                 claimed = await _claim_conversation_run(
@@ -1428,12 +1544,10 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             if not claimed:
                 await state.finish()
                 await _registry.remove(request_id, state)
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "conversation_busy",
-                        "message": "この会話では別の会議が実行中です。完了後に再試行してください。",
-                    },
+                raise api_error(
+                    409,
+                    "conversation_busy",
+                    "この会話では別の会議が実行中です。完了後に再試行してください。",
                 )
             try:
                 if state.cancel_requested:
@@ -1509,14 +1623,12 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 )
                 await state.finish()
                 await _registry.remove(request_id, state)
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={
-                        "code": exc.code,
-                        "message": str(exc),
-                        "budget": exc.snapshot,
-                    },
-                ) from exc
+                raise api_error(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    exc.code,
+                    str(exc),
+                    budget=exc.snapshot,
+                )
             except BaseException:
                 # task作成後は_execute_runが予算・conversation claimを所有する。
                 # start handshake中にcallerがcancelされても二重解放しない。
@@ -1532,25 +1644,37 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     await state.finish()
                     await _registry.remove(request_id, state)
                 raise
+    if state.replayed_from_storage:
+        return _stream_response(state, 0)
     if start_index > len(state.events):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "resume_not_available",
-                "message": "指定されたLast-Event-IDを再開できません",
-                "max_event_id": len(state.events),
-            },
+        raise api_error(
+            409,
+            "resume_not_available",
+            "指定されたLast-Event-IDを再開できません",
+            max_event_id=len(state.events),
         )
     return _stream_response(state, start_index)
 
 
-@app.post("/api/runs/{request_id}/cancel", dependencies=[Depends(check_auth)])
+@app.post(
+    "/api/runs/{request_id}/cancel",
+    dependencies=[Depends(check_auth)],
+    response_model=api_schemas.CancelRunResponse,
+)
 async def cancel_run(request_id: str) -> dict[str, Any]:
     if not _valid_request_id(request_id):
-        raise HTTPException(status_code=404, detail="実行中の会議が見つかりません")
+        raise api_error(
+            404,
+            "run_not_found",
+            "実行中の会議が見つかりません",
+        )
     state, task, already_done = await _registry.request_cancel(request_id)
     if state is None:
-        raise HTTPException(status_code=404, detail="実行中の会議が見つかりません")
+        raise api_error(
+            404,
+            "run_not_found",
+            "実行中の会議が見つかりません",
+        )
     if already_done:
         return {
             "ok": True,

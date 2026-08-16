@@ -99,7 +99,7 @@ Reference serverは有用な開発基盤ですが、公開版の必須runtimeに
 
 - Android版を中心に、旧Clage Cookで成熟した会話一覧、検索、composer、回答card、再生成、停止の操作感を継承する。
 - `!high` のような覚える必要のあるcommandは、可能な範囲でbutton、checkbox、chipへ置き換える。
-- 重要な状態は「DIRECT · LOCAL」「開発用サーバー」など画面上で常時判別できるようにする。
+- 重要な状態は「DIRECT · 端末内保存」「開発用サーバー」など画面上で常時判別できるようにする。
 - 会議前の課金確認、partial、stale synthesis、失敗、停止の限界を隠さない。
 - mobile、desktop、Webで同じ情報構造を保ちつつ、Directを利用できないWebでは理由と代替modeを示す。
 

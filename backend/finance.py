@@ -183,7 +183,8 @@ class BudgetGuard:
         return self.per_run_limit_micros is not None or self.daily_limit_micros is not None
 
     def validate_configuration(self) -> None:
-        if self.unknown_policy == "invalid":
+        invalid_policy = config.env_adjustment_for("CLAGE_BUDGET_UNKNOWN_POLICY")
+        if invalid_policy is not None or self.unknown_policy not in {"block", "allow"}:
             raise FinanceConfigurationError(
                 "CLAGE_BUDGET_UNKNOWN_POLICYはblockまたはallowを指定してください"
             )

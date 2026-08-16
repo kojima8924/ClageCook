@@ -110,7 +110,7 @@ def test_zip_export_contains_portable_json_markdown_and_owned_attachments(
     ]
     main.store.save(stored)
 
-    response = client.get(f"/api/conversations/{conversation_id}/export.zip")
+    response = client.get(f"/api/conversations/{conversation_id}/export?format=zip")
 
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:

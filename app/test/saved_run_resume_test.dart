@@ -16,7 +16,7 @@ TurnRecord _turn({
   synthesis: const SynthesisRecord(ok: false),
   options: options,
   resumeRequest: resumeRequest,
-  status: 'running',
+  status: TurnStatus.running,
 );
 
 void main() {

@@ -55,6 +55,9 @@ class RunState:
     failure_status: int | None = None
     failure_detail: Any = None
     terminal_outcome: TerminalOutcome | None = None
+    #: 保存turnから組み立て直した正規列を配信しているか。実行時のSSEを
+    #: 逐語再現したものではないため、実行時のLast-Event-IDは適用できない。
+    replayed_from_storage: bool = False
 
     def __post_init__(self) -> None:
         self.created_at = self.clock()
@@ -139,12 +142,14 @@ class RunRegistry:
         self,
         *,
         retention_sec: float = 300.0,
+        max_completed: int = 512,
         clock: Clock = time.monotonic,
         before_runner_enter: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._runs: dict[str, RunState] = {}
         self._lock = asyncio.Lock()
         self._retention_sec = retention_sec
+        self._max_completed = max(1, int(max_completed))
         self._clock = clock
         self._before_runner_enter = before_runner_enter
 
@@ -258,6 +263,20 @@ class RunRegistry:
             and now - run.completed_at > self._retention_sec
         ]
         for request_id in stale:
+            self._runs.pop(request_id, None)
+        # retentionはアクセス時にしか評価されないため、無アクセス期間が長いと
+        # 完了stateが上限なく積み上がる(issue #22)。件数上限でも切り、古い完了
+        # stateから捨てる。実行中stateは対象外(必ず所有者がいる)。
+        completed = [
+            (run.completed_at, request_id)
+            for request_id, run in self._runs.items()
+            if run.done and run.completed_at is not None
+        ]
+        overflow = len(completed) - self._max_completed
+        if overflow <= 0:
+            return
+        completed.sort()
+        for _, request_id in completed[:overflow]:
             self._runs.pop(request_id, None)
 
 

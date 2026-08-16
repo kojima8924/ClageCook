@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:clage_cook/models.dart';
 import 'package:clage_cook/services/direct_byok_client.dart';
 import 'package:clage_cook/services/direct_provider_client.dart';
 import 'package:clage_cook/services/direct_settings_store.dart';
@@ -432,7 +433,7 @@ void main() {
       target: 'answer',
       provider: 'chatgpt',
     );
-    expect(plan.policy.action, 'confirm');
+    expect(plan.policy.action, PolicyAction.confirm);
     expect(
       plan.policy.findings.map((finding) => finding.label),
       contains('メールアドレスらしい文字列'),

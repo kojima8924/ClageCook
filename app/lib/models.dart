@@ -199,6 +199,25 @@ class PolicyFinding {
   final int end;
 }
 
+/// ポリシー検査の判定。未知の値は必ず [block] へ倒す(fail-closed)。
+enum PolicyAction {
+  allow('allow'),
+  confirm('confirm'),
+  block('block');
+
+  const PolicyAction(this.wireName);
+
+  final String wireName;
+
+  /// 未知・欠落は送信を止める側へ倒す。将来サーバーが新しい判定名を返しても、
+  /// 「知らないから送ってよい」にはしない。
+  static PolicyAction parse(Object? raw) => switch (raw?.toString()) {
+    'allow' => PolicyAction.allow,
+    'confirm' => PolicyAction.confirm,
+    _ => PolicyAction.block,
+  };
+}
+
 class PolicyScanResult {
   const PolicyScanResult({
     required this.action,
@@ -210,25 +229,43 @@ class PolicyScanResult {
 
   factory PolicyScanResult.fromJson(Map<String, dynamic> json) =>
       PolicyScanResult(
-        action: switch (json['action']?.toString()) {
-          'allow' => 'allow',
-          'confirm' => 'confirm',
-          'block' => 'block',
-          _ => 'block',
-        },
+        action: PolicyAction.parse(json['action']),
         findings: _mapList(json['findings'], PolicyFinding.fromJson),
         redactedText: json['redacted_text']?.toString() ?? '',
         disclaimer: json['disclaimer']?.toString() ?? '',
         version: json['version']?.toString() ?? '',
       );
 
-  final String action;
+  final PolicyAction action;
   final List<PolicyFinding> findings;
   final String redactedText;
   final String disclaimer;
   final String version;
 
-  bool get blocked => action == 'block';
+  bool get blocked => action == PolicyAction.block;
+
+  /// 送信前に利用者の確認が要る状態。
+  bool get needsConfirmation => action == PolicyAction.confirm;
+}
+
+/// 会議参加者の実行形態。未知の値は課金しない側([mock])へ倒す。
+enum ParticipantMode {
+  live('live'),
+  mock('mock'),
+  disabled('disabled'),
+  unknown('');
+
+  const ParticipantMode(this.wireName);
+
+  final String wireName;
+
+  static ParticipantMode parse(Object? raw) => switch (raw?.toString()) {
+    'live' => ParticipantMode.live,
+    'mock' => ParticipantMode.mock,
+    'disabled' => ParticipantMode.disabled,
+    null => ParticipantMode.mock,
+    _ => ParticipantMode.unknown,
+  };
 }
 
 class RunPlanParticipant {
@@ -240,26 +277,37 @@ class RunPlanParticipant {
     required this.billable,
     required this.maxCalls,
     this.enabled = true,
+    this.maxOutputTokens = 0,
+    this.reasoning = const {},
   });
 
   factory RunPlanParticipant.fromJson(Map<String, dynamic> json) =>
       RunPlanParticipant(
         name: json['name']?.toString() ?? '',
         label: json['label']?.toString() ?? '',
-        mode: json['mode']?.toString() ?? 'mock',
+        mode: ParticipantMode.parse(json['mode']),
         model: json['model']?.toString() ?? '',
         billable: json['billable'] == true,
         maxCalls: _asInt(json['max_calls']),
         enabled: json['enabled'] != false,
+        maxOutputTokens: _asInt(json['max_output_tokens']),
+        reasoning: _dynamicMapOrNull(json['reasoning']) ?? const {},
       );
 
   final String name;
   final String label;
-  final String mode;
+  final ParticipantMode mode;
   final String model;
   final bool billable;
   final int maxCalls;
   final bool enabled;
+
+  /// 1 callあたりの最大出力token。planの送出側は以前から出していたが、
+  /// 読み捨てていたため計画画面から参照できなかった。
+  final int maxOutputTokens;
+
+  /// 実効推論エフォートの監査情報。
+  final Map<String, dynamic> reasoning;
 }
 
 class RunPlanWarning {
@@ -386,7 +434,7 @@ class RunPlan {
           : const RunPlanParticipant(
               name: 'synthesizer',
               label: 'Synthesizer',
-              mode: 'mock',
+              mode: ParticipantMode.mock,
               model: 'mock',
               billable: false,
               maxCalls: 0,
@@ -403,7 +451,7 @@ class RunPlan {
       policy: rawPolicy is Map
           ? PolicyScanResult.fromJson(Map<String, dynamic>.from(rawPolicy))
           : const PolicyScanResult(
-              action: 'block',
+              action: PolicyAction.block,
               findings: [],
               redactedText: '',
               disclaimer: 'ポリシー検査結果を取得できませんでした。',
@@ -463,8 +511,8 @@ class RunCostEstimate {
         available: json['available'] == true,
         complete: json['complete'] == true,
         totalMicros: _nullableInt(json['total_micros']),
-        totalUsd: _nullableText(json['total_usd']),
-        priceVersion: _nullableText(json['price_version']),
+        totalUsd: _textOrNull(json['total_usd']),
+        priceVersion: _textOrNull(json['price_version']),
         method: json['method']?.toString() ?? '',
       );
 
@@ -510,20 +558,20 @@ class BudgetSnapshot {
       configured: json['configured'] == true,
       allowed: json['allowed'] != false,
       unknownCostPolicy: json['unknown_cost_policy']?.toString() ?? 'block',
-      runEstimateUsd: _nullableText(json['run_estimate_usd']),
-      perRunLimitUsd: _nullableText(limits['per_run_usd']),
-      dailyLimitUsd: _nullableText(limits['daily_usd']),
-      todayActualUsd: _nullableText(today['actual_estimated_usd']),
-      todayReservedUsd: _nullableText(today['active_reservations_usd']),
-      todayActiveReservationTopUpUsd: _nullableText(
+      runEstimateUsd: _textOrNull(json['run_estimate_usd']),
+      perRunLimitUsd: _textOrNull(limits['per_run_usd']),
+      dailyLimitUsd: _textOrNull(limits['daily_usd']),
+      todayActualUsd: _textOrNull(today['actual_estimated_usd']),
+      todayReservedUsd: _textOrNull(today['active_reservations_usd']),
+      todayActiveReservationTopUpUsd: _textOrNull(
         today['active_reservation_top_up_usd'],
       ),
-      todayCommittedUsd: _nullableText(today['committed_usd']),
-      todayRemainingUsd: _nullableText(today['remaining_usd']),
+      todayCommittedUsd: _textOrNull(today['committed_usd']),
+      todayRemainingUsd: _textOrNull(today['remaining_usd']),
       day: today['day']?.toString() ?? '',
       unpricedRequests: _asInt(today['unpriced_requests']),
       priceTableLoaded: price['loaded'] == true,
-      priceVersion: _nullableText(price['version']),
+      priceVersion: _textOrNull(price['version']),
       activeReservationCount: json['active_reservations'] is List
           ? (json['active_reservations'] as List).length
           : 0,
@@ -573,7 +621,7 @@ class BudgetReservation {
         requestId: json['request_id']?.toString() ?? '',
         state: json['state']?.toString() ?? '',
         createdAt: json['created_at']?.toString() ?? '',
-        amountUsd: _nullableText(json['amount_usd']),
+        amountUsd: _textOrNull(json['amount_usd']),
         reason: json['reconciliation_reason']?.toString() ?? '',
       );
 
@@ -608,7 +656,7 @@ class QuotaDimension {
   factory QuotaDimension.fromJson(Map<String, dynamic> json) => QuotaDimension(
     limit: _nullableInt(json['limit']),
     remaining: _nullableInt(json['remaining']),
-    reset: _nullableText(json['reset']),
+    reset: _textOrNull(json['reset']),
   );
 
   final int? limit;
@@ -636,7 +684,7 @@ class QuotaSnapshot {
       }
     }
     return QuotaSnapshot(
-      observedAt: _nullableText(json['observed_at']),
+      observedAt: _textOrNull(json['observed_at']),
       dimensions: dimensions,
       retryAfterSeconds: json['retry_after_seconds'] is num
           ? (json['retry_after_seconds'] as num).toDouble()
@@ -730,7 +778,7 @@ class AdminProviderTelemetry {
     final window = _dynamicMapOrNull(json['window']);
     final errors = <String>[];
     void collect(Map<String, dynamic> section) {
-      final code = _nullableText(section['error_code']);
+      final code = _textOrNull(section['error_code']);
       if (code != null && !errors.contains(code)) errors.add(code);
     }
 
@@ -748,12 +796,12 @@ class AdminProviderTelemetry {
       configured: json['configured'] == true,
       usage: usage.map((key, value) => MapEntry(key.toString(), _asInt(value))),
       costUsd:
-          _nullableText(cost['amount_usd']) ??
-          _nullableText(usageSection['amount_usd']),
-      creditBalanceUsd: _nullableText(credit['provider_reported_usd']),
-      currentInvoiceUsd: _nullableText(billing['estimated_invoice_usd']),
-      softLimitUsd: _nullableText(limits['effective_soft_usd']),
-      hardLimitUsd: _nullableText(limits['effective_hard_usd']),
+          _textOrNull(cost['amount_usd']) ??
+          _textOrNull(usageSection['amount_usd']),
+      creditBalanceUsd: _textOrNull(credit['provider_reported_usd']),
+      currentInvoiceUsd: _textOrNull(billing['estimated_invoice_usd']),
+      softLimitUsd: _textOrNull(limits['effective_soft_usd']),
+      hardLimitUsd: _textOrNull(limits['effective_hard_usd']),
       balanceSignConvention: credit['sign_convention']?.toString() ?? '',
       errorCodes: List.unmodifiable(errors),
       window: window == null
@@ -796,16 +844,16 @@ class AdminProviderWindow {
 
   factory AdminProviderWindow.fromJson(Map<String, dynamic> json) =>
       AdminProviderWindow(
-        startingAt: _nullableString(json['starting_at']),
-        endingAt: _nullableString(json['ending_at']),
-        requestedStartingAt: _nullableString(json['requested_starting_at']),
-        requestedEndingAt: _nullableString(json['requested_ending_at']),
-        alignment: _nullableString(json['alignment']),
-        bucketWidth: _nullableString(json['bucket_width']),
+        startingAt: _strictStringOrNull(json['starting_at']),
+        endingAt: _strictStringOrNull(json['ending_at']),
+        requestedStartingAt: _strictStringOrNull(json['requested_starting_at']),
+        requestedEndingAt: _strictStringOrNull(json['requested_ending_at']),
+        alignment: _strictStringOrNull(json['alignment']),
+        bucketWidth: _strictStringOrNull(json['bucket_width']),
         exactBudgetWindow: json['exact_budget_window'] is bool
             ? json['exact_budget_window'] as bool
             : null,
-        completeThrough: _nullableString(json['complete_through']),
+        completeThrough: _strictStringOrNull(json['complete_through']),
       );
 
   final String? startingAt;
@@ -926,10 +974,12 @@ class ConversationSummary {
 class ConversationSearchResult {
   const ConversationSearchResult({required this.query, required this.results});
 
+  /// 一覧系レスポンスは `{"items": [...]}` 封筒で統一されている
+  /// (0.2.0で `results` から改名)。
   factory ConversationSearchResult.fromJson(Map<String, dynamic> json) =>
       ConversationSearchResult(
         query: json['query']?.toString() ?? '',
-        results: _mapList(json['results'], ConversationSummary.fromJson),
+        results: _mapList(json['items'], ConversationSummary.fromJson),
       );
 
   final String query;
@@ -970,6 +1020,72 @@ class CancelRunResult {
   final String warning;
 }
 
+/// 1回のProvider呼び出しの終わり方。未知の値は [unknown] にして、
+/// 「completedとみなして良い」に倒さない。
+enum CompletionStatus {
+  completed('completed'),
+  incomplete('incomplete'),
+  cancelled('cancelled'),
+  failed('failed'),
+  unknown('');
+
+  const CompletionStatus(this.wireName);
+
+  final String wireName;
+
+  static CompletionStatus parse(Object? raw, {CompletionStatus? fallback}) =>
+      switch (raw?.toString()) {
+        'completed' => CompletionStatus.completed,
+        'incomplete' => CompletionStatus.incomplete,
+        'cancelled' => CompletionStatus.cancelled,
+        'failed' => CompletionStatus.failed,
+        null || '' => fallback ?? CompletionStatus.unknown,
+        _ => CompletionStatus.unknown,
+      };
+}
+
+/// immutable attemptの状態。
+enum AttemptStatus {
+  completed('completed'),
+  interrupted('interrupted'),
+  failed('failed'),
+  unknown('');
+
+  const AttemptStatus(this.wireName);
+
+  final String wireName;
+
+  static AttemptStatus parse(Object? raw) => switch (raw?.toString()) {
+    'completed' => AttemptStatus.completed,
+    'interrupted' => AttemptStatus.interrupted,
+    'failed' => AttemptStatus.failed,
+    _ => AttemptStatus.unknown,
+  };
+}
+
+/// 1ターンの状態。以前は status / cancelled / interrupted / failed の4つが
+/// 同じ事実を別々に持ち、書き手が片方だけ埋めると表示が壊れた。
+/// 保存・表示ともこの1つを正とし、boolはここから導出する。
+enum TurnStatus {
+  completed('completed'),
+  running('running'),
+  interrupted('interrupted'),
+  failed('failed'),
+  unknown('');
+
+  const TurnStatus(this.wireName);
+
+  final String wireName;
+
+  static TurnStatus parse(Object? raw) => switch (raw?.toString()) {
+    'completed' => TurnStatus.completed,
+    'running' => TurnStatus.running,
+    'interrupted' => TurnStatus.interrupted,
+    'failed' => TurnStatus.failed,
+    _ => TurnStatus.unknown,
+  };
+}
+
 class AnswerRecord {
   const AnswerRecord({
     required this.source,
@@ -983,13 +1099,13 @@ class AnswerRecord {
     this.round1Text = '',
     this.round1Model = '',
     this.round1ElapsedSec = 0,
-    this.round1CompletionStatus = '',
+    this.round1CompletionStatus = CompletionStatus.unknown,
     this.round1Partial = false,
     this.round1Usage = const {},
     this.round1RequestAudit = const {},
     this.debateError = '',
     this.usage = const {},
-    this.completionStatus = 'completed',
+    this.completionStatus = CompletionStatus.completed,
     this.partial = false,
     this.incompleteReason = '',
     this.usageMayBeIncomplete = false,
@@ -1013,8 +1129,9 @@ class AnswerRecord {
       round1Text: json['round1_text']?.toString() ?? '',
       round1Model: json['round1_model']?.toString() ?? '',
       round1ElapsedSec: _asDouble(json['round1_elapsed_sec']),
-      round1CompletionStatus:
-          json['round1_completion_status']?.toString() ?? '',
+      round1CompletionStatus: CompletionStatus.parse(
+        json['round1_completion_status'],
+      ),
       round1Partial: json['round1_partial'] == true,
       round1Usage:
           (json['round1_usage'] as Map?)?.map(
@@ -1029,7 +1146,10 @@ class AnswerRecord {
             (key, value) => MapEntry(key.toString(), _asInt(value)),
           ) ??
           const {},
-      completionStatus: json['completion_status']?.toString() ?? 'completed',
+      completionStatus: CompletionStatus.parse(
+        json['completion_status'],
+        fallback: CompletionStatus.completed,
+      ),
       partial: json['partial'] == true,
       incompleteReason: json['incomplete_reason']?.toString() ?? '',
       usageMayBeIncomplete:
@@ -1053,13 +1173,13 @@ class AnswerRecord {
   final String round1Text;
   final String round1Model;
   final double round1ElapsedSec;
-  final String round1CompletionStatus;
+  final CompletionStatus round1CompletionStatus;
   final bool round1Partial;
   final Map<String, int> round1Usage;
   final Map<String, dynamic> round1RequestAudit;
   final String debateError;
   final Map<String, int> usage;
-  final String completionStatus;
+  final CompletionStatus completionStatus;
   final bool partial;
   final String incompleteReason;
   final bool usageMayBeIncomplete;
@@ -1080,7 +1200,7 @@ class SynthesisRecord {
     this.mock = false,
     this.skipped = false,
     this.usage = const {},
-    this.completionStatus = 'completed',
+    this.completionStatus = CompletionStatus.completed,
     this.partial = false,
     this.incompleteReason = '',
     this.usageMayBeIncomplete = false,
@@ -1103,7 +1223,10 @@ class SynthesisRecord {
             (key, value) => MapEntry(key.toString(), _asInt(value)),
           ) ??
           const {},
-      completionStatus: json['completion_status']?.toString() ?? 'completed',
+      completionStatus: CompletionStatus.parse(
+        json['completion_status'],
+        fallback: CompletionStatus.completed,
+      ),
       partial: json['partial'] == true,
       incompleteReason: json['incomplete_reason']?.toString() ?? '',
       usageMayBeIncomplete:
@@ -1122,7 +1245,7 @@ class SynthesisRecord {
   final bool mock;
   final bool skipped;
   final Map<String, int> usage;
-  final String completionStatus;
+  final CompletionStatus completionStatus;
   final bool partial;
   final String incompleteReason;
   final bool usageMayBeIncomplete;
@@ -1148,8 +1271,8 @@ class RegenerationAttempt {
         attemptId: json['attempt_id']?.toString() ?? '',
         target: json['target']?.toString() ?? '',
         provider: json['provider']?.toString() ?? '',
-        status: json['status']?.toString() ?? '',
-        parentAttemptId: _nullableText(json['parent_attempt_id']),
+        status: AttemptStatus.parse(json['status']),
+        parentAttemptId: _textOrNull(json['parent_attempt_id']),
         createdAt: json['created_at']?.toString() ?? '',
         completedAt: json['completed_at']?.toString() ?? '',
         original: json['original'] == true,
@@ -1164,7 +1287,7 @@ class RegenerationAttempt {
   final String attemptId;
   final String target;
   final String provider;
-  final String status;
+  final AttemptStatus status;
   final String? parentAttemptId;
   final String createdAt;
   final String completedAt;
@@ -1226,10 +1349,8 @@ class TurnRecord {
     required this.options,
     this.resumeRequest = const {},
     this.insights,
-    this.status = 'completed',
-    this.cancelled = false,
-    this.interrupted = false,
-    this.failed = false,
+    this.status = TurnStatus.completed,
+    this.cancelledByUser = false,
     this.usageMayBeIncomplete = false,
     this.attempts = const [],
     this.activeAttempts = const {},
@@ -1267,11 +1388,8 @@ class TurnRecord {
           ) ??
           const {},
       insights: _dynamicMapOrNull(json['insights']),
-      status: json['status']?.toString() ?? 'completed',
-      cancelled: json['cancelled'] == true,
-      interrupted:
-          json['interrupted'] == true || json['status'] == 'interrupted',
-      failed: json['failed'] == true,
+      status: _turnStatus(json),
+      cancelledByUser: json['cancelled'] == true,
       usageMayBeIncomplete: json['usage_may_be_incomplete'] == true,
       attempts: _mapList(json['attempts'], RegenerationAttempt.fromJson),
       activeAttempts:
@@ -1292,10 +1410,14 @@ class TurnRecord {
   final Map<String, dynamic> options;
   final Map<String, dynamic> resumeRequest;
   final Map<String, dynamic>? insights;
-  final String status;
-  final bool cancelled;
-  final bool interrupted;
-  final bool failed;
+
+  /// このターンの状態。表示・分岐はすべてここだけを見る。
+  final TurnStatus status;
+
+  /// 「利用者が停止した」だけは通信断([TurnStatus.interrupted])と意味が違うので
+  /// 独立したフラグとして残す。
+  final bool cancelledByUser;
+
   final bool usageMayBeIncomplete;
   final List<RegenerationAttempt> attempts;
   final Map<String, String> activeAttempts;
@@ -1303,6 +1425,25 @@ class TurnRecord {
   final List<AttachmentRecord> attachments;
 
   List<String> get providers => _stringList(options['providers']);
+
+  bool get completed => status == TurnStatus.completed;
+  bool get running => status == TurnStatus.running;
+  bool get interrupted => status == TurnStatus.interrupted;
+  bool get failed => status == TurnStatus.failed;
+
+  /// 旧名の別名。停止は中断の一種であり、状態としては同じ扱いになる。
+  bool get cancelled => cancelledByUser;
+}
+
+/// statusを正としつつ、statusを持たない旧recordだけbool群から復元する。
+TurnStatus _turnStatus(Map<String, dynamic> json) {
+  final parsed = TurnStatus.parse(json['status']);
+  if (parsed != TurnStatus.unknown) return parsed;
+  if (json['failed'] == true) return TurnStatus.failed;
+  if (json['interrupted'] == true || json['cancelled'] == true) {
+    return TurnStatus.interrupted;
+  }
+  return json.containsKey('status') ? TurnStatus.unknown : TurnStatus.completed;
 }
 
 class ConversationRecord {
@@ -1426,13 +1567,15 @@ int? _nullableInt(dynamic value) {
   return int.tryParse(value.toString());
 }
 
-String? _nullableText(dynamic value) {
+/// 何であれ文字列化し、空文字はnullにする。
+String? _textOrNull(dynamic value) {
   if (value == null) return null;
   final text = value.toString().trim();
   return text.isEmpty ? null : text;
 }
 
-String? _nullableString(dynamic value) {
+/// String以外は値があってもnullにする(数値やbooleanを表示へ流さない)。
+String? _strictStringOrNull(dynamic value) {
   if (value is! String) return null;
   final text = value.trim();
   return text.isEmpty ? null : text;

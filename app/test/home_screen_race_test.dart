@@ -226,7 +226,7 @@ class _HomeBackend {
           'auth_required': false,
         });
       case '/api/conversations':
-        return _jsonResponse([_summary('a', '会話A'), _summary('b', '会話B')]);
+        return _jsonResponse(_conversationListBody([_summary('a', '会話A'), _summary('b', '会話B')]));
       case '/api/conversations/a':
         _conversationALoads++;
         if (delaySecondConversationA && _conversationALoads == 2) {
@@ -353,3 +353,10 @@ class _MemorySettings implements SettingsRepository {
   @override
   Future<void> save(ConnectionSettings settings) async {}
 }
+
+/// `GET /api/conversations` の items 封筒(0.2.0で裸の配列から変更)。
+Map<String, Object> _conversationListBody(List<Object> items) => {
+  'items': items,
+  'corrupt_count': 0,
+  'corrupt': <Object>[],
+};

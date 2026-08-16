@@ -88,7 +88,7 @@ void main() {
   test('全文検索レスポンスを復元する', () {
     final result = ConversationSearchResult.fromJson({
       'query': '設計',
-      'results': [
+      'items': [
         {
           'id': 'conversation-id',
           'title': '設計会議',
@@ -154,7 +154,7 @@ void main() {
       'disclaimer': '未知action',
     });
 
-    expect(result.action, 'block');
+    expect(result.action, PolicyAction.block);
     expect(result.blocked, isTrue);
   });
 
@@ -397,9 +397,87 @@ void main() {
     )..insights = {'agreement_score': 0.5};
 
     expect(record.insights?['agreement_score'], 0.75);
-    expect(record.status, 'failed');
+    expect(record.status, TurnStatus.failed);
     expect(record.failed, isTrue);
     expect(record.usageMayBeIncomplete, isTrue);
     expect(live.insights?['agreement_score'], 0.5);
+  });
+
+  test('ターン状態はstatusだけを正とし、boolはそこから導出する', () {
+    final failed = TurnRecord.fromJson({
+      'request_id': 'a',
+      // 旧recordのような重複キーが残っていてもstatusを優先する。
+      'status': 'failed',
+      'interrupted': true,
+      'answers': <String, dynamic>{},
+    });
+    expect(failed.status, TurnStatus.failed);
+    expect(failed.failed, isTrue);
+    expect(failed.interrupted, isFalse);
+    expect(failed.completed, isFalse);
+
+    // 利用者の停止は中断の一種だが、独立したフラグとして残る。
+    final cancelled = TurnRecord.fromJson({
+      'request_id': 'b',
+      'status': 'interrupted',
+      'cancelled': true,
+      'answers': <String, dynamic>{},
+    });
+    expect(cancelled.status, TurnStatus.interrupted);
+    expect(cancelled.interrupted, isTrue);
+    expect(cancelled.cancelledByUser, isTrue);
+    expect(cancelled.cancelled, isTrue);
+
+    // statusを持たない旧recordだけbool群から復元する。
+    final legacy = TurnRecord.fromJson({
+      'request_id': 'c',
+      'failed': true,
+      'answers': <String, dynamic>{},
+    });
+    expect(legacy.status, TurnStatus.failed);
+
+    final legacyCompleted = TurnRecord.fromJson({
+      'request_id': 'd',
+      'answers': <String, dynamic>{},
+    });
+    expect(legacyCompleted.status, TurnStatus.completed);
+
+    // 未知のstatusはcompletedへ倒さない。
+    final unknown = TurnRecord.fromJson({
+      'request_id': 'e',
+      'status': 'paused',
+      'answers': <String, dynamic>{},
+    });
+    expect(unknown.status, TurnStatus.unknown);
+    expect(unknown.completed, isFalse);
+    expect(unknown.running, isFalse);
+  });
+
+  test('未知のcompletion statusをcompletedとみなさない', () {
+    final answer = AnswerRecord.fromJson({
+      'source': 'claude',
+      'ok': true,
+      'completion_status': 'paused',
+    });
+    expect(answer.completionStatus, CompletionStatus.unknown);
+
+    final fallback = AnswerRecord.fromJson({'source': 'claude', 'ok': true});
+    expect(fallback.completionStatus, CompletionStatus.completed);
+  });
+
+  test('planの参加者はmax_output_tokensとreasoningを保持する', () {
+    final participant = RunPlanParticipant.fromJson({
+      'name': 'claude',
+      'label': 'Claude',
+      'mode': 'live',
+      'model': 'claude-x',
+      'billable': true,
+      'max_calls': 2,
+      'max_output_tokens': 4096,
+      'reasoning': {'effective': 'high'},
+    });
+    expect(participant.mode, ParticipantMode.live);
+    expect(participant.maxOutputTokens, 4096);
+    expect(participant.reasoning['effective'], 'high');
   });
 }

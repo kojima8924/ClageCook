@@ -24,6 +24,17 @@ class FinanceConfigurationError(RuntimeError):
     pass
 
 
+def _positive_plan_int(value: Any) -> int | None:
+    """planの整数フィールドを読む。欠落・不正・非正なら見積り不能としてNone。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str, Any]:
     if not plan.get("billable"):
         return {
@@ -64,6 +75,10 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
     )
     debate_effective = bool((plan.get("options") or {}).get("debate_effective"))
     items: list[dict[str, Any]] = []
+    # planから出力上限が欠落していた場合は「0 token=無料」ではなく
+    # 「見積り不能」として扱う。0で埋めると出力コストを過小に見積もり、
+    # CLAGE_BUDGET_UNKNOWN_POLICY の「欠落は見積り不能」という思想と矛盾する。
+    plan_missing: set[str] = set()
     for provider in plan.get("providers") or []:
         if not isinstance(provider, dict) or not provider.get("billable"):
             continue
@@ -71,7 +86,10 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
         if debate_effective:
             input_tokens += int(envelope.get("debate_per_call") or 0)
         calls = int(provider.get("max_calls") or 0)
-        per_call_output = int(provider.get("max_output_tokens") or 0)
+        per_call_output = _positive_plan_int(provider.get("max_output_tokens"))
+        if per_call_output is None:
+            plan_missing.add("plan_max_output_tokens")
+            per_call_output = 0
         items.append(
             _estimate_max_item(
                 catalog,
@@ -85,7 +103,10 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
     synthesizer = plan.get("synthesizer") or {}
     if isinstance(synthesizer, dict) and synthesizer.get("billable"):
         calls = int(synthesizer.get("max_calls") or 0)
-        per_call_output = int(synthesizer.get("max_output_tokens") or 0)
+        per_call_output = _positive_plan_int(synthesizer.get("max_output_tokens"))
+        if per_call_output is None:
+            plan_missing.add("plan_max_output_tokens")
+            per_call_output = 0
         items.append(
             _estimate_max_item(
                 catalog,
@@ -101,6 +122,7 @@ def estimate_plan_cost(plan: dict[str, Any], catalog: PriceCatalog) -> dict[str,
         for item in items
         for missing in item.get("missing", [])
     }
+    missing |= plan_missing
     web_search = plan.get("web_search")
     options = plan.get("options")
     web_search_effective = (

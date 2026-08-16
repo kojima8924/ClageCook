@@ -295,6 +295,9 @@ def test_sse_resume_uses_last_event_id(tmp_path, monkeypatch):
     assert resumed_records[0][0] == 3
     assert resumed_records[-1][1] == "done"
 
+    # サーバー再起動後(registry空)は保存turnからの再構成になる。実行時SSEの
+    # 逐語再現ではないため、実行時のLast-Event-IDは適用せず必ず先頭から流す。
+    # これがないと終端のdoneを取りこぼす。
     monkeypatch.setattr(main, "_registry", main.RunRegistry())
     restarted = client.post(
         "/api/chat",
@@ -303,10 +306,20 @@ def test_sse_resume_uses_last_event_id(tmp_path, monkeypatch):
     )
     restarted_records = _event_records(restarted)
     assert [record[0] for record in restarted_records] == [
-        record[0] for record in first_records[2:]
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
     ]
     assert [record[1] for record in restarted_records] == [
-        record[1] for record in first_records[2:]
+        "meta",
+        "answer",
+        "answer",
+        "insights",
+        "synthesis",
+        "done",
     ]
     assert client.post(
         "/api/chat", json=payload, headers={"Last-Event-ID": "invalid"}
@@ -423,7 +436,7 @@ def test_pydantic_validation_errors_have_fixed_non_reflective_response(monkeypat
         ("/api/chat", {"message": [secret]}),
         ("/api/plan", {"message": "safe", "providers": [secret]}),
         ("/api/policy/scan", {"text": {"secret": secret}}),
-        ("/api/search", {"q": [secret]}),
+        ("/api/conversations/search", {"q": [secret]}),
     )
 
     client = TestClient(main.app)
@@ -450,14 +463,18 @@ def test_search_uses_post_body_and_never_a_query_string(tmp_path, monkeypatch):
     client = TestClient(main.app)
 
     response = client.post(
-        "/api/search",
+        "/api/conversations/search",
         json={"q": "  機密になり得る検索語  ", "limit": 10},
     )
 
     assert response.status_code == 200
     assert response.json()["query"] == "機密になり得る検索語"
-    assert response.json()["results"][0]["id"] == conversation["id"]
-    assert client.get("/api/search?q=機密").status_code == 405
+    assert response.json()["items"][0]["id"] == conversation["id"]
+    # 検索語をURLへ載せるGETは提供しない(access logへ残さないため)。
+    # GETは会話ID取得route側へ落ち、検索としては解釈されない。
+    get_attempt = client.get("/api/conversations/search?q=機密")
+    assert get_attempt.status_code == 404
+    assert get_attempt.json()["detail"]["code"] == "conversation_not_found"
 
 
 def test_secret_is_not_retained_or_exposed_by_failures(
@@ -624,7 +641,7 @@ def test_existing_unscrubbed_history_is_scrubbed_on_every_public_read(
             headers=headers,
         ),
         client.post(
-            "/api/search",
+            "/api/conversations/search",
             json={"q": secret},
             headers=headers,
         ),
@@ -768,7 +785,9 @@ async def test_cancel_run_persists_completed_answers_and_usage(tmp_path, monkeyp
     saved = main.store.load(conversation_id)
     assert len(saved["turns"]) == 1
     turn = saved["turns"][0]
-    assert turn["cancelled"] is True
+    # 状態はstatus単一ソース。保存JSONに派生booleanは持たない。
+    assert turn["status"] == "cancelled"
+    assert "cancelled" not in turn
     assert turn["usage_may_be_incomplete"] is True
     assert turn["answers"]["claude"]["usage"]["total_tokens"] == 30
     assert turn["options"]["tier"] == "high"
@@ -778,10 +797,14 @@ async def test_cancel_run_persists_completed_answers_and_usage(tmp_path, monkeyp
     monkeypatch.setattr(main, "_registry", main.RunRegistry())
     replay = TestClient(main.app).post("/api/chat", json=payload)
     replay_records = _event_records(replay)
-    assert [record[0] for record in replay_records] == [1, 2, 3, 4]
+    # 再生は保存turnのフィールドから組み立てるため、保存済みinsights /
+    # synthesis(キャンセル理由入り)も必ず含む。
+    assert [record[0] for record in replay_records] == [1, 2, 3, 4, 5, 6]
     assert [record[1] for record in replay_records] == [
         "meta",
         "answer",
+        "insights",
+        "synthesis",
         "error",
         "done",
     ]
@@ -837,6 +860,8 @@ def test_general_failure_persists_durable_claim_partial_usage_and_replays(
     assert [event for event, _ in _events(replay)] == [
         "meta",
         "answer",
+        "insights",
+        "synthesis",
         "error",
         "done",
     ]
@@ -867,7 +892,6 @@ def test_startup_marks_orphaned_running_turn_as_interrupted(tmp_path, monkeypatc
             "answers": {},
             "synthesis": {"ok": False, "pending": True},
             "options": {"providers": ["chatgpt"]},
-            "event_log": [],
         }
     )
     main.store.save(conversation)

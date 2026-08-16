@@ -237,7 +237,8 @@ async def test_cancel_during_pending_save_persists_cancelled_turn_and_releases_b
     assert len(saved) == 1
     turn = main.store.load(saved[0]["id"])["turns"][0]
     assert turn["status"] == "cancelled"
-    assert turn["cancelled"] is True
+    # 派生booleanは保存しない(statusが単一ソース)。
+    assert "cancelled" not in turn
     assert budget.released == ["pending-save-cancel"]
     assert budget.settled == []
 
@@ -298,7 +299,7 @@ async def test_cancel_during_chat_final_save_keeps_completed_result_and_settleme
     saved = main.store.list()
     turn = main.store.load(saved[0]["id"])["turns"][0]
     assert turn["status"] == "completed"
-    assert turn["cancelled"] is False
+    assert "cancelled" not in turn
     assert budget.settled == [("final-save-cancel", True)]
     assert budget.released == []
     assert '"cancelled":true' not in response.text
@@ -1243,3 +1244,102 @@ def test_health_settings_plan_and_policy_scan_use_public_scrubber(
     ]
     assert all(response.status_code == 200 for response in responses)
     assert all(secret not in response.text for response in responses)
+
+
+def test_claude_effort_prefixes_have_a_single_source_of_truth():
+    """issue #21-1: planのAUTO推論policyと実送信判定が同じ表を見る。"""
+    import model_capabilities
+    from providers import anthropic as anthropic_provider
+
+    policies = config._AUTO_REASONING_POLICIES["claude"]
+    plan_prefixes, plan_effort = policies[0]
+
+    assert plan_effort == "high"
+    assert plan_prefixes is model_capabilities.CLAUDE_EFFORT_MODEL_PREFIXES
+    assert (
+        anthropic_provider._EFFORT_MODEL_PREFIXES
+        is model_capabilities.CLAUDE_EFFORT_MODEL_PREFIXES
+    )
+    # adaptive thinking / dynamic web searchも同じ表からの導出であること。
+    assert set(anthropic_provider._EXPLICIT_ADAPTIVE_THINKING_MODEL_PREFIXES) <= set(
+        model_capabilities.CLAUDE_EFFORT_MODEL_PREFIXES
+    )
+    assert set(anthropic_provider._DYNAMIC_WEB_SEARCH_MODEL_PREFIXES) <= set(
+        model_capabilities.CLAUDE_EFFORT_MODEL_PREFIXES
+    )
+
+
+def test_missing_plan_output_limit_is_unknown_cost_not_zero(tmp_path):
+    """issue #22: planに出力上限が無いとき、出力コストを0と見なさない。"""
+    import json
+
+    import finance
+
+    price_path = tmp_path / "price.json"
+    price_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": "test-v1",
+                "currency": "USD",
+                "models": {
+                    "claude": {
+                        "claude-test": {
+                            "input_per_million_usd": "1.00",
+                            "output_per_million_usd": "2.00",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    catalog = finance.PriceCatalog(str(price_path))
+    plan = {
+        "billable": True,
+        "options": {"debate_effective": False},
+        "providers": [
+            {
+                "name": "claude",
+                "model": "claude-test",
+                "billable": True,
+                "max_calls": 1,
+                # max_output_tokens が欠落している(再生成planの一部経路など)
+            }
+        ],
+        "synthesizer": {"billable": False},
+        "input_envelope": {"answer_per_call": 2, "debate_per_call": 0},
+        "retry_envelope": {"configured_retries_per_live_call": 0},
+    }
+
+    estimate = finance.estimate_plan_cost(plan, catalog)
+
+    assert estimate["complete"] is False
+    assert estimate["total_micros"] is None
+    assert "plan_max_output_tokens" in estimate["missing"]
+
+
+@pytest.mark.asyncio
+async def test_run_registry_caps_completed_states_without_access():
+    """issue #22: retention未到達でも完了stateが無制限に積み上がらない。"""
+    import runs as runs_module
+
+    registry = runs_module.RunRegistry(retention_sec=86_400, max_completed=3)
+    for index in range(6):
+        request_id = f"request-{index}"
+        state, _ = await registry.claim(
+            request_id,
+            lambda request_id=request_id: runs_module.RunState(
+                request_id=request_id,
+                conversation_id="conversation-1",
+                request_fingerprint="fingerprint-1",
+            ),
+        )
+        await state.finish("completed")
+
+    # claim/lookupがcleanupを走らせ、古い完了stateから捨てられる。
+    await registry.lookup("request-5")
+
+    assert len(registry._runs) == 3
+    assert await registry.lookup("request-0") is None
+    assert await registry.lookup("request-5") is not None

@@ -9,7 +9,7 @@ import '../services/api_client.dart';
 class UsageScreen extends StatefulWidget {
   const UsageScreen({super.key, required this.client});
 
-  final ApiClient client;
+  final ClageApiClient client;
 
   @override
   State<UsageScreen> createState() => _UsageScreenState();
@@ -143,20 +143,70 @@ class _UsageScreenState extends State<UsageScreen> {
             if (snapshot != null) ...[
               _ScopeCard(snapshot: snapshot),
               const SizedBox(height: 12),
-              _BudgetCard(
-                finance: snapshot.finance,
-                reconcilingRequestId: _reconcilingRequestId,
-                onRelease: _releaseReservation,
-              ),
-              const SizedBox(height: 12),
-              _AdminTelemetryCard(admin: snapshot.admin),
-              const SizedBox(height: 12),
+              // 端末内モード(Direct BYOK)では予算・組織管理APIの数値が存在しない。
+              // 「無効」だけのカードを並べても読み取れる情報がないので、
+              // 代わりに何が見えて何が見えないかを1枚で説明する。
+              if (_localOnly(snapshot)) ...[
+                const _LocalOnlyUsageCard(),
+                const SizedBox(height: 12),
+              ] else ...[
+                _BudgetCard(
+                  finance: snapshot.finance,
+                  reconcilingRequestId: _reconcilingRequestId,
+                  onRelease: _releaseReservation,
+                ),
+                const SizedBox(height: 12),
+                _AdminTelemetryCard(admin: snapshot.admin),
+                const SizedBox(height: 12),
+              ],
               for (final provider in snapshot.providers) ...[
                 _ProviderCard(provider: provider),
                 const SizedBox(height: 12),
               ],
               _LimitationsCard(limitations: snapshot.limitations),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Direct BYOK(端末内モード)では、providers/finance/adminが空で返る。
+bool _localOnly(UsageTelemetrySnapshot snapshot) =>
+    snapshot.providers.isEmpty &&
+    !snapshot.finance.configured &&
+    !snapshot.admin.enabled;
+
+class _LocalOnlyUsageCard extends StatelessWidget {
+  const _LocalOnlyUsageCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.phone_android),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('端末内モードの表示範囲', style: theme.textTheme.titleMedium),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text('この画面には、端末に保存された会話から集計した実測値だけを表示します。'),
+            const SizedBox(height: 6),
+            Text(
+              '金額の上限管理(ローカル予算)と組織管理APIの読み取りは、開発用サーバーへ接続した場合の機能です。'
+              '残高・請求額は各社のコンソールで確認してください。',
+              style: theme.textTheme.bodySmall,
+            ),
           ],
         ),
       ),
@@ -186,7 +236,7 @@ class _AdminTelemetryCard extends StatelessWidget {
                   child: Text('組織管理API', style: theme.textTheme.titleMedium),
                 ),
                 Chip(
-                  label: Text(admin.enabled ? '有効' : '無効'),
+                  label: Text(admin.enabled ? '有効' : '未接続'),
                   visualDensity: VisualDensity.compact,
                 ),
               ],
@@ -447,7 +497,7 @@ class _BudgetCard extends StatelessWidget {
                   child: Text('ローカル予算', style: theme.textTheme.titleMedium),
                 ),
                 Chip(
-                  label: Text(finance.configured ? '有効' : '無効'),
+                  label: Text(finance.configured ? '有効' : '未設定'),
                   visualDensity: VisualDensity.compact,
                 ),
               ],

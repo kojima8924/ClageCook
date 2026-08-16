@@ -6,8 +6,128 @@
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+0.2.0は後方互換性を前提としない初期リリースです。以下はbackendの保存schema・API契約・
+環境変数名の破壊的変更で、移行手順を各項目に記載します。
+
+- **会話JSONを `schema_version: 2` へ上げた。** 変更点は2つ。
+  (a) turnの `event_log`（SSEイベントの丸ごとコピー）を廃止した。
+  (b) turnの `cancelled` / `failed` / `interrupted` を保存せず、`status` からの派生値にした。
+  **移行**: 手作業は不要。`schema_version: 1` のファイルは読み込み時に自動で2へ引き上げ、
+  `event_log` は読み捨て、`status` が無いturnは旧派生booleanから復元する。次回保存時に
+  新形式で書き戻される。**未知の `schema_version`（3以降など）は黙って読まず拒否する**
+  （`conversation_schema_unsupported`）。データを退避したい場合は事前に
+  `GET /api/conversations/{id}/export?format=json` で保存しておくこと。
+- **SSEのリプレイを保存turnのフィールドから再構成するようにした。** `event_log` を優先していた
+  従来は、再生成が `answers` / `synthesis` / `insights` だけを更新して `event_log` を書き換えないため、
+  再生成後に同じ `request_id` を再送すると**再生成前の古い回答がリプレイされ**、
+  `GET /api/conversations/{id}` の内容と食い違っていた。**移行**: クライアント側の対応は不要。
+  ただしリプレイは実行時SSEの逐語再現ではなく正規化された列（`phase` を含まない、`insights` /
+  `synthesis` を必ず含む）になり、保存turnからのリプレイでは実行時の `Last-Event-ID` を適用せず
+  必ず先頭から流す（終端の `done` を取りこぼさないため）。各イベントはsource単位で冪等。
+- **HTTPエラーの `detail` を `{code, message, ...}` に統一した。** 従来は構造化オブジェクトと
+  生の日本語文字列が混在しており、構造化側はクライアントで生JSONとして表示され、文字列側は
+  機械判別できなかった。**移行**: クライアントは `detail is String ? detail : jsonEncode(detail)`
+  のような分岐をやめ、`detail["message"]` を表示し `detail["code"]` で分岐すること。
+  復旧手順が異なる2種類の409に別コードを与えた
+  （`request_id_conflict_conversation` = 会話IDを付け直す /
+  `request_id_conflict_fingerprint` = 新しいrequest_idを振り直す）。
+  コード一覧は `docs/API_ERRORS.md`。
+- **一覧系レスポンスを `{"items": [...]}` 封筒へ統一した。** `GET /api/conversations` は裸の配列を
+  やめ、`{items, corrupt_count, corrupt}` を返す。`POST /api/search` は
+  **`POST /api/conversations/search` へ移動**し、`results` キーを `items` へ改名した。
+  **移行**: クライアントはURLとキー名を差し替えること。
+- **エクスポートの形式指定をクエリへ移した。** `/export.md` と `/export.zip` を廃止し、
+  `GET /api/conversations/{id}/export?format=json|md|zip` に一本化した（既定は `json`）。
+  **移行**: 旧URLは404になるのでクエリ形式へ差し替えること。
+- **環境変数を `CLAGE_` 接頭辞へ統一した。** `HISTORY_TURNS` / `MAX_MESSAGE_CHARS` /
+  `RATE_LIMIT_PER_MINUTE` のような汎用名はdocker-composeや共有シェル環境で他プロセスと
+  衝突するため廃止した。**移行**: `backend/.env` の以下を改名する（値はそのまま）。
+
+  | 旧名 | 新名 |
+  | --- | --- |
+  | `INCLUDE_MOCK_PROVIDERS` | `CLAGE_INCLUDE_MOCK_PROVIDERS` |
+  | `HTTP_TIMEOUT_SEC` | `CLAGE_HTTP_TIMEOUT_SEC` |
+  | `HTTP_RETRIES` | `CLAGE_HTTP_RETRIES` |
+  | `MOCK_DELAY_SEC` | `CLAGE_MOCK_DELAY_SEC` |
+  | `MAX_MESSAGE_CHARS` | `CLAGE_MAX_MESSAGE_CHARS` |
+  | `MAX_PROVIDER_CALLS_PER_RUN` | `CLAGE_MAX_PROVIDER_CALLS_PER_RUN` |
+  | `MAX_OUTPUT_TOKENS_PER_RUN` | `CLAGE_MAX_OUTPUT_TOKENS_PER_RUN` |
+  | `MAX_INPUT_BYTES_PER_RUN` | `CLAGE_MAX_INPUT_BYTES_PER_RUN` |
+  | `HISTORY_TURNS` | `CLAGE_HISTORY_TURNS` |
+  | `HISTORY_MAX_CHARS` | `CLAGE_HISTORY_MAX_CHARS` |
+  | `PEER_MAX_CHARS` | `CLAGE_PEER_MAX_CHARS` |
+  | `MAX_CONCURRENT_RUNS` | `CLAGE_MAX_CONCURRENT_RUNS` |
+  | `RATE_LIMIT_PER_MINUTE` | `CLAGE_RATE_LIMIT_PER_MINUTE` |
+  | `SSE_PING_SEC` | `CLAGE_SSE_PING_SEC` |
+  | `RUN_RETENTION_SEC` | `CLAGE_RUN_RETENTION_SEC` |
+  | `SYNTHESIZER_PROVIDER` | `CLAGE_SYNTHESIZER_PROVIDER` |
+  | `SYNTHESIZER_MODEL_{LOW,BALANCED,HIGH}` | `CLAGE_SYNTHESIZER_MODEL_{...}` |
+  | `{CLAUDE,GEMINI,CHATGPT,GROK}_MODEL_{LOW,BALANCED,HIGH}` | `CLAGE_{...}_MODEL_{...}` |
+  | `{CLAUDE,GEMINI,CHATGPT,GROK}_MAX_OUTPUT_TOKENS_{LOW,BALANCED,HIGH}` | `CLAGE_{...}_MAX_OUTPUT_TOKENS_{...}` |
+
+  `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `XAI_API_KEY` /
+  `ANTHROPIC_ADMIN_KEY` / `OPENAI_ADMIN_KEY` / `XAI_MANAGEMENT_KEY` / `XAI_TEAM_ID` は
+  ベンダー標準名のため据え置き。旧名が残っていると起動時にwarningで新名を案内する。
+- **`CLAGE_HTTP_TIMEOUT_SEC` の既定を180秒から600秒（上限1800秒）へ延ばした。** 自動再試行は
+  既定0のままなので、タイムアウトは「課金済みで成果ゼロ」になる。HIGH tierのreasoning +
+  Web検索には180秒では足りなかった。**移行**: 短いタイムアウトが必要なら明示的に設定すること。
+- **アプリの端末内会話ストレージAPIを変更した。** `LocalConversationRepository.list()` /
+  `search()` の戻り値を `List<LocalConversationSummary>` から
+  `LocalConversationListing`（`items` と、読めなかった会話を表す `defects`）へ変えた。
+  `quarantine()` / `rebuildManifestFromRecords()` を追加し、`LocalConversationSummary` から
+  消費者のいなかった `createdAt` / `storageRevision` を削除した。
+  **移行**: 保存recordの形式は変えていないので既存データはそのまま読める。呼び出し側は
+  `(await repository.list()).items` へ差し替えること。
+- **端末内会話1件のサイズ上限を16 MiBから2 MiBへ下げた。** SharedPreferencesは全体を
+  メモリへ展開して保存のたびに書き直すため、16 MiBは現実的に扱えなかった。
+  **移行**: 上限を超えた会話は保存時に失敗する。分岐（fork）で分割するか、
+  ZIP/JSONエクスポートで退避すること。既存データの自動変換や削除は行わない。
+- **Direct BYOKの保存turnから `resume_request.confirm_live_api` /
+  `confirm_sensitive_data` を削除した。** 保存した同意をそのまま再送すると、
+  再開経路で課金確認を迂回できてしまうため。再開は毎回 plan → 確認ダイアログ →
+  実行を通す。**移行**: 既存recordに残っている両キーは読み捨てるだけで害はない。
+- **Direct BYOKの秘密検出ルールをreference serverと同一にした。** ルール表の唯一の仕様を
+  `docs/policy_rules.json` に置き、GitHubトークン、GitHub fine-grained token、AWSアクセス
+  キーID、Bearer、Basic認証、`OPENAI_API_KEY=...` 形式の代入をDirect側にも追加した。
+  伏せ字の粒度（secret_group）と判定versionも `local-patterns-v1` で揃えた。
+  **移行**: 従来Direct BYOKで送信できていた文字列が block / confirm になる場合がある。
+  誤検知は伏せ字置換またはファイルを分けて送ること。
+- **アプリのAPI契約を `ClageApiClient` interfaceへ分離した。** `DirectByokClient` が具象HTTP
+  クライアント `ApiClient` を継承するのをやめ、両者が同じinterfaceを実装する形にした。
+  以前は契約へendpointを1つ足すと、Direct BYOKだけがそれを継承したまま
+  `http://direct.invalid` へ会話本文を送ろうとし、名前解決の失敗に助けられていた。
+  能力差は `supportsRunReconnect` / `supportsLocalStorageRepair` /
+  `supportsBudgetReconciliation` で表現する。Direct BYOKの
+  `releaseBudgetReconciliation()` は空のsnapshotを返す代わりに例外を投げる。
+- **アプリのターン状態表現を `TurnStatus` 1つへ統一した。** `TurnRecord` が
+  `status` / `cancelled` / `interrupted` / `failed` の4つで同じ事実を持っていたのをやめ、
+  `status` を唯一の正、boolはそこからのgetterにした。「利用者が停止した」だけは通信断と
+  意味が違うため `cancelledByUser` として独立に残す。Direct BYOKも `status` と
+  `cancelled` だけを保存する。あわせて `PolicyScanResult.action` / `RunPlanParticipant.mode` /
+  `AnswerRecord.completionStatus` / `SynthesisRecord.completionStatus` /
+  `RegenerationAttempt.status` を enum 化した（未知の値は `PolicyAction.block` や
+  `CompletionStatus.unknown` へ倒し、安全側の既定を保つ）。
+  **移行**: 既存recordは読める。`status` を持たない旧recordだけ従来のbool群から復元する。
+
 ### Added
 
+- ローカル秘密スキャナのルール表の単一仕様 `docs/policy_rules.json` を追加した。reference server
+  (`backend/policy.py`) とDirect BYOK (`app/lib/services/policy_scanner.dart`) の双方に、
+  rule_idの集合・並び・pattern・secret_group・判定versionと、共通sampleの検出位置・伏せ字結果が
+  仕様と一致することを検証する回帰テストを置いた。片方だけ検出が弱くなる状態を検知する。
+- 端末内会話の破損を伝えるアプリ内banner（読めなかった件数と理由、隔離、index再構築）を追加した。
+- HTTPエラーコードの一覧と復旧手順を `docs/API_ERRORS.md` に表として追加した。
+- 主要レスポンスにPydantic `response_model`(`backend/api_schemas.py`)を追加し、`/docs` のOpenAPIへ
+  実際の契約が出るようにした。会話・ターン・添付のモデルは `extra="allow"` で、宣言外のキーを
+  黙って落とさない。
+- 読み取れない会話ファイルを `GET /api/conversations` の `corrupt_count` / `corrupt` で報告するようにした。
+  破損ファイルは隔離ディレクトリへ移さず**その場に残す**(正本を勝手に動かさない)。
+- 会話ファイルの `schema_version` を読み取り時に検証するようにした(従来はstorageだけが未検証で、
+  attachments / finance / runtime_settings は既に検証していた)。
+- 指定した環境変数が不正値・範囲外で実効値と食い違うとき、起動時にwarningで可視化するようにした。
+  従来は黙って既定へ落とすかクランプしており、設定が効いていないことに気付けなかった。
 - 公開ベータ向けのContributing guide、行動規範、Issue / Pull request template、Dependabot設定、
   AI支援開発の役割と検証方法を説明する文書を追加した。
 - pytestがローカルのlive `.env` を継承しても、課金API、管理telemetry、Bearer、4社APIキーをimport前に
@@ -44,8 +164,30 @@
   Pull request eventだけで検証し、main以外のpushとの二重実行を避ける。
 - Provider実測トークン利用量台帳をターンごとの既定折りたたみaccordionへ変更した。設定画面から台帳だけを
   非表示にでき、OFFでもusageの取得・端末保存・エクスポートは継続する。
-- モバイルcomposerを2段の横スクロールstripへ圧縮した。1段目はLOW / BALANCED / HIGHとDEBATE、2段目は
-  設定値 / LOW / MEDIUM / HIGHのeffort、WEB ON / OFF、統合、BLIND、参加Providerを扱う。
+- モバイルcomposerの最上段を「参加AI」専用の行にし、品質 / DEBATE / effort / WEB / 統合 / BLINDは
+  「詳細」で開閉する2段のstripへ移した。既定は畳んだ状態で、参加AIの選択と入力欄だけを常時表示する。
+  各stripの見出し（品質・エフォート）と「詳細」buttonは固定し、中身だけを横スクロールさせる。
+  APIキーが1本も無い場合は参加AIの位置に「APIキー未設定 — 設定する」を出し、設定画面へ直行できる。
+- 参加Providerが空のまま送信した時のエラーを、候補ゼロ（APIキー未設定）と未選択で書き分けた。
+  従来はキー未設定でも「参加するAIを1つ以上選んでください。」と表示し、選択UI自体が存在しない状態で
+  利用者を詰まらせていた。あわせてAPIキー・認証・接続が原因のエラーbannerと回答card内の401表示へ
+  設定画面を開く復帰導線を追加した。
+- 設定画面（旧「接続とBYOK設定」）を初回導線順へ組み替えた。APIキー入力を最上部、実行方式の切替を最下部へ
+  移し、保存buttonを画面下部の固定barへ出して未保存の有無を常時表示する。未保存のまま戻ろうとした場合は
+  破棄確認を挟み、無警告で入力が消えないようにした。各Providerの発行ページを開くリンクと、
+  キー欄の説明文（保存済み／未設定で切替）を追加した。
+- 実API確認dialogの「実行して次回から表示しない」を、肯定buttonと同格のtext buttonから
+  「次回からこの確認を表示しない」チェックボックス＋単一の実行buttonへ畳んだ。誤タップで安全弁が
+  恒久OFFになるのを防ぐ。個人情報の警告はdialog末尾からタイトル直下へ昇格させ、マスク済み文面から
+  該当箇所の抜粋（⟪REDACTED:...⟫ 付き）と誤検知の可能性を明示する。金額・回数の内訳は
+  「内訳」見出し配下の小さめ表記へ落とした。
+- ドロワー下部へ設定と利用状況への導線を追加し、キーボードのない端末ではCtrl/Cmd+Kの案内を出さないようにした。
+  AppBarの実行方式表示を広幅・狭幅とも「DIRECT · 端末内保存」に統一した（従来は広幅のみ `DIRECT · LOCAL`）。
+- 利用状況画面は、端末内モード（Direct BYOK）では中身の無いローカル予算・組織管理APIのcardを並べず、
+  表示範囲の説明cardへ置き換えるようにした。状態chipの表記も「無効」から「未設定」「未接続」へ改めた。
+- 回答card内のicon buttonのタップ領域をMaterial最小の48dpへ広げ、Provider名のブランド色を背景に対して
+  コントラスト比4.5:1を満たす明度へ寄せた（ライトテーマでChatGPT / Grokが読みにくかった）。
+  統合をスキップしたターンのchipは内部値の `none` / `SKIPPED` をやめ「統合なし」1つに整理した。
 - 会議条件を開始時snapshotへ固定し、生成中の入力欄とoptionを次回用として編集可能にした。添付操作は生成中も
   lockし、送信buttonを同位置の停止buttonへ切り替えて現在runへの二重送信を防ぐ。次回下書きは自動queueしない。
 - Provider設定をキー状態とmodel要約付きの折りたたみcardへ変更した。回答cardもProvider、model、実効effort、状態を
@@ -90,6 +232,45 @@
   `state.result` を共通の `RUN_RETENTION_SEC`（既定1時間）へ保持しないようにした。
 
 ### Fixed
+
+- **端末内会話が1件の破損で全損に見える問題(issue #18・アプリ側)**: 一覧・検索がmanifestの全entryを
+  読み、1件でも壊れていれば例外になり、それを起動処理が「実行環境を初期化できない」と受けて
+  接続そのものを無効化していた。結果、健全な会話を開くこともエクスポートすることもできなかった。
+  一覧・検索は破損をskipして `defects` として報告し、部分成功を成功として扱うようにした。
+  特定の会話を開く経路(`read`)は従来どおりfail-closedのまま。壊れた会話はmanifestから外して
+  隔離keyへ退避でき（中身は端末に残す）、残ったrecordからindexを組み直す明示操作も追加した。
+  破損が残っている間は `compact()` が物理削除しない。
+- **Direct BYOKで届かない再接続導線(issue #19)**: 保存turnの `status` 文字列で出し分けていた
+  「実行へ再接続」ボタンと切断バナーの再接続を、実行方式の能力(`supportsRunReconnect`)で
+  出し分けるようにした。Direct BYOKはrunの状態をプロセス内にしか持たないため表示しない。
+- **添付付きターンの再生成が理由不明で失敗する問題(issue #19)**: Direct BYOKの添付本文は端末
+  メモリだけに置くためアプリ再起動で失われるが、再生成計画が例外を投げるだけで理由も回避策も
+  示していなかった。`allowed: false` と `block_reasons: ["attachment_snapshot_missing"]`、
+  および制約と回避策を説明するwarningを返すようにした。
+- **二重課金の穴**: 破損した会話JSONを黙って読み飛ばしていたため、その会話の `request_id` が
+  起動時のrequest indexから落ち、`/api/chat` の「保存済みturnは再実行しない」防波堤を素通りして
+  同じ `request_id` が再実行=再課金され得た。破損がある間は「実行済みかどうか判定できない」ことを
+  409 `request_index_incomplete` で明示して止めるようにした(issue #18)。
+- **再生成後のリプレイが古い回答を返す不整合**: 保存turnが答えを `answers`/`synthesis` と `event_log` の
+  2箇所に持ち、再生成が後者を更新していなかったため。`event_log` を廃止して単一ソース化した。
+- ファイルは存在するのに読み取れない会話を、404「会話が見つかりません」と偽らずに
+  422 `conversation_corrupt` として区別するようにした。起動時の中断turn確定で読み飛ばした
+  ファイルもwarningで報告する。
+- 再生成のキャンセル経路で、予算清算とattemptの中断確定が `_complete_critical` に包まれておらず、
+  二重キャンセル時にattemptが `dispatching` のまま残り予算予約が未清算になり得た。chat側と同じ形に
+  揃えた(issue #22)。
+- planに `max_output_tokens` が無いとき出力コストを0(=無料)と見積もっていた。欠落は
+  「見積り不能」として `plan_max_output_tokens` をmissingへ計上し、`CLAGE_BUDGET_UNKNOWN_POLICY` の
+  判断へ委ねるようにした(issue #22)。
+- 完了した実行状態が、retention経過後もregistryへのアクセスが無い限り残り続けた。件数上限を
+  追加し、古い完了stateから捨てるようにした(issue #22)。
+- Claudeのeffort対応model一覧が `config.py` と `providers/anthropic.py` で二重管理されており、
+  片方だけ更新すると「planはpinnedなeffortを表示するのに実送信では `output_config` が落ちる」
+  状態になり得た。`backend/model_capabilities.py` の表を唯一のソースにした(issue #21-1)。
+- `resume_request` が完了turnからだけ消えていた(orchestratorの戻り値でpending turnごと差し替わるため)。
+  完了turnにも引き継ぐようにし、turnの任意フィールドが「いつ存在するか」をHANDOFF.mdの表にした。
+- `CLAGE_BUDGET_UNKNOWN_POLICY` の不正値を帯域内の魔法値 `"invalid"` で表現するのをやめ、
+  安全側の既定へ落としたうえで起動時に設定エラーとして止めるようにした。
 
 - DEBATE round 2がpartial / failureになった場合も、送信済みcallの実測usageをround 1へ合算し、partial本文と
   監査metadataを保存するよう修正した。送信済みなのにusageが無い場合は照合済みにせず、予算予約を維持する。

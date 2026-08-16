@@ -135,7 +135,7 @@ Direct BYOKを使えないため、この方式が前提です。
 | `true`、`CLAGE_AUTH_TOKEN` なし | 起動を拒否 |
 | `true`、APIキー0個 | Providerなしとしてfail-closed |
 | `true`、APIキー1〜4個 | 設定済み実Providerだけを使用 |
-| `INCLUDE_MOCK_PROVIDERS=true` | 未設定Providerの明示的なmock混在を許可 |
+| `CLAGE_INCLUDE_MOCK_PROVIDERS=true` | 未設定Providerの明示的なmock混在を許可 |
 
 運用上の注意です。
 
@@ -173,14 +173,16 @@ Direct BYOKを使えないため、この方式が前提です。
    Android実機なら、接続済みdeviceを `flutter devices` で確認してから
    `flutter run -d <device-id>` を実行します。
 
-4. アプリ右上の「接続とBYOK設定」で次を設定します。
+4. アプリ右上の歯車（または左のドロワー下部「設定（APIキー・実行方式）」）で次を設定します。
 
-   1. 実行方式を `Direct BYOK` にする。
-   2. Claude / Gemini / ChatGPT / Grokのうち、使う会社のAPIキーを1つ以上入力する。
-   3. 必要ならmodel IDと統合役を変更する。空欄は組み込み既定値を使う。
-   4. 既定の推論エフォートをAUTO / LOW / MEDIUM / HIGHから選び、保存する。
+   1. 画面上部の「AIプロバイダー（APIキー）」で、Claude / Gemini / ChatGPT / Grokのうち
+      使う会社の行を開き、APIキーを1つ以上入力する（各行から発行ページを開けます）。
+   2. 必要ならmodel IDと統合役を変更する。空欄は組み込み既定値を使う。
+   3. 既定の推論エフォートをAUTO / LOW / MEDIUM / HIGHから選ぶ。
+   4. 画面下部に固定された「設定を保存」を押す（未保存のまま戻ろうとすると確認が出ます）。
+      実行方式の切替（Direct BYOK / 開発用サーバー）は同じ画面の最下部にあります。
 
-5. 質問を送ると会議前planが表示されます。**最大呼出回数と利用Providerを確認してから**実行して
+5. 入力欄の上「参加AI」で会議に出すAIを選び、質問を送ると会議前planが表示されます。**最大呼出回数と利用Providerを確認してから**実行して
    ください（Direct BYOKは各社の有料APIを直接呼ぶためです）。
 
 保存済みキーは画面へ読み戻しません。空欄のまま保存すると既存値を維持し、入力した会社だけを
@@ -248,11 +250,11 @@ FastAPIのAPIRouter（エンドポイントを別ファイルへ分割して登�
 - 設定済みProviderの並列回答、部分失敗、統合、DEBATE、BLIND、Provider選択、統合省略
 - model・出力枠の `LOW` / `BALANCED` / `HIGH` と、独立した推論エフォート選択
 - AUTOを設定画面の既定エフォートとして保存し、質問を分類・書き換えずmodel familyの固定policyだけで解決
-- 狭い画面でも全項目を省略しない、2段の横スクロール式composer。品質 / DEBATEと、
-  エフォート / Web / 統合 / BLIND / 参加Providerを分離
+- 狭い画面でも全項目を省略しないcomposer。常時表示の「参加AI」行と、「詳細」で開く
+  品質 / DEBATE・エフォート / Web / 統合 / BLINDの2段（見出しは固定、中身だけ横スクロール）
 - 会議条件を開始時にsnapshotし、生成中も現在のrunを変えずに次回用の下書きと設定を編集できるUI
 - 会議前plan、Provider/model/最大call/最大出力tokenの表示、既定ONの課金API確認。dialogの
-  「実行して次回から表示しない」または設定画面で、通常の課金可能性の確認だけをOFFにできる
+  「次回からこの確認を表示しない」チェックボックスまたは設定画面で、通常の課金可能性の確認だけをOFFにできる
 - 初回promptの質問・添付・memory・履歴・systemをUTF-8 byteで積算し、1 call 1 MiBで遮断
 - APIキー・秘密鍵らしい文字列の端末内blockと、メールアドレス・電話番号らしい文字列の確認
 - partial/incomplete本文の表示・保存。途中終了後の自動継続や同一HTTP要求の自動再試行は行わない
@@ -307,9 +309,11 @@ Reference serverも同じ `LOW / BALANCED / HIGH` のtierと、独立した
 
 ## 操作
 
-composer上部は2段とも横へscrollできます。1段目でモデル・出力枠のLOW / BALANCED / HIGHとDEBATE、
-2段目で独立した推論エフォート、WEB ON / OFF、統合、BLIND、参加AIを選びます。AUTOはcomposerへ
-置かず、設定画面の既定エフォートとしてだけ選択します。
+composer最上段は「参加AI」の行で、会議に出すAIをここで選びます（APIキーが1本も無い場合は
+「APIキー未設定 — 設定する」が出て設定画面へ直行できます）。右端の「詳細」を開くと2段の操作帯が現れ、
+1段目でモデル・出力枠のLOW / BALANCED / HIGHとDEBATE・統合、2段目で独立した推論エフォート、
+WEB ON / OFF、BLINDを選びます。見出しと「詳細」は固定で、中身だけが横へscrollします。
+AUTOはcomposerへ置かず、設定画面の既定エフォートとしてだけ選択します。
 
 会議開始時に質問、tier、effort、DEBATE、統合、BLIND、Web、参加Provider、添付IDをsnapshotします。
 実行が受理された後も入力欄と会議設定は次回用として編集でき、現在のrunは変化しません。送信ボタンは同じ位置の
@@ -354,7 +358,7 @@ ZIPはreference serverでだけ利用できます。
 目的としています。
 
 共通して、実APIを呼ぶ会議・再生成の通常確認は既定ONです（なぜ: 課金が発生し得る操作を、毎回
-利用者の明示的な同意にするためです）。「次回から表示しない」または設定画面で通常の課金可能性の
+利用者の明示的な同意にするためです）。dialogの「次回からこの確認を表示しない」または設定画面で通常の課金可能性の
 確認だけをOFFにできます。APIキー・秘密鍵候補のblockと、メールアドレス・電話番号候補の追加確認は
 この設定では解除されません。ただし両modeの機能は同一ではありません。
 
@@ -385,8 +389,15 @@ ZIPはreference serverでだけ利用できます。
 | `POST` | `/api/policy/scan` | local policy scan |
 | `POST` | `/api/chat` | 会議開始・同一run再接続（SSE） |
 | `POST` | `/api/runs/{request_id}/cancel` | local停止要求 |
-| `GET/POST/PATCH/DELETE` | `/api/conversations...` | 履歴、検索、メモ、添付、export、分岐、再生成 |
+| `GET` | `/api/conversations` | 履歴一覧（`{items, corrupt_count, corrupt}`） |
+| `POST` | `/api/conversations/search` | 検索語をURLへ残さない本文検索（`{query, items}`） |
+| `GET` | `/api/conversations/{id}/export?format=json\|md\|zip` | エクスポート |
+| `GET/POST/PATCH/DELETE` | `/api/conversations...` | 履歴、メモ、添付、分岐、再生成 |
 | `POST` | `/api/budget/reconciliation/{request_id}/release` | 照合待ちの手動確定 |
+
+エラー応答は全て `{"detail": {"code": ..., "message": ...}}` の形です。
+`code` の一覧と復旧手順は [`docs/API_ERRORS.md`](docs/API_ERRORS.md) にあります。
+レスポンススキーマはサーバー起動中の `/docs`（OpenAPI）でも確認できます。
 
 ## テストとビルド
 

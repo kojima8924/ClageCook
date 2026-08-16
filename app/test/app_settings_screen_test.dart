@@ -23,14 +23,15 @@ void main() {
 
     expect(find.textContaining('never-render-this-key'), findsNothing);
 
-    await tester.tap(find.text('開発用サーバー'));
-    await tester.pumpAndSettle();
+    // 実行方式の切替はAPIキー入力より下(変更頻度が低いため)。
     await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
+      find.text('開発用サーバー'),
       500,
       scrollable: find.byType(Scrollable).first,
     );
-    await tester.tap(find.text('実行方式を保存'));
+    await tester.tap(find.text('開発用サーバー'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('設定を保存'));
     await tester.pumpAndSettle();
 
     expect(direct.value.executionMode, ExecutionMode.referenceServer);
@@ -60,15 +61,15 @@ void main() {
     );
 
     expect(find.byType(SegmentedButton<ExecutionMode>), findsNothing);
-    expect(find.textContaining('Web版はAPIキーを保存せず'), findsOneWidget);
     expect(find.byKey(const ValueKey('direct-provider-claude')), findsNothing);
-
     await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
+      find.textContaining('Web版はAPIキーを保存せず'),
       500,
       scrollable: find.byType(Scrollable).first,
     );
-    await tester.tap(find.text('実行方式を保存'));
+    expect(find.textContaining('Web版はAPIキーを保存せず'), findsOneWidget);
+
+    await tester.tap(find.text('設定を保存'));
     await tester.pumpAndSettle();
 
     expect(direct.value.executionMode, ExecutionMode.referenceServer);
@@ -171,12 +172,7 @@ void main() {
 
     expect(customFieldFinder, findsNothing);
     expect(find.textContaining('モデル: 固定・claude-sonnet-5'), findsOneWidget);
-    await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
-      450,
-      scrollable: scrollable,
-    );
-    await tester.tap(find.text('実行方式を保存'));
+    await tester.tap(find.text('設定を保存'));
     await tester.pumpAndSettle();
 
     expect(direct.value.claudeModelOverride, 'claude-sonnet-5');
@@ -195,12 +191,7 @@ void main() {
       ),
     );
 
-    await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
-      500,
-      scrollable: find.byType(Scrollable).first,
-    );
-    await tester.tap(find.text('実行方式を保存'));
+    await tester.tap(find.text('設定を保存'));
     await tester.pump();
 
     expect(find.text('Direct BYOKには1つ以上のAPIキーが必要です。'), findsOneWidget);
@@ -236,12 +227,7 @@ void main() {
 
     await tester.tap(find.text('MEDIUM'));
     await tester.pumpAndSettle();
-    await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
-      400,
-      scrollable: find.byType(Scrollable).first,
-    );
-    await tester.tap(find.text('実行方式を保存'));
+    await tester.tap(find.text('設定を保存'));
     await tester.pumpAndSettle();
 
     expect(direct.value.reasoningMode, ReasoningMode.medium);
@@ -272,12 +258,7 @@ void main() {
     expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
     expect(find.textContaining('OFFでもusageの取得'), findsOneWidget);
 
-    await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
-      500,
-      scrollable: scrollable,
-    );
-    await tester.tap(find.text('実行方式を保存'));
+    await tester.tap(find.text('設定を保存'));
     await tester.pumpAndSettle();
 
     expect(direct.value.showTokenUsageLedger, isFalse);
@@ -308,12 +289,7 @@ void main() {
     expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
     expect(find.textContaining('policy上必要な確認は常に表示'), findsOneWidget);
 
-    await tester.scrollUntilVisible(
-      find.text('実行方式を保存'),
-      500,
-      scrollable: scrollable,
-    );
-    await tester.tap(find.text('実行方式を保存'));
+    await tester.tap(find.text('設定を保存'));
     await tester.pumpAndSettle();
 
     expect(direct.value.showLiveApiConfirmation, isFalse);
@@ -339,10 +315,15 @@ void main() {
     );
 
     expect(find.text('開発用サーバー'), findsNothing);
+    await tester.scrollUntilVisible(
+      find.textContaining('配布版はDirect BYOK専用'),
+      400,
+      scrollable: find.byType(Scrollable).first,
+    );
     expect(find.textContaining('配布版はDirect BYOK専用'), findsOneWidget);
     await tester.scrollUntilVisible(
       find.byKey(const ValueKey('direct-provider-claude')),
-      400,
+      -400,
       scrollable: find.byType(Scrollable).first,
     );
     await tester.tap(find.byKey(const ValueKey('direct-provider-claude')));

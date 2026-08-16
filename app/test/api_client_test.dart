@@ -16,13 +16,13 @@ void main() {
       ),
       client: MockClient((request) async {
         expect(request.method, 'POST');
-        expect(request.url.path, '/api/search');
+        expect(request.url.path, '/api/conversations/search');
         expect(request.url.hasQuery, isFalse);
         expect(jsonDecode(request.body), {'q': '猫 と 犬', 'limit': 50});
         expect(request.headers['authorization'], 'Bearer secret');
         return _jsonResponse({
           'query': '猫 と 犬',
-          'results': [
+          'items': [
             {
               'id': 'conversation-id',
               'title': '動物会議',
@@ -85,10 +85,8 @@ void main() {
     final client = ApiClient(
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
-        expect(
-          request.url.path,
-          '/api/conversations/conversation-id/export.zip',
-        );
+        expect(request.url.path, '/api/conversations/conversation-id/export');
+        expect(request.url.queryParameters['format'], 'zip');
         return http.Response.bytes([0x50, 0x4b, 0x03, 0x04], 200);
       }),
     );
@@ -96,6 +94,61 @@ void main() {
     final exported = await client.exportConversationArchive('conversation-id');
 
     expect(exported, [0x50, 0x4b, 0x03, 0x04]);
+    client.close();
+  });
+
+  test('会話一覧はitems封筒を読み、読めなかった分をdefectとして残す', () async {
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient((request) async {
+        expect(request.url.path, '/api/conversations');
+        return _jsonResponse({
+          'items': [
+            {
+              'id': 'conversation-id',
+              'title': '読めた会話',
+              'updated_at': '2026-07-18T00:00:00Z',
+              'turn_count': 1,
+              'preview': '本文',
+            },
+          ],
+          'corrupt_count': 1,
+          'corrupt': [
+            {'id': 'broken-id', 'file': 'broken-id.json', 'reason': 'invalid_json'},
+          ],
+        });
+      }),
+    );
+
+    final summaries = await client.conversations();
+
+    // 破損1件で全損に見せない。健全な会話は返す。
+    expect(summaries.single.title, '読めた会話');
+    expect(client.storageDefects.single.conversationId, 'broken-id');
+    expect(client.storageDefects.single.reason, 'invalid_json');
+    // 隔離・index再構築は端末内storage専用の操作なので出さない。
+    expect(client.supportsLocalStorageRepair, isFalse);
+    client.close();
+  });
+
+  test('HTTPエラーは構造化detailのmessageだけを表示する', () async {
+    final client = ApiClient(
+      const ConnectionSettings(baseUrl: 'http://localhost:8000'),
+      client: MockClient(
+        (_) async => _jsonResponse({
+          'detail': {'code': 'conversation_not_found', 'message': '会話が見つかりません'},
+        }, statusCode: 404),
+      ),
+    );
+
+    await expectLater(
+      client.conversation('missing-id'),
+      throwsA(
+        isA<ApiException>()
+            .having((error) => error.message, 'message', '会話が見つかりません')
+            .having((error) => error.statusCode, 'statusCode', 404),
+      ),
+    );
     client.close();
   });
 
@@ -525,11 +578,12 @@ void main() {
   });
 }
 
-http.Response _jsonResponse(Object data) => http.Response.bytes(
-  utf8.encode(jsonEncode(data)),
-  200,
-  headers: {'content-type': 'application/json; charset=utf-8'},
-);
+http.Response _jsonResponse(Object data, {int statusCode = 200}) =>
+    http.Response.bytes(
+      utf8.encode(jsonEncode(data)),
+      statusCode,
+      headers: {'content-type': 'application/json; charset=utf-8'},
+    );
 
 Map<String, Object> _runPlanJson() => {
   'allowed': true,

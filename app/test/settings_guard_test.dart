@@ -140,7 +140,8 @@ void main() {
 
     expect(serverFactoryCalls, 0);
     expect(directFactoryCalls, 1);
-    expect(find.text('DIRECT · LOCAL'), findsOneWidget);
+    // 広幅チップと狭幅サブタイトルで同じ文言を使う。
+    expect(find.text('DIRECT · 端末内保存'), findsOneWidget);
   });
 }
 
@@ -208,7 +209,7 @@ http.Response _successResponse(http.Request request) {
         'auth_required': false,
       });
     case '/api/conversations':
-      return _jsonResponse(<Object>[]);
+      return _jsonResponse(_conversationListBody(<Object>[]));
     case '/api/conversations/conversation-id':
       return _jsonResponse({
         'id': 'conversation-id',
@@ -277,3 +278,10 @@ http.Response _jsonResponse(Object data) => http.Response.bytes(
   200,
   headers: {'content-type': 'application/json; charset=utf-8'},
 );
+
+/// `GET /api/conversations` の items 封筒(0.2.0で裸の配列から変更)。
+Map<String, Object> _conversationListBody(List<Object> items) => {
+  'items': items,
+  'corrupt_count': 0,
+  'corrupt': <Object>[],
+};

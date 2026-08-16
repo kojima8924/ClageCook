@@ -1,5 +1,7 @@
 import pytest
 
+import turn_state
+
 import storage
 from scrubbing import scrub_public_data
 from storage import AmbiguousRequestId, ConversationStore
@@ -144,8 +146,14 @@ def test_recover_interrupted_turns_marks_only_running_without_reexecution(tmp_pa
     saved = store.load(conversation["id"])
     interrupted, completed = saved["turns"]
     assert interrupted["status"] == "interrupted"
-    assert interrupted["interrupted"] is True
-    assert interrupted["failed"] is True
+    # 保存されるのはstatusだけ。派生booleanはAPI応答生成時に算出する。
+    assert "interrupted" not in interrupted
+    assert "failed" not in interrupted
+    assert turn_state.derived_flags(interrupted["status"]) == {
+        "cancelled": False,
+        "failed": True,
+        "interrupted": True,
+    }
     assert interrupted["usage_may_be_incomplete"] is True
     assert interrupted["answers"]["chatgpt"]["usage"]["total_tokens"] == 12
     assert "サーバー停止" in interrupted["synthesis"]["error"]

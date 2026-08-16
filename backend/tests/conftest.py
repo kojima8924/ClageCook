@@ -12,7 +12,7 @@ import os
 _SAFE_TEST_ENV = {
     "CLAGE_LIVE_API_ENABLED": "false",
     "CLAGE_ADMIN_TELEMETRY_ENABLED": "false",
-    "INCLUDE_MOCK_PROVIDERS": "false",
+    "CLAGE_INCLUDE_MOCK_PROVIDERS": "false",
     "CLAGE_AUTH_TOKEN": "",
     "ANTHROPIC_API_KEY": "",
     "GEMINI_API_KEY": "",

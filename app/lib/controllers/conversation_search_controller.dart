@@ -17,7 +17,7 @@ class ConversationSearchController {
   static const _debounce = Duration(milliseconds: 350);
 
   /// 検索実行時点のクライアントを参照する(schedule時点で固定しない)。
-  final ApiClient? Function() _client;
+  final ClageApiClient? Function() _client;
   final void Function() _onChanged;
 
   List<ConversationSummary>? _results;

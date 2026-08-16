@@ -87,7 +87,7 @@ def test_blind_command_is_reflected_without_extra_calls(monkeypatch):
 def test_inline_controls_and_disabled_provider_match_runtime(monkeypatch):
     _clear_keys(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
-    monkeypatch.setenv("CHATGPT_MODEL_HIGH", "test-high-model")
+    monkeypatch.setenv("CLAGE_CHATGPT_MODEL_HIGH", "test-high-model")
 
     plan = planning.build_run_plan(
         message="!high\n!debate\nquestion",

@@ -18,6 +18,7 @@ import '../services/local_conversation_store.dart';
 import '../services/settings_store.dart';
 import '../utils/format.dart';
 import '../widgets/home_dialogs.dart';
+import '../widgets/storage_defect_banner.dart';
 import '../widgets/turn_view.dart';
 import 'app_settings_screen.dart';
 import 'settings_screen.dart';
@@ -32,18 +33,19 @@ const _promptTemplates = <String, String>{
   '事実確認': '次の内容を、確認できる事実・推測・未確認事項に分けて検討してください。\n\n',
 };
 
-typedef ApiClientFactory = ApiClient Function(ConnectionSettings settings);
+typedef ApiClientFactory =
+    ClageApiClient Function(ConnectionSettings settings);
 typedef DirectApiClientFactory =
-    ApiClient Function(
+    ClageApiClient Function(
       DirectSettings settings,
       LocalConversationRepository conversations,
     );
 typedef AttachmentPicker = Future<FilePickerResult?> Function();
 
-ApiClient _defaultApiClientFactory(ConnectionSettings settings) =>
+ClageApiClient _defaultApiClientFactory(ConnectionSettings settings) =>
     ApiClient(settings);
 
-ApiClient _defaultDirectApiClientFactory(
+ClageApiClient _defaultDirectApiClientFactory(
   DirectSettings settings,
   LocalConversationRepository conversations,
 ) => DirectByokClient(settings: settings, conversations: conversations);
@@ -113,12 +115,17 @@ class _HomeScreenState extends State<HomeScreen> {
     onChanged: _onSearchChanged,
   );
 
-  ApiClient? _client;
+  ClageApiClient? _client;
   ConnectionSettings? _connection;
   DirectSettings? _directSettings;
   ServerSettings? _server;
   List<ConversationSummary> _summaries = const [];
+  List<LocalConversationDefect> _storageDefects = const [];
+  bool _storageDefectsDismissed = false;
+  bool _repairingStorage = false;
   String _tier = 'balanced';
+  // 初回は「参加AIを選ぶ→質問を送る」だけに絞りたいので、品質などの詳細は畳んでおく。
+  bool _showComposerOptions = false;
   String _defaultReasoningMode = 'auto';
   String? _reasoningModeOverride;
   bool _debate = false;
@@ -214,7 +221,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _loading = true;
       _error = '';
     });
-    ApiClient? candidate;
+    ClageApiClient? candidate;
     ConnectionSettings? attemptedConnection;
     DirectSettings? attemptedDirectSettings;
     try {
@@ -247,6 +254,9 @@ class _HomeScreenState extends State<HomeScreen> {
       ]);
       final server = results[0] as ServerSettings;
       final summaries = results[1] as List<ConversationSummary>;
+      // 読めなかった会話があっても部分成功として扱う。全損に見せないため、
+      // 接続を破棄せず件数と復旧操作だけを知らせる。
+      final defects = candidate.storageDefects;
       ConversationRecord? selected;
       var selectedId = _selectedId;
       if (selectedId != null &&
@@ -270,6 +280,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _directSettings = directSettings;
         _server = server;
         _summaries = summaries;
+        _storageDefects = defects;
+        _storageDefectsDismissed = false;
         _selection.restore(selectedId: selectedId, conversation: selected);
         _selectedProviders
           ..clear()
@@ -298,6 +310,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _directSettings = attemptedDirectSettings;
         _server = null;
         _summaries = const [];
+        _storageDefects = const [];
         _selectedProviders.clear();
         _loading = false;
         _error = '実行環境を初期化できないため接続を無効化しました: $error';
@@ -327,6 +340,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       setState(() {
         _summaries = summaries;
+        _storageDefects = client.storageDefects;
         _selection.commit(token, conversation: conversation);
         if (_terminalReloadConversationId == selectedId) {
           _run.clearTerminalReload();
@@ -348,6 +362,50 @@ class _HomeScreenState extends State<HomeScreen> {
         _loading = false;
         _error = '更新に失敗しました: $error';
       });
+    }
+  }
+
+  /// 読めなかった会話をmanifestから外す。recordは隔離keyへ退避され消えない。
+  Future<void> _quarantineDefectiveConversations() => _repairStorage(
+    (client) => client.quarantineDefectiveConversations(
+      _storageDefects.map((defect) => defect.conversationId),
+    ),
+    (count) => '$count件の会話を隔離しました。中身は端末内に保持しています。',
+  );
+
+  /// 残っているrecordから会話indexを組み直す。
+  Future<void> _rebuildConversationIndex() => _repairStorage(
+    (client) => client.rebuildConversationIndex(),
+    (count) => '$count件の会話でindexを再構築しました。',
+  );
+
+  Future<void> _repairStorage(
+    Future<int> Function(ClageApiClient client) action,
+    String Function(int count) notice,
+  ) async {
+    final client = _client;
+    if (client == null || _repairingStorage) return;
+    setState(() {
+      _repairingStorage = true;
+      _error = '';
+    });
+    try {
+      final count = await action(client);
+      if (!mounted) return;
+      setState(() {
+        _storageDefects = client.storageDefects;
+        _storageDefectsDismissed = false;
+      });
+      await _refresh();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(notice(count))));
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _error = '端末内ストレージを修復できませんでした: $error');
+    } finally {
+      if (mounted) setState(() => _repairingStorage = false);
     }
   }
 
@@ -640,7 +698,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _requiresBillableConfirmation(RunPlan plan, PolicyScanResult policy) =>
       plan.billable &&
       (_directSettings?.showLiveApiConfirmation != false ||
-          policy.action == 'confirm');
+          policy.needsConfirmation);
 
   Future<bool> _approveBillableRun(
     RunPlan plan,
@@ -653,7 +711,7 @@ class _HomeScreenState extends State<HomeScreen> {
       plan: plan,
       policy: policy,
       allowDisableFuture:
-          policy.action != 'confirm' &&
+          !policy.needsConfirmation &&
           widget.directRepository != null &&
           _directSettings != null,
     );
@@ -670,8 +728,8 @@ class _HomeScreenState extends State<HomeScreen> {
   ) {
     if (standalone.blocked) return standalone;
     if (planned.blocked) return planned;
-    if (planned.action == 'confirm') return planned;
-    if (standalone.action == 'confirm') return standalone;
+    if (planned.needsConfirmation) return planned;
+    if (standalone.needsConfirmation) return standalone;
     return planned;
   }
 
@@ -730,7 +788,14 @@ class _HomeScreenState extends State<HomeScreen> {
         .map((item) => item.id)
         .toList(growable: false);
     if (providers.isEmpty) {
-      setState(() => _error = '参加するAIを1つ以上選んでください。');
+      // 候補ゼロ(=APIキー未設定)と、候補はあるが未選択を区別する。
+      // 混同すると「選べと言われたが選ぶ場所が無い」状態になる。
+      final available = _server?.activeWorkers ?? const <String>[];
+      setState(() {
+        _error = available.isEmpty
+            ? 'APIキーが1つも設定されていないため、参加できるAIがありません。設定画面でAPIキーを登録してください。'
+            : '参加するAIを1つ以上選んでください。入力欄の上「参加AI」から選べます。';
+      });
       return;
     }
     setState(() {
@@ -786,7 +851,7 @@ class _HomeScreenState extends State<HomeScreen> {
           return;
         }
         confirmedLiveApi = true;
-        confirmedSensitiveData = effectivePolicy.action == 'confirm';
+        confirmedSensitiveData = effectivePolicy.needsConfirmation;
       }
       startingChat = true;
       final stream = await client.startChat(
@@ -1006,7 +1071,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final conversationId = _conversation?.id ?? _selectedId;
     if (client == null ||
         conversationId == null ||
-        turn.status != 'running' ||
+        !client.supportsRunReconnect ||
+        !turn.running ||
         _sending ||
         _liveTurn != null ||
         _savedRunActionIds.contains(turn.requestId)) {
@@ -1021,7 +1087,50 @@ class _HomeScreenState extends State<HomeScreen> {
       _run.beginRequest();
       _error = '';
     });
+    var confirmedLiveApi = false;
+    var confirmedSensitiveData = false;
     try {
+      // 保存済みの同意を読み戻して再送しない。再開のたびに現在の条件で
+      // planを取り直し、課金・機密の確認を利用者から取り直す。
+      final plan = await client.planChat(
+        message: turn.message.isNotEmpty ? turn.message : turn.cleanMessage,
+        conversationId: conversationId,
+        tier: params.requestTier,
+        reasoningMode: params.requestReasoningMode,
+        debate: resume['debate'] == true,
+        providers: params.requestedProviders,
+        synthesize: resume['synthesize'] != false,
+        blind: resume['blind'] == true,
+        webSearch: resume['web_search'] == true,
+        attachmentIds: params.attachmentIds,
+      );
+      if (!mounted) return;
+      if (!plan.allowed) {
+        final reasons = plan.warnings
+            .map((warning) => warning.message)
+            .where((message) => message.isNotEmpty)
+            .toSet()
+            .join(' ');
+        setState(() {
+          _savedRunActionIds.remove(turn.requestId);
+          _run.endRequest();
+          _error = reasons.isEmpty ? '現在の設定ではこの実行へ再接続できません。' : reasons;
+        });
+        return;
+      }
+      if (plan.billable) {
+        final approved = await _approveBillableRun(plan, plan.policy);
+        if (!mounted) return;
+        if (!approved) {
+          setState(() {
+            _savedRunActionIds.remove(turn.requestId);
+            _run.endRequest();
+          });
+          return;
+        }
+        confirmedLiveApi = true;
+        confirmedSensitiveData = plan.policy.needsConfirmation;
+      }
       final stream = await client.startChat(
         message: turn.message.isNotEmpty ? turn.message : turn.cleanMessage,
         conversationId: conversationId,
@@ -1033,8 +1142,8 @@ class _HomeScreenState extends State<HomeScreen> {
         synthesize: resume['synthesize'] != false,
         blind: resume['blind'] == true,
         webSearch: resume['web_search'] == true,
-        confirmLiveApi: resume['confirm_live_api'] == true,
-        confirmSensitiveData: resume['confirm_sensitive_data'] == true,
+        confirmLiveApi: confirmedLiveApi,
+        confirmSensitiveData: confirmedSensitiveData,
         attachmentIds: params.attachmentIds,
       );
       if (!mounted) return;
@@ -1048,8 +1157,8 @@ class _HomeScreenState extends State<HomeScreen> {
         synthesize: turn.options['synthesize'] != false,
         blind: turn.options['blind'] == true,
         webSearch: turn.options['web_search'] == true,
-        confirmedLiveApi: resume['confirm_live_api'] == true,
-        confirmedSensitiveData: resume['confirm_sensitive_data'] == true,
+        confirmedLiveApi: confirmedLiveApi,
+        confirmedSensitiveData: confirmedSensitiveData,
         conversationId: stream.conversationId.isNotEmpty
             ? stream.conversationId
             : conversationId,
@@ -1081,7 +1190,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _cancelSavedTurn(TurnRecord turn) async {
     final client = _client;
     if (client == null ||
-        turn.status != 'running' ||
+        !turn.running ||
         _savedRunActionIds.contains(turn.requestId)) {
       return;
     }
@@ -1120,7 +1229,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final conversation = _conversation;
     if (client == null ||
         conversation == null ||
-        turn.status != 'completed' ||
+        !turn.completed ||
         _sending ||
         _liveTurn != null) {
       return;
@@ -1242,7 +1351,7 @@ class _HomeScreenState extends State<HomeScreen> {
         target: target,
         provider: provider,
         confirmLiveApi: plan.billable,
-        confirmSensitiveData: plan.billable && plan.policy.action == 'confirm',
+        confirmSensitiveData: plan.billable && plan.policy.needsConfirmation,
       );
       final summaries = await client.conversations();
       if (!mounted || _conversation?.id != conversationId) return;

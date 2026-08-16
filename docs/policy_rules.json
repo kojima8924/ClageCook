@@ -1,0 +1,218 @@
+{
+  "$comment": [
+    "外部送信前のローカル秘密スキャナの単一仕様。reference server (backend/policy.py) と",
+    "Direct BYOK (app/lib/services/policy_scanner.dart) は同じrule集合・同じversion文字列を持つ。",
+    "両側にこのファイルとの一致を検証する回帰テストがあり、片方だけが弱くなるのを防ぐ。",
+    "pattern はPython(re)方言。Dartで書き分けが必要なruleだけ pattern_dart を持つ。",
+    "secret_group が0以外のruleでは、その捕捉groupは必ず一致全体の末尾にある",
+    "(Dart側は group offset APIを持たないため end - length で位置を求める)。"
+  ],
+  "version": "local-patterns-v1",
+  "rules": [
+    {
+      "rule_id": "private_key",
+      "label": "秘密鍵ブロック",
+      "severity": "block",
+      "pattern": "-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----[\\s\\S]*?(?:-----END(?: [A-Z0-9]+)? PRIVATE KEY-----|\\Z)",
+      "pattern_dart": "-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----[\\s\\S]*?(?:-----END(?: [A-Z0-9]+)? PRIVATE KEY-----|$)",
+      "flags": ["i"],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "anthropic_api_key",
+      "label": "Anthropic APIキーらしい文字列",
+      "severity": "block",
+      "pattern": "\\bsk-ant-[A-Za-z0-9_-]{16,}\\b",
+      "flags": [],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "openai_api_key",
+      "label": "OpenAI APIキーらしい文字列",
+      "severity": "block",
+      "pattern": "\\b(?:sk-(?:proj|svcacct)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{32,})\\b",
+      "flags": [],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "google_api_key",
+      "label": "Google APIキーらしい文字列",
+      "severity": "block",
+      "pattern": "\\bAIza[0-9A-Za-z_-]{30,}\\b",
+      "flags": [],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "google_aq_api_key",
+      "label": "Google APIキーらしいAQ形式の文字列",
+      "severity": "block",
+      "pattern": "\\bAQ\\.[0-9A-Za-z_-]{20,}\\b",
+      "flags": [],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "xai_api_key",
+      "label": "xAI APIキーらしい文字列",
+      "severity": "block",
+      "pattern": "\\bxai-[A-Za-z0-9_-]{16,}\\b",
+      "flags": ["i"],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "github_token",
+      "label": "GitHubトークンらしい文字列",
+      "severity": "block",
+      "pattern": "\\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\\b",
+      "flags": ["i"],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "github_fine_grained_token",
+      "label": "GitHub fine-grained tokenらしい文字列",
+      "severity": "block",
+      "pattern": "\\bgithub_pat_[A-Za-z0-9_]{20,}\\b",
+      "flags": ["i"],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "aws_access_key",
+      "label": "AWSアクセスキーIDらしい文字列",
+      "severity": "block",
+      "pattern": "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b",
+      "flags": [],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "bearer_token",
+      "label": "Bearerトークンらしい文字列",
+      "severity": "block",
+      "pattern": "\\bBearer\\s+([A-Za-z0-9._~+/-]{20,}={0,2})",
+      "flags": ["i"],
+      "secret_group": 1
+    },
+    {
+      "rule_id": "assigned_secret",
+      "label": "環境変数へ設定された秘密値らしい文字列",
+      "severity": "block",
+      "pattern": "\\b(?:OPENAI|ANTHROPIC|GEMINI|GOOGLE|XAI|CLAUDE|GROK|CLAGE)(?:_[A-Z0-9]+)*_(?:API_)?(?:KEY|TOKEN)\\s*[:=]\\s*[\"']?([A-Za-z0-9._~+/-]{16,}={0,2})",
+      "flags": ["i"],
+      "secret_group": 1
+    },
+    {
+      "rule_id": "generic_assigned_secret",
+      "label": "秘密値用の変数へ設定された文字列",
+      "severity": "block",
+      "pattern": "\\b(?:AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|DATABASE_URL|[A-Z][A-Z0-9_]{1,64}(?:PASSWORD|PASSWD|SECRET|SECRET_KEY|PRIVATE_KEY|ACCESS_TOKEN))\\s*[:=]\\s*[\"']?([^\\s\"']{8,})",
+      "flags": ["i"],
+      "secret_group": 1
+    },
+    {
+      "rule_id": "basic_auth",
+      "label": "Basic認証情報らしい文字列",
+      "severity": "block",
+      "pattern": "\\bBasic\\s+([A-Za-z0-9+/]{16,}={0,2})",
+      "flags": ["i"],
+      "secret_group": 1
+    },
+    {
+      "rule_id": "email_address",
+      "label": "メールアドレスらしい文字列",
+      "severity": "confirm",
+      "pattern": "(?<![\\w.+-])[\\w.+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+",
+      "flags": [],
+      "secret_group": 0
+    },
+    {
+      "rule_id": "phone_number",
+      "label": "電話番号らしい文字列",
+      "severity": "confirm",
+      "pattern": "(?<!\\d)(?:\\+?\\d[\\d ()-]{8,}\\d)(?!\\d)",
+      "flags": [],
+      "secret_group": 0
+    }
+  ],
+  "samples": [
+    {
+      "name": "allow_plain_question",
+      "text": "4つの回答の共通点と相違点を整理してください。",
+      "action": "allow",
+      "findings": [],
+      "redacted_text": "4つの回答の共通点と相違点を整理してください。"
+    },
+    {
+      "name": "github_token_blocked",
+      "text": "token=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa end",
+      "action": "block",
+      "findings": [{ "rule_id": "github_token", "start": 6, "end": 40 }],
+      "redacted_text": "token=⟪REDACTED:github_token⟫ end"
+    },
+    {
+      "name": "aws_access_key_blocked",
+      "text": "key AKIAAAAAAAAAAAAAAAAA here",
+      "action": "block",
+      "findings": [{ "rule_id": "aws_access_key", "start": 4, "end": 24 }],
+      "redacted_text": "key ⟪REDACTED:aws_access_key⟫ here"
+    },
+    {
+      "name": "bearer_token_redacts_only_the_secret",
+      "text": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+      "action": "block",
+      "findings": [{ "rule_id": "bearer_token", "start": 22, "end": 48 }],
+      "redacted_text": "Authorization: Bearer ⟪REDACTED:bearer_token⟫"
+    },
+    {
+      "name": "basic_auth_redacts_only_the_secret",
+      "text": "Authorization: Basic dXNlcjpwYXNzd29yZC0xMjM0NTY=",
+      "action": "block",
+      "findings": [{ "rule_id": "basic_auth", "start": 21, "end": 49 }],
+      "redacted_text": "Authorization: Basic ⟪REDACTED:basic_auth⟫"
+    },
+    {
+      "name": "assigned_secret_redacts_only_the_value",
+      "text": "CLAGE_AUTH_TOKEN=opaque_token_value_123456789",
+      "action": "block",
+      "findings": [{ "rule_id": "assigned_secret", "start": 17, "end": 45 }],
+      "redacted_text": "CLAGE_AUTH_TOKEN=⟪REDACTED:assigned_secret⟫"
+    },
+    {
+      "name": "generic_assigned_secret_redacts_only_the_value",
+      "text": "APP_PASSWORD=correct-horse-battery-staple",
+      "action": "block",
+      "findings": [
+        { "rule_id": "generic_assigned_secret", "start": 13, "end": 41 }
+      ],
+      "redacted_text": "APP_PASSWORD=⟪REDACTED:generic_assigned_secret⟫"
+    },
+    {
+      "name": "overlap_prefers_the_specific_rule",
+      "text": "OPENAI_API_KEY=sk-proj-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "action": "block",
+      "findings": [{ "rule_id": "openai_api_key", "start": 15, "end": 55 }],
+      "redacted_text": "OPENAI_API_KEY=⟪REDACTED:openai_api_key⟫"
+    },
+    {
+      "name": "short_placeholders_stay_allowed",
+      "text": "OPENAI_API_KEY=your-key and Bearer example",
+      "action": "allow",
+      "findings": [],
+      "redacted_text": "OPENAI_API_KEY=your-key and Bearer example"
+    },
+    {
+      "name": "contact_details_require_confirmation",
+      "text": "連絡先 foo@example.com / +81 90-1234-5678",
+      "action": "confirm",
+      "findings": [
+        { "rule_id": "email_address", "start": 4, "end": 19 },
+        { "rule_id": "phone_number", "start": 22, "end": 38 }
+      ],
+      "redacted_text": "連絡先 ⟪REDACTED:email_address⟫ / ⟪REDACTED:phone_number⟫"
+    },
+    {
+      "name": "private_key_without_footer_reaches_end_of_input",
+      "text": "before\n-----BEGIN PRIVATE KEY-----\nsuper-secret-private-key-material\n",
+      "action": "block",
+      "findings": [{ "rule_id": "private_key", "start": 7, "end": 69 }],
+      "redacted_text": "before\n⟪REDACTED:private_key⟫"
+    }
+  ]
+}

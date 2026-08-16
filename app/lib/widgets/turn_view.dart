@@ -22,6 +22,7 @@ class SavedTurnView extends StatelessWidget {
     this.actionPending = false,
     this.regenerationPending = false,
     this.showTokenUsageLedger = true,
+    this.onOpenSettings,
   });
 
   final TurnRecord turn;
@@ -33,6 +34,9 @@ class SavedTurnView extends StatelessWidget {
   final bool actionPending;
   final bool regenerationPending;
   final bool showTokenUsageLedger;
+
+  /// APIキー起因のエラー表示から設定画面へ戻るための導線。
+  final VoidCallback? onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -48,19 +52,20 @@ class SavedTurnView extends StatelessWidget {
       synthesisStale: turn.synthesisStale,
       reasoningMode: turn.options['reasoning_mode']?.toString() ?? '',
       regenerationPending: regenerationPending,
-      onRegenerateAnswer: turn.status == 'completed'
+      onRegenerateAnswer: turn.completed
           ? onRegenerateAnswer
           : null,
-      onRegenerateSynthesis: turn.status == 'completed'
+      onRegenerateSynthesis: turn.completed
           ? onRegenerateSynthesis
           : null,
-      onForkEdit: turn.status == 'completed' ? onForkEdit : null,
+      onForkEdit: turn.completed ? onForkEdit : null,
       attachments: turn.attachments,
+      onOpenSettings: onOpenSettings,
       showTokenUsageLedger: showTokenUsageLedger,
       usageLedgerStorageKey: PageStorageKey<String>(
         'usage-ledger-${turn.requestId}',
       ),
-      statusActions: turn.status == 'running'
+      statusActions: turn.running
           ? Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -95,10 +100,12 @@ class LiveTurnView extends StatelessWidget {
     super.key,
     required this.turn,
     this.showTokenUsageLedger = true,
+    this.onOpenSettings,
   });
 
   final LiveTurn turn;
   final bool showTokenUsageLedger;
+  final VoidCallback? onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -113,6 +120,7 @@ class LiveTurnView extends StatelessWidget {
       liveError: turn.error,
       synthesisPending: turn.synthesis == null && turn.error.isEmpty,
       reasoningMode: turn.reasoningMode,
+      onOpenSettings: onOpenSettings,
       showTokenUsageLedger: showTokenUsageLedger,
       usageLedgerStorageKey: PageStorageKey<String>(
         'usage-ledger-${turn.requestId}',
@@ -127,6 +135,35 @@ const _providerColors = {
   'chatgpt': Color(0xFF10A37F),
   'grok': Color(0xFF8B95A5),
 };
+
+/// ブランド色をそのまま文字色に使うと、ライトテーマでコントラストが不足する
+/// (ChatGPTの緑で約3:1、Grokの灰で約2.5:1)。背景に対して4.5:1を満たす明度へ寄せる。
+Color _providerAccent(BuildContext context, String provider) {
+  final colors = Theme.of(context).colorScheme;
+  final base = _providerColors[provider];
+  if (base == null) return colors.secondary;
+  return _readableColor(base, colors.surface);
+}
+
+Color _readableColor(Color color, Color background, {double target = 4.5}) {
+  final lighten = background.computeLuminance() <= 0.5;
+  var hsl = HSLColor.fromColor(color);
+  for (var step = 0; step < 24; step++) {
+    if (_contrastRatio(hsl.toColor(), background) >= target) break;
+    final next = hsl.lightness + (lighten ? 0.03 : -0.03);
+    if (next <= 0 || next >= 1) break;
+    hsl = hsl.withLightness(next);
+  }
+  return hsl.toColor();
+}
+
+double _contrastRatio(Color first, Color second) {
+  final a = first.computeLuminance();
+  final b = second.computeLuminance();
+  final lighter = a > b ? a : b;
+  final darker = a > b ? b : a;
+  return (lighter + 0.05) / (darker + 0.05);
+}
 
 class _TurnView extends StatelessWidget {
   const _TurnView({
@@ -147,6 +184,7 @@ class _TurnView extends StatelessWidget {
     this.onRegenerateSynthesis,
     this.onForkEdit,
     this.attachments = const [],
+    this.onOpenSettings,
     this.showTokenUsageLedger = true,
     this.usageLedgerStorageKey,
   });
@@ -168,6 +206,7 @@ class _TurnView extends StatelessWidget {
   final VoidCallback? onRegenerateSynthesis;
   final VoidCallback? onForkEdit;
   final List<AttachmentRecord> attachments;
+  final VoidCallback? onOpenSettings;
   final bool showTokenUsageLedger;
   final Key? usageLedgerStorageKey;
 
@@ -223,6 +262,7 @@ class _TurnView extends StatelessWidget {
                 .toList(growable: false),
             pending: answers[provider] == null && liveError.isEmpty,
             regenerationPending: regenerationPending,
+            onOpenSettings: onOpenSettings,
             onRegenerate: onRegenerateAnswer == null
                 ? null
                 : () => onRegenerateAnswer!(provider),
@@ -342,7 +382,6 @@ class _UserMessage extends StatelessWidget {
                     if (onForkEdit != null)
                       IconButton(
                         tooltip: 'この発言を編集して分岐',
-                        visualDensity: VisualDensity.compact,
                         onPressed: onForkEdit,
                         icon: const Icon(Icons.call_split, size: 19),
                       ),
@@ -423,6 +462,7 @@ class _AnswerCard extends StatelessWidget {
     required this.pending,
     this.regenerationPending = false,
     this.onRegenerate,
+    this.onOpenSettings,
   });
 
   final String provider;
@@ -432,12 +472,13 @@ class _AnswerCard extends StatelessWidget {
   final bool pending;
   final bool regenerationPending;
   final VoidCallback? onRegenerate;
+  final VoidCallback? onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final accent = _providerColors[provider] ?? colors.secondary;
+    final accent = _providerAccent(context, provider);
     final current = answer;
     final failed = current != null && !current.ok;
     final hasInitial = current?.round1Text.trim().isNotEmpty == true;
@@ -505,6 +546,7 @@ class _AnswerCard extends StatelessWidget {
                 message: current.error.isEmpty
                     ? '回答の生成に失敗しました。'
                     : current.error,
+                onOpenSettings: onOpenSettings,
               ),
             if (hasInitial) ...[
               const SizedBox(height: 8),
@@ -635,12 +677,13 @@ class _CompactIconButton extends StatelessWidget {
   final VoidCallback? onPressed;
   final bool progress;
 
+  // Materialの最小タップ領域48dpを下回ると隣のアイコンを誤爆しやすい。
+  // 見た目の密度はpaddingで保ちつつ、当たり判定だけ48dpを確保する。
   @override
   Widget build(BuildContext context) => IconButton(
     tooltip: tooltip,
-    visualDensity: VisualDensity.compact,
-    constraints: const BoxConstraints.tightFor(width: 32, height: 32),
-    padding: const EdgeInsets.all(5),
+    constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+    padding: const EdgeInsets.all(13),
     onPressed: onPressed,
     icon: progress
         ? const SizedBox.square(
@@ -1041,15 +1084,15 @@ class _AttemptHistoryTile extends StatelessWidget {
     final text = result?.text.trim() ?? '';
     final title = attempt.original
         ? '最初の保存回答'
-        : '${providerLabels[provider] ?? provider} · ${_attemptStatusLabel(attempt.status)}';
+        : '${providerLabels[provider] ?? provider} · ${_attemptStatusLabel(attempt.status.wireName)}';
     final leading = Icon(
       attempt.usageMayBeIncomplete
           ? Icons.warning_amber_rounded
           : attempt.original
           ? Icons.history
-          : attempt.status == 'completed'
+          : attempt.status == AttemptStatus.completed
           ? Icons.check_circle_outline
-          : attempt.status == 'failed'
+          : attempt.status == AttemptStatus.failed
           ? Icons.error_outline
           : Icons.pending_outlined,
       color: attempt.usageMayBeIncomplete ? colors.error : null,
@@ -1143,7 +1186,11 @@ class _SynthesisCard extends StatelessWidget {
     final current = synthesis;
     final failed = current != null && !current.ok && !current.skipped;
     final source = current?.source ?? '';
-    final sourceLabel = providerLabels[source] ?? source;
+    // 'none'は「統合役なし」を表す内部値。そのまま出すと意味不明なチップになる。
+    final sourceLabel = source == 'none' ? '' : providerLabels[source] ?? source;
+    final model = current == null || current.model.trim().toLowerCase() == 'none'
+        ? ''
+        : current.model.trim();
     return Card(
       margin: EdgeInsets.zero,
       color: colors.secondaryContainer,
@@ -1203,16 +1250,15 @@ class _SynthesisCard extends StatelessWidget {
                 runSpacing: 5,
                 children: [
                   if (sourceLabel.isNotEmpty) _MetaChip(label: sourceLabel),
-                  if (current.model.trim().isNotEmpty &&
-                      !(current.mock &&
-                          current.model.trim().toLowerCase() == 'mock'))
-                    _MetaChip(label: current.model.trim()),
+                  if (model.isNotEmpty &&
+                      !(current.mock && model.toLowerCase() == 'mock'))
+                    _MetaChip(label: model),
                   if (current.elapsedSec > 0)
                     _MetaChip(label: _elapsedLabel(current.elapsedSec)),
                   if (current.mock)
                     const _MetaChip(label: 'MOCK', emphasized: true),
                   if (current.skipped)
-                    const _MetaChip(label: 'SKIPPED', emphasized: true),
+                    const _MetaChip(label: '統合なし', emphasized: true),
                   if (current.partial)
                     _MetaChip(
                       label: current.incompleteReason.isEmpty
@@ -1301,16 +1347,16 @@ class _RevisionSummary extends StatelessWidget {
               leading: Icon(
                 attempt.original
                     ? Icons.history
-                    : attempt.status == 'completed'
+                    : attempt.status == AttemptStatus.completed
                     ? Icons.check_circle_outline
-                    : attempt.status == 'failed'
+                    : attempt.status == AttemptStatus.failed
                     ? Icons.error_outline
                     : Icons.pending_outlined,
               ),
               title: Text(
                 attempt.original
                     ? '元の${attempt.target == 'synthesis' ? '統合' : '回答'}'
-                    : '${attempt.target == 'synthesis' ? '統合' : attempt.provider} · ${attempt.status}',
+                    : '${attempt.target == 'synthesis' ? '統合' : attempt.provider} · ${attempt.status.wireName}',
               ),
               subtitle: attempt.createdAt.isEmpty
                   ? null
@@ -1327,11 +1373,24 @@ class _ErrorBox extends StatelessWidget {
     required this.message,
     this.title = 'エラー',
     this.warning = false,
+    this.onOpenSettings,
   });
 
   final String title;
   final String message;
   final bool warning;
+
+  /// 認証失敗など、設定を直さないと回復できないエラーの復帰導線。
+  final VoidCallback? onOpenSettings;
+
+  /// APIキーを直せば回復する種類のエラーか。文面はProvider実装側の日本語文言。
+  static bool needsCredentialFix(String message) => const [
+    '認証',
+    'APIキー',
+    '401',
+    '403',
+    '権限',
+  ].any(message.contains);
 
   @override
   Widget build(BuildContext context) {
@@ -1370,6 +1429,17 @@ class _ErrorBox extends StatelessWidget {
                   ),
                 ),
                 SelectableText(message, style: TextStyle(color: foreground)),
+                if (onOpenSettings != null &&
+                    _ErrorBox.needsCredentialFix(message))
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: onOpenSettings,
+                      icon: const Icon(Icons.settings_outlined, size: 18),
+                      label: const Text('設定を開いてAPIキーを直す'),
+                      style: TextButton.styleFrom(foregroundColor: foreground),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -1426,10 +1496,10 @@ String _partialMessage(String reason) {
 
 String _savedTurnNotice(TurnRecord turn) {
   if (turn.cancelled) return 'この会議はキャンセルされ、利用量が不完全な可能性があります。';
-  if (turn.interrupted || turn.status == 'interrupted') {
+  if (turn.interrupted || turn.interrupted) {
     return 'この会議はサーバー停止で中断されました。自動再実行はせず、利用量は不完全な可能性があります。';
   }
-  if (turn.status == 'running') {
+  if (turn.running) {
     return 'このrunは実行中、または接続が切れて状態確認待ちです。再接続して進捗を復元するか停止を要求できます。利用量は不完全な可能性があります。';
   }
   if (turn.failed && turn.usageMayBeIncomplete) {
