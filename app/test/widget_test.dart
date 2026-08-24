@@ -713,7 +713,9 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse(_conversationListBody([_completedConversationSummary()]));
+          return _widgetJsonResponse(
+            _conversationListBody([_completedConversationSummary()]),
+          );
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(_completedConversation());
@@ -768,7 +770,9 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse(_conversationListBody([_completedConversationSummary()]));
+          return _widgetJsonResponse(
+            _conversationListBody([_completedConversationSummary()]),
+          );
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(_completedConversation());
@@ -1071,15 +1075,17 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse(_conversationListBody([
-            {
-              'id': 'conversation-id',
-              'title': '復旧会議',
-              'updated_at': '2026-07-18T00:00:00Z',
-              'turn_count': 1,
-              'preview': '継続中',
-            },
-          ]));
+          return _widgetJsonResponse(
+            _conversationListBody([
+              {
+                'id': 'conversation-id',
+                'title': '復旧会議',
+                'updated_at': '2026-07-18T00:00:00Z',
+                'turn_count': 1,
+                'preview': '継続中',
+              },
+            ]),
+          );
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(
@@ -1145,15 +1151,17 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse(_conversationListBody([
-            {
-              'id': 'conversation-id',
-              'title': '復旧会議',
-              'updated_at': '2026-07-18T00:00:00Z',
-              'turn_count': 1,
-              'preview': '継続中',
-            },
-          ]));
+          return _widgetJsonResponse(
+            _conversationListBody([
+              {
+                'id': 'conversation-id',
+                'title': '復旧会議',
+                'updated_at': '2026-07-18T00:00:00Z',
+                'turn_count': 1,
+                'preview': '継続中',
+              },
+            ]),
+          );
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(_savedRunningConversation(running: true));
@@ -1199,15 +1207,17 @@ void main() {
       const ConnectionSettings(baseUrl: 'http://localhost:8000'),
       client: MockClient((request) async {
         if (request.url.path == '/api/conversations') {
-          return _widgetJsonResponse(_conversationListBody([
-            {
-              'id': 'conversation-id',
-              'title': '停止会議',
-              'updated_at': '2026-07-18T00:00:00Z',
-              'turn_count': 1,
-              'preview': '継続中',
-            },
-          ]));
+          return _widgetJsonResponse(
+            _conversationListBody([
+              {
+                'id': 'conversation-id',
+                'title': '停止会議',
+                'updated_at': '2026-07-18T00:00:00Z',
+                'turn_count': 1,
+                'preview': '継続中',
+              },
+            ]),
+          );
         }
         if (request.url.path == '/api/conversations/conversation-id') {
           return _widgetJsonResponse(

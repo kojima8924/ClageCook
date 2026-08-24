@@ -114,7 +114,11 @@ void main() {
           ],
           'corrupt_count': 1,
           'corrupt': [
-            {'id': 'broken-id', 'file': 'broken-id.json', 'reason': 'invalid_json'},
+            {
+              'id': 'broken-id',
+              'file': 'broken-id.json',
+              'reason': 'invalid_json',
+            },
           ],
         });
       }),

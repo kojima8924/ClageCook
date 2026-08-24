@@ -329,8 +329,7 @@ extension _HomeScreenView on _HomeScreenState {
             defects: _storageDefects,
             repairable: _client?.supportsLocalStorageRepair ?? false,
             busy: _repairingStorage,
-            onQuarantine: () =>
-                unawaited(_quarantineDefectiveConversations()),
+            onQuarantine: () => unawaited(_quarantineDefectiveConversations()),
             onRebuild: () => unawaited(_rebuildConversationIndex()),
             onDismiss: () => _rebuild(() => _storageDefectsDismissed = true),
           ),
@@ -454,8 +453,7 @@ extension _HomeScreenView on _HomeScreenState {
             actionPending: _savedRunActionIds.contains(turn.requestId),
             // 再接続導線は保存turnの文字列ではなく、実行方式の能力で出し分ける。
             onReconnect:
-                turn.running &&
-                    (_client?.supportsRunReconnect ?? false)
+                turn.running && (_client?.supportsRunReconnect ?? false)
                 ? () => unawaited(_reconnectSavedTurn(turn))
                 : null,
             onCancel: turn.running
@@ -473,8 +471,7 @@ extension _HomeScreenView on _HomeScreenState {
                     ),
                   )
                 : null,
-            onRegenerateSynthesis:
-                turn.completed && !turn.synthesis.skipped
+            onRegenerateSynthesis: turn.completed && !turn.synthesis.skipped
                 ? () =>
                       unawaited(_regenerateSavedTurn(turn, target: 'synthesis'))
                 : null,
@@ -952,13 +949,8 @@ extension _HomeScreenView on _HomeScreenState {
 
   /// APIキー・認証・接続が原因のエラーは、設定画面への復帰導線を添える。
   /// (原因表示だけだと初見が行き止まりになるため)
-  bool _errorNeedsSettings(String message) => const [
-    'APIキー',
-    '認証',
-    '401',
-    '実行方式',
-    '接続',
-  ].any(message.contains);
+  bool _errorNeedsSettings(String message) =>
+      const ['APIキー', '認証', '401', '実行方式', '接続'].any(message.contains);
 
   Widget _errorBanner(String message) {
     final colors = Theme.of(context).colorScheme;

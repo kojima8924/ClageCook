@@ -367,7 +367,8 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
       _SettingsNotice(
         icon: Icons.web_asset_off_outlined,
         color: theme.colorScheme.errorContainer,
-        text: 'Web版はAPIキーを保存せず、開発用サーバーだけを利用します。Direct BYOKはAndroid・iOS・Desktopで使用してください。',
+        text:
+            'Web版はAPIキーを保存せず、開発用サーバーだけを利用します。Direct BYOKはAndroid・iOS・Desktopで使用してください。',
       ),
   ];
 

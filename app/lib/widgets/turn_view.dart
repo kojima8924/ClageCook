@@ -52,12 +52,8 @@ class SavedTurnView extends StatelessWidget {
       synthesisStale: turn.synthesisStale,
       reasoningMode: turn.options['reasoning_mode']?.toString() ?? '',
       regenerationPending: regenerationPending,
-      onRegenerateAnswer: turn.completed
-          ? onRegenerateAnswer
-          : null,
-      onRegenerateSynthesis: turn.completed
-          ? onRegenerateSynthesis
-          : null,
+      onRegenerateAnswer: turn.completed ? onRegenerateAnswer : null,
+      onRegenerateSynthesis: turn.completed ? onRegenerateSynthesis : null,
       onForkEdit: turn.completed ? onForkEdit : null,
       attachments: turn.attachments,
       onOpenSettings: onOpenSettings,
@@ -1187,8 +1183,11 @@ class _SynthesisCard extends StatelessWidget {
     final failed = current != null && !current.ok && !current.skipped;
     final source = current?.source ?? '';
     // 'none'は「統合役なし」を表す内部値。そのまま出すと意味不明なチップになる。
-    final sourceLabel = source == 'none' ? '' : providerLabels[source] ?? source;
-    final model = current == null || current.model.trim().toLowerCase() == 'none'
+    final sourceLabel = source == 'none'
+        ? ''
+        : providerLabels[source] ?? source;
+    final model =
+        current == null || current.model.trim().toLowerCase() == 'none'
         ? ''
         : current.model.trim();
     return Card(
@@ -1384,13 +1383,8 @@ class _ErrorBox extends StatelessWidget {
   final VoidCallback? onOpenSettings;
 
   /// APIキーを直せば回復する種類のエラーか。文面はProvider実装側の日本語文言。
-  static bool needsCredentialFix(String message) => const [
-    '認証',
-    'APIキー',
-    '401',
-    '403',
-    '権限',
-  ].any(message.contains);
+  static bool needsCredentialFix(String message) =>
+      const ['認証', 'APIキー', '401', '403', '権限'].any(message.contains);
 
   @override
   Widget build(BuildContext context) {

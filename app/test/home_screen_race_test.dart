@@ -226,7 +226,9 @@ class _HomeBackend {
           'auth_required': false,
         });
       case '/api/conversations':
-        return _jsonResponse(_conversationListBody([_summary('a', '会話A'), _summary('b', '会話B')]));
+        return _jsonResponse(
+          _conversationListBody([_summary('a', '会話A'), _summary('b', '会話B')]),
+        );
       case '/api/conversations/a':
         _conversationALoads++;
         if (delaySecondConversationA && _conversationALoads == 2) {

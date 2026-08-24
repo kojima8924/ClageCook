@@ -33,8 +33,7 @@ const _promptTemplates = <String, String>{
   '事実確認': '次の内容を、確認できる事実・推測・未確認事項に分けて検討してください。\n\n',
 };
 
-typedef ApiClientFactory =
-    ClageApiClient Function(ConnectionSettings settings);
+typedef ApiClientFactory = ClageApiClient Function(ConnectionSettings settings);
 typedef DirectApiClientFactory =
     ClageApiClient Function(
       DirectSettings settings,

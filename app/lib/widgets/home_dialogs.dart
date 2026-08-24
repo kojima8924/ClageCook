@@ -53,7 +53,9 @@ Future<bool?> showPolicyBlockedDialog(
               ),
               child: Padding(
                 padding: const EdgeInsets.all(12),
-                child: SelectableText(redacted.isEmpty ? '⟪REDACTED⟫' : redacted),
+                child: SelectableText(
+                  redacted.isEmpty ? '⟪REDACTED⟫' : redacted,
+                ),
               ),
             ),
             if (policy.disclaimer.isNotEmpty) ...[
@@ -218,7 +220,10 @@ class _BillableRunConfirmationDialogState
                 style: theme.textTheme.titleSmall,
               ),
               if (plan.costEstimate.priceVersion != null)
-                Text('価格版: ${plan.costEstimate.priceVersion}', style: detailStyle),
+                Text(
+                  '価格版: ${plan.costEstimate.priceVersion}',
+                  style: detailStyle,
+                ),
               if (plan.budget.configured) ...[
                 if (plan.budget.perRunLimitUsd != null)
                   Text('1会議上限: \$${plan.budget.perRunLimitUsd}'),

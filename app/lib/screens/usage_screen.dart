@@ -195,7 +195,10 @@ class _LocalOnlyUsageCard extends StatelessWidget {
                 const Icon(Icons.phone_android),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text('端末内モードの表示範囲', style: theme.textTheme.titleMedium),
+                  child: Text(
+                    '端末内モードの表示範囲',
+                    style: theme.textTheme.titleMedium,
+                  ),
                 ),
               ],
             ),
