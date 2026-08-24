@@ -780,13 +780,74 @@ async def test_gemini_budget_exceeded_is_preserved_as_incomplete_reason():
 
 
 @pytest.mark.asyncio
-async def test_anthropic_pause_turn_is_explicitly_incomplete():
-    def handler(_request: httpx.Request):
+async def test_anthropic_pause_turn_continues_and_merges(monkeypatch):
+    """issue #20: pause_turnは継続リクエストで最後まで生成し、usageを合算する。"""
+    requests_seen: list[dict] = []
+    paused_content = [
+        {"type": "server_tool_use", "id": "tool_1", "name": "web_search",
+         "input": {"query": "clage"}},
+        {"type": "text", "text": "part1"},
+    ]
+
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        requests_seen.append(body)
+        if len(requests_seen) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "claude-opus-4-8",
+                    "content": paused_content,
+                    "stop_reason": "pause_turn",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            )
         return httpx.Response(
             200,
             json={
                 "model": "claude-opus-4-8",
-                "content": [{"type": "text", "text": "partial answer"}],
+                "content": [{"type": "text", "text": "part2"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 7},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await AnthropicProvider(
+            name="claude",
+            model="claude-opus-4-8",
+            api_key="secret",
+            client=client,
+        ).complete(CompletionRequest(prompt="hello", web_search=True))
+
+    assert len(requests_seen) == 2
+    # 継続リクエストは、pauseで返ったcontentをassistantターンとして丸ごと積む
+    assert requests_seen[1]["messages"] == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": paused_content},
+    ]
+    assert result.text == "part1\n\npart2"
+    assert result.finish_reason == "end_turn"
+    assert result.completion_status == "completed"
+    assert result.partial is False
+    # 継続分も課金されるので合算して報告する
+    assert result.usage == {"input_tokens": 8, "output_tokens": 9, "total_tokens": 17}
+    assert result.request_audit["http_attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_anthropic_pause_turn_stops_at_cap_as_incomplete():
+    """継続上限に達したら、エラーにせずそれまでの本文をincompleteで返す。"""
+    calls = 0
+
+    def handler(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": f"part{calls}"}],
                 "stop_reason": "pause_turn",
                 "usage": {"input_tokens": 3, "output_tokens": 2},
             },
@@ -800,11 +861,55 @@ async def test_anthropic_pause_turn_is_explicitly_incomplete():
             client=client,
         ).complete(CompletionRequest(prompt="hello", web_search=True))
 
-    assert result.text == "partial answer"
+    assert calls == 4  # 初回 + 継続3回(_MAX_PAUSE_TURN_CONTINUATIONS)
+    assert result.text == "part1\n\npart2\n\npart3\n\npart4"
     assert result.finish_reason == "pause_turn"
     assert result.completion_status == "incomplete"
     assert result.partial is True
     assert result.incomplete_reason == "pause_turn"
+    assert result.usage == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_refusal_during_continuation_discards_all_output():
+    """継続中にrefusalが返ったら、継続前の回の途中出力ごと破棄する。"""
+    calls = 0
+
+    def handler(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": "must-not-surface"}],
+                    "stop_reason": "pause_turn",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "claude-opus-4-8",
+                "content": [],
+                "stop_reason": "refusal",
+                "usage": {"input_tokens": 4, "output_tokens": 1},
+            },
+        )
+
+    async with _client(handler) as client:
+        with pytest.raises(ProviderError) as excinfo:
+            await AnthropicProvider(
+                name="claude",
+                model="claude-opus-4-8",
+                api_key="secret",
+                client=client,
+            ).complete(CompletionRequest(prompt="hello", web_search=True))
+
+    assert calls == 2
+    assert excinfo.value.error_code == "model_refusal"
+    assert "must-not-surface" not in str(excinfo.value)
 
 
 @pytest.mark.asyncio
