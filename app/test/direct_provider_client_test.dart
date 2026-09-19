@@ -629,6 +629,73 @@ void main() {
       {'role': 'user', 'content': '質問'},
     ]);
   });
+
+  group('debate usageの合算', () {
+    test('同じ量の別名キーを1回だけ数え、Input+OutputとTotalを揃える', () {
+      final merged = DirectProviderClient.mergeUsage(
+        {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15},
+        {'input_tokens': 20, 'output_tokens': 8, 'total_tokens': 28},
+      );
+      expect(merged['input_tokens'], 30);
+      expect(merged['output_tokens'], 13);
+      expect(merged['total_tokens'], 43);
+      expect(merged.containsKey('prompt_tokens'), isFalse);
+      expect(merged.containsKey('completion_tokens'), isFalse);
+    });
+
+    test('正準名と別名が同居しても同じ実測値を二重に足さない', () {
+      final merged = DirectProviderClient.mergeUsage({
+        'input_tokens': 10,
+        'prompt_tokens': 10,
+        'output_tokens': 4,
+        'completion_tokens': 4,
+        'total_tokens': 14,
+      }, null);
+      expect(merged['input_tokens'], 10);
+      expect(merged['output_tokens'], 4);
+      expect(merged['total_tokens'], 14);
+    });
+
+    test('片方にtotal_tokensが無くても巡ごとの実効合計を取りこぼさない', () {
+      final merged = DirectProviderClient.mergeUsage(
+        {'input_tokens': 100, 'output_tokens': 50, 'total_tokens': 150},
+        {'input_tokens': 200, 'output_tokens': 80},
+      );
+      expect(merged['input_tokens'], 300);
+      expect(merged['output_tokens'], 130);
+      expect(merged['total_tokens'], 430);
+    });
+
+    test('reasoning・cacheなどの実測カウンタは素直に足す', () {
+      final merged = DirectProviderClient.mergeUsage(
+        {
+          'input_tokens': 1,
+          'output_tokens': 2,
+          'reasoning_tokens': 7,
+          'cached_input_tokens': 3,
+        },
+        {
+          'input_tokens': 1,
+          'output_tokens': 2,
+          'reasoning_tokens': 5,
+          'cached_input_tokens': 4,
+        },
+      );
+      expect(merged['reasoning_tokens'], 12);
+      expect(merged['cached_input_tokens'], 7);
+      expect(merged['total_tokens'], 6);
+    });
+
+    test('usageが無い巡は合計にも現れない', () {
+      expect(DirectProviderClient.mergeUsage(null, null), isEmpty);
+      expect(DirectProviderClient.mergeUsage(const {}, const {}), isEmpty);
+      final merged = DirectProviderClient.mergeUsage(const {}, {
+        'input_tokens': 4,
+        'output_tokens': 6,
+      });
+      expect(merged['total_tokens'], 10);
+    });
+  });
 }
 
 DirectProviderRequest _grokRequest({

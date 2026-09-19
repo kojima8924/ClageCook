@@ -85,6 +85,9 @@ class CompletionResult:
     completion_status: str = "completed"
     partial: bool = False
     incomplete_reason: str | None = None
+    # ベンダーが未知の完了status値を返し、完了を確認できなかったことを示す。
+    # 本文の欠損を意味しない(issue #21-3)。
+    completion_unverified: bool = False
     usage_may_be_incomplete: bool = False
     request_audit: dict[str, Any] = field(default_factory=dict)
     quota_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -444,7 +447,12 @@ def completion_metadata(
 ) -> dict[str, Any]:
     """ベンダー状態を、UIが共通に扱える安全な完了状態へ正規化する。"""
     normalized = str(status or default_status).strip().lower()
-    if normalized not in _COMPLETION_STATUSES:
+    # ベンダーが新しいstatus値を返し始めても、こちらの列挙に無いというだけで
+    # 「失敗」へ倒さない。未知値は "unknown" に正規化したうえで、本文の欠損
+    # ではなく「完了を確認できなかった」印として別の旗で持ち回る(issue #21-3)。
+    # ベンダー由来の文字列自体は反射しない(公開データへ生値を出さないため)。
+    unverified = normalized not in _COMPLETION_STATUSES
+    if unverified:
         normalized = "unknown"
 
     reason: str | None = None
@@ -461,8 +469,13 @@ def completion_metadata(
 
     return {
         "completion_status": normalized,
-        "partial": normalized != "completed" and bool(text.strip()),
+        # "unknown" は本文が途中で切れた証拠ではないため partial に含めない。
+        # partial は「欠けた回答」を意味し、相互批評・統合から外す根拠になる。
+        "partial": (
+            normalized not in {"completed", "unknown"} and bool(text.strip())
+        ),
         "incomplete_reason": reason,
+        "completion_unverified": unverified,
     }
 
 

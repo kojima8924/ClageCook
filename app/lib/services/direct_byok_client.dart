@@ -31,6 +31,13 @@ const _directProviderOrder = <DirectProvider>[
 const _maxDirectRunOutputTokens = 196608;
 const _maxDirectWorkerInputBytes = 1024 * 1024;
 
+/// 課金済み結果をローカルへ書き込むときの保存試行回数。
+///
+/// Provider呼び出しは既に終わっていて請求は確定しているため、会議(turn)でも
+/// 再生成でも同じ回数だけ粘る。ここが経路ごとに違うと「同じ金額を払ったのに
+/// 片方だけ先に諦める」ことになるので、定数を1か所にまとめて共有する。
+const _persistSaveAttempts = 4;
+
 typedef DirectProviderClientFactory = DirectProviderClient Function();
 
 /// FastAPIを介さず、端末から4社APIへ直接接続する [ClageApiClient] 実装。
@@ -72,6 +79,10 @@ class DirectByokClient implements ClageApiClient {
   final Map<String, String> _regenerationReservations = {};
 
   final Map<String, Map<String, _DirectAttachment>> _attachments = {};
+
+  /// 退避済みの課金済み結果。keyはrequest_id / regeneration_idで、値は退避先の
+  /// 会話ID。同じ結果を失敗のたびに何本も退避して会話一覧を汚さないための台帳。
+  final Map<String, String> _rescuedResults = {};
 
   List<LocalConversationDefect> _storageDefects =
       const <LocalConversationDefect>[];
@@ -420,49 +431,55 @@ class DirectByokClient implements ClageApiClient {
     required List<_DirectAttachment> attachments,
     required String status,
     required bool cancelled,
+    Map<String, dynamic> contextRedaction = const {},
   }) async {
-    for (var attempt = 0; attempt < 2; attempt++) {
+    // ターン本体は読み込んだ会話に依存しないので、競合retryの外で1度だけ組む。
+    // 保存に失敗し切ったときへそのまま退避できるようにする狙いもある。
+    final turn = <String, dynamic>{
+      'request_id': state.requestId,
+      'created_at': _now(),
+      'message': message,
+      'clean_message': message,
+      'options': {
+        'tier': tier,
+        'reasoning_mode': reasoningMode.name,
+        'debate': debate,
+        'providers': providers.map((item) => item.name).toList(),
+        'synthesize': synthesize,
+        'blind': blind,
+        'web_search': webSearch,
+      },
+      // 同意(confirm_live_api / confirm_sensitive_data)は保存しない。
+      // 保存された同意をそのまま再送すると、再実行時に課金確認を迂回できて
+      // しまう。再開経路は毎回 plan → 確認ダイアログ → startChat を通す。
+      'resume_request': {
+        'tier': tier,
+        'reasoning_mode': reasoningMode.name,
+        'debate': debate,
+        'providers': providers.map((item) => item.name).toList(),
+        'synthesize': synthesize,
+        'blind': blind,
+        'web_search': webSearch,
+        'attachment_ids': attachmentIds,
+      },
+      'answers': _cloneMapMap(answers),
+      'synthesis': _cloneMap(synthesis),
+      // 同じ事実をstatus/interrupted/failedへ重複して書かない。書き手が
+      // 片方だけ更新して表示が食い違う経路を、保存schemaの側で塞ぐ。
+      // cancelledは「利用者が止めた」で、通信断のinterruptedとは意味が違う。
+      'status': status,
+      'cancelled': cancelled,
+      'usage_may_be_incomplete': cancelled,
+      'attachments': _attachmentReferences(state.conversationId, attachments),
+      // 履歴・メモを伏せ字にして送った事実。空なら置換していない。
+      if (contextRedaction.isNotEmpty) 'context_redaction': contextRedaction,
+    };
+    for (var attempt = 0; attempt < _persistSaveAttempts; attempt++) {
       final current = await _requiredConversation(state.conversationId);
       final conversation = _cloneMap(current.value);
       final turns = _mapList(conversation['turns']);
-      if (turns.any((turn) => turn['request_id'] == state.requestId)) return;
-      turns.add({
-        'request_id': state.requestId,
-        'created_at': _now(),
-        'message': message,
-        'clean_message': message,
-        'options': {
-          'tier': tier,
-          'reasoning_mode': reasoningMode.name,
-          'debate': debate,
-          'providers': providers.map((item) => item.name).toList(),
-          'synthesize': synthesize,
-          'blind': blind,
-          'web_search': webSearch,
-        },
-        // 同意(confirm_live_api / confirm_sensitive_data)は保存しない。
-        // 保存された同意をそのまま再送すると、再実行時に課金確認を迂回できて
-        // しまう。再開経路は毎回 plan → 確認ダイアログ → startChat を通す。
-        'resume_request': {
-          'tier': tier,
-          'reasoning_mode': reasoningMode.name,
-          'debate': debate,
-          'providers': providers.map((item) => item.name).toList(),
-          'synthesize': synthesize,
-          'blind': blind,
-          'web_search': webSearch,
-          'attachment_ids': attachmentIds,
-        },
-        'answers': _cloneMapMap(answers),
-        'synthesis': _cloneMap(synthesis),
-        // 同じ事実をstatus/interrupted/failedへ重複して書かない。書き手が
-        // 片方だけ更新して表示が食い違う経路を、保存schemaの側で塞ぐ。
-        // cancelledは「利用者が止めた」で、通信断のinterruptedとは意味が違う。
-        'status': status,
-        'cancelled': cancelled,
-        'usage_may_be_incomplete': cancelled,
-        'attachments': _attachmentReferences(state.conversationId, attachments),
-      });
+      if (turns.any((item) => item['request_id'] == state.requestId)) return;
+      turns.add(_cloneMap(turn));
       conversation['turns'] = turns;
       conversation['updated_at'] = _now();
       final title = conversation['title']?.toString().trim() ?? '';
@@ -476,10 +493,59 @@ class DirectByokClient implements ClageApiClient {
         );
         return;
       } on LocalConversationConflict {
-        if (attempt == 1) rethrow;
+        if (attempt == _persistSaveAttempts - 1) {
+          throw await _rescueBilledTurn(
+            sourceConversationId: state.conversationId,
+            rescueKey: state.requestId,
+            title: _titleFromMessage(message),
+            turn: turn,
+          );
+        }
       }
     }
   }
+
+  /// 保存し切れなかった課金済みターンを、別の会話として退避する。
+  ///
+  /// 競合しているのは元の会話docだけなので、新しいdocへ書けば既存のexport
+  /// (JSON / ZIP)導線にそのまま乗る。課金して得た本文を黙って捨てないことが
+  /// 目的で、退避自体に失敗しても元の保存失敗は必ず利用者へ伝える。
+  ///
+  /// 会話が削除済み(`_requiredConversation` が失敗)の場合は退避しない。
+  /// 利用者が明示的に消した会話を、こちらの都合で復活させないため。
+  Future<ApiException> _rescueBilledTurn({
+    required String sourceConversationId,
+    required String rescueKey,
+    required String title,
+    required Map<String, dynamic> turn,
+  }) async {
+    final rescueTitle = '退避: $title';
+    final existing = _rescuedResults[rescueKey];
+    if (existing != null) return ApiException(_rescueMessage(rescueTitle));
+    try {
+      final draft = await _conversations.create();
+      final conversation = _cloneMap(draft.value);
+      conversation['title'] = rescueTitle;
+      conversation['rescued_from'] = sourceConversationId;
+      conversation['turns'] = [_cloneMap(turn)];
+      conversation['updated_at'] = _now();
+      final saved = await _conversations.save(
+        conversation,
+        expectedStorageRevision: draft.storageRevision,
+      );
+      _rescuedResults[rescueKey] = saved.value['id']?.toString() ?? '';
+      return ApiException(_rescueMessage(rescueTitle));
+    } catch (_) {
+      return const ApiException(
+        '課金済みの結果を端末へ保存できず、退避もできませんでした。'
+        '画面に表示されている本文を手元へコピーしてから操作を続けてください。',
+      );
+    }
+  }
+
+  String _rescueMessage(String rescueTitle) =>
+      '課金済みの結果を元の会話へ保存できませんでした。'
+      '本文は会話「$rescueTitle」として退避したので、exportで取り出せます。';
 
   @override
   Future<List<ConversationSummary>> conversations() async {
@@ -893,7 +959,7 @@ class DirectByokClient implements ClageApiClient {
   }) async {
     // Provider呼び出しは既に一度だけ完了している。以降は保存だけを再試行し、
     // renameや別ターン保存との競合で課金済み結果を失わないようにする。
-    for (var attempt = 0; attempt < 4; attempt++) {
+    for (var attempt = 0; attempt < _persistSaveAttempts; attempt++) {
       final current = await _requiredConversation(conversationId);
       final conversation = _cloneMap(current.value);
       final turns = _mapList(conversation['turns']);
@@ -949,7 +1015,19 @@ class DirectByokClient implements ClageApiClient {
         );
         return ConversationRecord.fromJson(saved.value);
       } on LocalConversationConflict {
-        if (attempt == 3) rethrow;
+        if (attempt == _persistSaveAttempts - 1) {
+          // 会議側と同じく、課金済み本文をexportできる形へ退避してから諦める。
+          throw await _rescueBilledTurn(
+            sourceConversationId: conversationId,
+            rescueKey: regenerationId,
+            title: _titleFromMessage(
+              turn['clean_message']?.toString() ??
+                  turn['message']?.toString() ??
+                  '再生成',
+            ),
+            turn: turn,
+          );
+        }
       }
     }
     throw const ApiException('課金済みの再生成結果をローカルへ保存できませんでした。');

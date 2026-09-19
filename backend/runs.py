@@ -152,6 +152,7 @@ class RunRegistry:
         self._max_completed = max(1, int(max_completed))
         self._clock = clock
         self._before_runner_enter = before_runner_enter
+        self._sweeper: asyncio.Task | None = None
 
     async def claim(
         self,
@@ -229,8 +230,59 @@ class RunRegistry:
                     task.cancel()
             return state, task, False
 
+    async def sweep(self) -> int:
+        """保持期限切れの完了stateを、アクセスを待たずに解放する。"""
+        async with self._lock:
+            before = len(self._runs)
+            self._cleanup_locked()
+            return before - len(self._runs)
+
+    def start_sweeper(self, *, interval_sec: float | None = None) -> None:
+        """retention切れの完了stateを定期回収するbackground taskを開始する。
+
+        cleanupはclaim/lookup/request_cancelのアクセス時にしか動かないため、
+        最後のrunが終わったあと無アクセスで放置されると、完了stateがretentionを
+        過ぎてもメモリに残り続ける(issue #22)。max_completedの件数上限があるので
+        青天井にはならないが、上限に届くまでメモリは戻らない。定期sweepで
+        「アクセスが無くてもretention後には必ず消える」を保証する。
+
+        二重起動はno-op。停止は shutdown() が行う。
+        """
+        if self._sweeper is not None and not self._sweeper.done():
+            return
+        period = (
+            interval_sec
+            if interval_sec is not None and interval_sec > 0
+            else max(1.0, self._retention_sec)
+        )
+        self._sweeper = asyncio.create_task(self._sweep_loop(period))
+
+    async def _sweep_loop(self, period: float) -> None:
+        while True:
+            await asyncio.sleep(period)
+            # sweepの失敗でloopごと落とすと以後の回収が止まる。回収は次周期で
+            # やり直せるため、cancel以外は握り潰して継続する。
+            try:
+                await self.sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 回収は次周期で再試行できる
+                pass
+
+    async def _stop_sweeper(self) -> None:
+        sweeper = self._sweeper
+        self._sweeper = None
+        if sweeper is None or sweeper.done():
+            return
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+
     async def shutdown(self) -> int:
         """全background runnerへcancelを一度だけ通知し、cleanup完了まで待つ。"""
+        await self._stop_sweeper()
         async with self._lock:
             states = list(self._runs.values())
             tasks: list[asyncio.Task] = []

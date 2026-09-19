@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:clage_cook/models.dart';
+import 'package:clage_cook/services/api_contract.dart';
 import 'package:clage_cook/services/direct_byok_client.dart';
 import 'package:clage_cook/services/direct_provider_client.dart';
 import 'package:clage_cook/services/direct_settings_store.dart';
@@ -619,6 +620,265 @@ void main() {
     expect(saved.turns.single.answers['chatgpt']?.text, '競合後の再生成回答');
     client.close();
   });
+
+  test('会議の保存に失敗し切っても課金済み本文をexportできる会話へ退避する', () async {
+    final inner = SharedPreferencesLocalConversationRepository(
+      namespace: LocalConversationNamespace.directByok,
+      valueStore: MemoryLocalConversationValueStore(),
+    );
+    final repository = _AlwaysConflictingRepository(inner)..failSaves = true;
+    final client = DirectByokClient(
+      settings: const DirectSettings(
+        chatGptApiKey: 'test-openai-key',
+        chatGptModelOverride: 'gpt-test',
+      ),
+      conversations: repository,
+      providerClientFactory: () => DirectProviderClient(
+        client: MockClient((_) async => _openAiResponse('課金済みの回答')),
+      ),
+    );
+
+    final stream = await client.startChat(
+      message: '退避の確認',
+      providers: const ['chatgpt'],
+      confirmLiveApi: true,
+    );
+    final events = await stream.events.toList();
+    final error = events.firstWhere((event) => event.event == 'error');
+    expect(error.data['message'], contains('退避'));
+
+    // 会議側の保存試行回数が再生成側と揃っていることを固定する。
+    expect(repository.conflictsBeforeRescue, 4);
+
+    final summaries = await client.conversations();
+    final rescued = summaries.where((item) => item.title.startsWith('退避: '));
+    expect(rescued, hasLength(1));
+    final exported = await client.exportConversationJson(rescued.single.id);
+    expect(exported, contains('課金済みの回答'));
+    expect(exported, contains('rescued_from'));
+    client.close();
+  });
+
+  test('再生成の保存に失敗し切っても課金済み本文を退避し二重に増やさない', () async {
+    final inner = SharedPreferencesLocalConversationRepository(
+      namespace: LocalConversationNamespace.directByok,
+      valueStore: MemoryLocalConversationValueStore(),
+    );
+    final repository = _AlwaysConflictingRepository(inner);
+    final client = DirectByokClient(
+      settings: const DirectSettings(
+        chatGptApiKey: 'test-openai-key',
+        chatGptModelOverride: 'gpt-test',
+      ),
+      conversations: repository,
+      providerClientFactory: () => DirectProviderClient(
+        client: MockClient((_) async => _openAiResponse('最初の回答')),
+      ),
+    );
+
+    final stream = await client.startChat(
+      message: '再生成の退避',
+      providers: const ['chatgpt'],
+      confirmLiveApi: true,
+    );
+    await stream.events.toList();
+    final turnId = (await client.conversation(
+      stream.conversationId,
+    )).turns.single.requestId;
+
+    repository.failSaves = true;
+    await expectLater(
+      client.regenerate(
+        conversationId: stream.conversationId,
+        turnRequestId: turnId,
+        target: 'answer',
+        provider: 'chatgpt',
+        confirmLiveApi: true,
+        regenerationId: 'regeneration-rescue-0001',
+      ),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.toString(),
+          'message',
+          contains('退避'),
+        ),
+      ),
+    );
+    expect(repository.conflicts, 4);
+
+    final rescued = (await client.conversations()).where(
+      (item) => item.title.startsWith('退避: '),
+    );
+    expect(rescued, hasLength(1));
+    client.close();
+  });
+
+  test('履歴の伏字化はmetaと保存turnへ記録し、生値は残さない', () async {
+    final repository = SharedPreferencesLocalConversationRepository(
+      namespace: LocalConversationNamespace.directByok,
+      valueStore: MemoryLocalConversationValueStore(),
+    );
+    final prompts = <String>[];
+    final client = DirectByokClient(
+      settings: const DirectSettings(chatGptApiKey: 'test-openai-key'),
+      conversations: repository,
+      providerClientFactory: () => DirectProviderClient(
+        client: MockClient((request) async {
+          prompts.add(request.body);
+          return _openAiResponse('回答');
+        }),
+      ),
+    );
+
+    final first = await client.startChat(
+      message: '連絡先は foo@example.com です',
+      providers: const ['chatgpt'],
+      confirmLiveApi: true,
+      confirmSensitiveData: true,
+    );
+    await first.events.drain<void>();
+
+    final second = await client.startChat(
+      message: '続きを教えて',
+      conversationId: first.conversationId,
+      providers: const ['chatgpt'],
+      confirmLiveApi: true,
+    );
+    final events = await second.events.toList();
+    final meta = events.firstWhere((event) => event.event == 'meta');
+    final metaRedaction = ContextRedaction.fromJson(
+      Map<String, dynamic>.from(meta.data['context_redaction'] as Map),
+    );
+    expect(metaRedaction.count, greaterThan(0));
+    expect(metaRedaction.labels, contains('メールアドレスらしい文字列'));
+
+    // 履歴は伏字化して送っている(置換自体はやめない)。
+    expect(prompts.last, contains('REDACTED'));
+    expect(prompts.last, isNot(contains('foo@example.com')));
+
+    final saved = await client.conversation(first.conversationId);
+    final redaction = saved.turns.last.contextRedaction;
+    expect(redaction.isNotEmpty, isTrue);
+    expect(redaction.labels, contains('メールアドレスらしい文字列'));
+    expect(saved.turns.first.contextRedaction.isEmpty, isTrue);
+    client.close();
+  });
+}
+
+/// 保存だけが必ず競合するrepository。退避先(rescued_from付き)の保存は通す。
+class _AlwaysConflictingRepository implements LocalConversationRepository {
+  _AlwaysConflictingRepository(this._inner);
+
+  final LocalConversationRepository _inner;
+
+  bool failSaves = false;
+  int conflicts = 0;
+  int? conflictsBeforeRescue;
+
+  @override
+  Future<LocalConversationDocument> save(
+    Map<String, dynamic> conversation, {
+    int? expectedStorageRevision,
+  }) async {
+    final turns = conversation['turns'];
+    final isRescue = conversation['rescued_from'] != null;
+    if (isRescue) {
+      conflictsBeforeRescue ??= conflicts;
+    } else if (failSaves && turns is List && turns.isNotEmpty) {
+      conflicts++;
+      throw LocalConversationConflict(
+        conversationId: conversation['id']?.toString() ?? '',
+        expectedRevision: expectedStorageRevision ?? 0,
+        actualRevision: (expectedStorageRevision ?? 0) + 1,
+      );
+    }
+    return _inner.save(
+      conversation,
+      expectedStorageRevision: expectedStorageRevision,
+    );
+  }
+
+  @override
+  LocalConversationNamespace get namespace => _inner.namespace;
+
+  @override
+  Future<LocalConversationDocument> create({
+    String firstMessage = '',
+    String? conversationId,
+  }) =>
+      _inner.create(firstMessage: firstMessage, conversationId: conversationId);
+
+  @override
+  Future<LocalConversationDocument?> read(String conversationId) =>
+      _inner.read(conversationId);
+
+  @override
+  Future<LocalConversationListing> list() => _inner.list();
+
+  @override
+  Future<LocalConversationListing> search(String query, {int limit = 30}) =>
+      _inner.search(query, limit: limit);
+
+  @override
+  Future<LocalConversationDocument> rename(
+    String conversationId,
+    String title, {
+    int? expectedStorageRevision,
+  }) => _inner.rename(
+    conversationId,
+    title,
+    expectedStorageRevision: expectedStorageRevision,
+  );
+
+  @override
+  Future<void> delete(String conversationId, {int? expectedStorageRevision}) =>
+      _inner.delete(
+        conversationId,
+        expectedStorageRevision: expectedStorageRevision,
+      );
+
+  @override
+  Future<LocalConversationDocument> fork({
+    required String conversationId,
+    required int beforeTurnIndex,
+    required String parentTurnRequestId,
+    String? branchConversationId,
+    int? expectedStorageRevision,
+  }) => _inner.fork(
+    conversationId: conversationId,
+    beforeTurnIndex: beforeTurnIndex,
+    parentTurnRequestId: parentTurnRequestId,
+    branchConversationId: branchConversationId,
+    expectedStorageRevision: expectedStorageRevision,
+  );
+
+  @override
+  Future<LocalConversationDocument> updateMemory({
+    required String conversationId,
+    required int expectedMemoryRevision,
+    required String text,
+    int? expectedStorageRevision,
+  }) => _inner.updateMemory(
+    conversationId: conversationId,
+    expectedMemoryRevision: expectedMemoryRevision,
+    text: text,
+    expectedStorageRevision: expectedStorageRevision,
+  );
+
+  @override
+  Future<String> exportJson(String conversationId) =>
+      _inner.exportJson(conversationId);
+
+  @override
+  Future<int> quarantine(Iterable<String> conversationIds) =>
+      _inner.quarantine(conversationIds);
+
+  @override
+  Future<int> rebuildManifestFromRecords() =>
+      _inner.rebuildManifestFromRecords();
+
+  @override
+  Future<void> compact() => _inner.compact();
 }
 
 http.Response _openAiResponse(String text) => http.Response.bytes(

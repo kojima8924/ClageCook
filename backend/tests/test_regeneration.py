@@ -52,7 +52,7 @@ class _Config:
         return _Config.MAX_OUTPUT_TOKENS[source][tier]
 
     @staticmethod
-    def resolve_reasoning(_source, _model, requested, *, mock=False):
+    def resolve_reasoning(_source, _model, requested, *, tier, mock=False):
         return SimpleNamespace(
             public_dict=lambda: {
                 "requested": requested,

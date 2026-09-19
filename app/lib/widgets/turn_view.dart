@@ -56,6 +56,7 @@ class SavedTurnView extends StatelessWidget {
       onRegenerateSynthesis: turn.completed ? onRegenerateSynthesis : null,
       onForkEdit: turn.completed ? onForkEdit : null,
       attachments: turn.attachments,
+      contextRedaction: turn.contextRedaction,
       onOpenSettings: onOpenSettings,
       showTokenUsageLedger: showTokenUsageLedger,
       usageLedgerStorageKey: PageStorageKey<String>(
@@ -116,6 +117,7 @@ class LiveTurnView extends StatelessWidget {
       liveError: turn.error,
       synthesisPending: turn.synthesis == null && turn.error.isEmpty,
       reasoningMode: turn.reasoningMode,
+      contextRedaction: turn.contextRedaction,
       onOpenSettings: onOpenSettings,
       showTokenUsageLedger: showTokenUsageLedger,
       usageLedgerStorageKey: PageStorageKey<String>(
@@ -183,6 +185,7 @@ class _TurnView extends StatelessWidget {
     this.onOpenSettings,
     this.showTokenUsageLedger = true,
     this.usageLedgerStorageKey,
+    this.contextRedaction = const ContextRedaction(),
   });
 
   final String message;
@@ -205,6 +208,9 @@ class _TurnView extends StatelessWidget {
   final VoidCallback? onOpenSettings;
   final bool showTokenUsageLedger;
   final Key? usageLedgerStorageKey;
+
+  /// 履歴・メモを伏字にして送った事実。空なら何も置換していない。
+  final ContextRedaction contextRedaction;
 
   @override
   Widget build(BuildContext context) {
@@ -234,6 +240,10 @@ class _TurnView extends StatelessWidget {
         if (attachments.isNotEmpty) ...[
           const SizedBox(height: 6),
           _AttachmentChips(attachments: attachments),
+        ],
+        if (contextRedaction.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          _ContextRedactionNotice(redaction: contextRedaction),
         ],
         if (livePhase.isNotEmpty || liveError.isNotEmpty) ...[
           const SizedBox(height: 8),
@@ -296,6 +306,42 @@ class _TurnView extends StatelessWidget {
             onRegenerate: onRegenerateSynthesis,
           ),
       ],
+    );
+  }
+}
+
+/// 履歴・メモの一部を伏字にして送ったことを、そのターンの位置で明示する。
+///
+/// 置換自体は安全側の既定として続けるが、黙って行うと回答が薄い理由が
+/// 利用者から見えない。何を伏せたかの種類だけを示し、生値は出さない。
+class _ContextRedactionNotice extends StatelessWidget {
+  const _ContextRedactionNotice({required this.redaction});
+
+  final ContextRedaction redaction;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final labels = redaction.labels.join('、');
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Tooltip(
+        message: labels.isEmpty
+            ? '過去の発言・回答とローカルメモの該当箇所を ⟪REDACTED⟫ へ置き換えて送信しました。'
+            : '$labels を ⟪REDACTED⟫ へ置き換えて送信しました。今回の質問文はそのまま送っています。',
+        child: Chip(
+          avatar: Icon(
+            Icons.visibility_off_outlined,
+            size: 17,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          label: Text(
+            labels.isEmpty
+                ? '履歴・メモの${redaction.count}箇所を伏字にして送信'
+                : '履歴・メモの${redaction.count}箇所（$labels）を伏字にして送信',
+          ),
+        ),
+      ),
     );
   }
 }

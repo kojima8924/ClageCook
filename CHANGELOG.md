@@ -110,6 +110,34 @@
   `RegenerationAttempt.status` を enum 化した（未知の値は `PolicyAction.block` や
   `CompletionStatus.unknown` へ倒し、安全側の既定を保つ）。
   **移行**: 既存recordは読める。`status` を持たない旧recordだけ従来のbool群から復元する。
+- **tier=low でのAUTO推論effortを medium へ引き下げた（issue #21-2）。** tier=lowの生成上限
+  （Claude/ChatGPT/Grokは既定4,096トークン）に対し、AUTOがhighを選ぶとthinkingが枠を食い、
+  本文が `max_tokens` で切れた `partial` になりやすかった。lowのceilingを黙って引き上げると
+  利用者が選んだコスト上限を越えてしまうため、逆にAUTO側のeffortを枠へ合わせる方を選んだ。
+  判定は tier名ではなく**実効の生成上限**で行うので、`CLAGE_*_MAX_OUTPUT_TOKENS_LOW` を
+  8,192以上へ上げればAUTOは従来どおりhighに戻る。**利用者が明示したeffortは引き下げない。**
+  **移行**: クライアント側の対応は不要。planの `reasoning.source` に新しい値
+  `model_policy_output_capped`（枠に合わせて引き下げた）が増えるので、`source` で分岐して
+  いる場合は未知値を既定側へ倒すこと。内部APIの `config.resolve_reasoning()` は
+  `tier` がキーワード必須引数になった（渡し忘れでplanと実送信が食い違うのを防ぐため）。
+- **未知の完了statusを「失敗」扱いしなくなった（issue #21-3）。** ベンダーが我々の列挙に無い
+  `completion_status` を返し始めると、正常な本文が返っていても全AI失敗になっていた。本文が
+  実際に取れている場合は `ok: true` とし、`warning` に「完了を確認できなかった」旨を入れる。
+  あわせて回答JSONに `completion_unverified`（bool）を追加し、`completion_status: "unknown"`
+  のときの `partial` は **false** になった（未知statusは本文欠損の証拠ではないため）。
+  途中終了（`incomplete`）の扱いは従来どおりで、相互批評・統合の根拠からは除外する。
+  **移行**: `partial` で「一部取得」を表示しているクライアントは、`completion_unverified`
+  または `warning` を別表示にするとよい（未対応でも表示が壊れることはない）。
+
+- **Direct BYOKのdebate回答 `usage` を正準キーでまとめるようにした（issue #22）。** 1巡目と2巡目の
+  usageを全キー単純加算していたため、同じ量を指す別名キー（`prompt_tokens` と `input_tokens` など）が
+  同居すると同一の実測値を二度足し、片方の巡に `total_tokens` が無いと合計だけ取りこぼしていた
+  （トークン利用量台帳のTotalがInput+Outputと合わず、二重計上に見える）。キーを正準名
+  （`input_tokens` / `output_tokens` / `total_tokens` / `cached_input_tokens` / `reasoning_tokens` ほか）へ
+  寄せたうえで、各巡の実効合計（報告値があればそれ、無ければinput+output）をちょうど1回ずつ足す。
+  **移行**: 端末内の既存会話はそのまま読めるので手作業は不要。エクスポートJSONの
+  `answers[*].usage` を機械処理している場合だけ、debate済み回答で `prompt_tokens` /
+  `completion_tokens` のような別名キーが現れなくなる点に合わせること。
 
 ### Added
 
@@ -233,6 +261,21 @@
 
 ### Fixed
 
+- **Claudeのeffort対応modelリストの二重管理を解消した（issue #21-1）**: plan表示側
+  (`backend/config.py`) と実送信payload側 (`backend/providers/anthropic.py`) が同じprefix
+  リストを手でコピーしており、片方だけ更新すると「planはpinned effortを表示するのに実送信では
+  黙って落ちる」乖離が起きた。`backend/model_capabilities.py` の表を唯一のソースにし、両者が
+  そこから導出するようにしたうえで、表の全行について両者が一致することをテストで固定した。
+- **保存済みturnのリプレイ経路で予算予約が未清算のまま残る問題（issue #22）**: 会話lockを取るまでの
+  間に別実行が同じturnを保存していた場合、`_execute_run` が予約をsettleもreleaseもせずに
+  早期returnしていた。Providerを一度も呼んでいない経路なので、`release_undispatched` で
+  必ず解放してから戻るようにした（従来は次回起動時のorphan recoverまで戻らなかった）。
+- **完了した実行stateがアクセスされるまで解放されない問題（issue #22）**: `RunRegistry` の
+  cleanupが `claim` / `lookup` / `request_cancel` の契機でしか動かず、最後の実行の後に
+  リクエストが来ないとretentionを過ぎてもメモリに残っていた（件数上限があるので青天井では
+  なかった）。retention周期で回るsweeperをlifespanで起動し、アクセスが無くても解放されるように
+  した。retention内のstateは従来どおり残す（結果の再取得を壊さないため）。
+
 - **Claudeのweb検索多用時に回答が途中で切れる問題(issue #20)**: `pause_turn`(サーバ側
   ツールループの一時停止)を受けたら、返ってきたcontentをassistantターンとして積んで
   継続リクエストを送り、最後まで生成するようにした(上限3回・全体timeoutの残り時間内)。
@@ -332,6 +375,20 @@
   再接続が現在設定で拒否される問題を修正した。添付順序もrequest fingerprintへ含めた。
 - 部分的なprice tableでも判明済みrateカテゴリをknown subtotalへ加え、unknown `allow` 時に既知費用を
   予約から落とさないようにした。mock/skipped entryは実費の未価格requestへ数えない。
+- **課金済み結果の保存リトライを会議と再生成で揃えた（issue #22 / app）。** 会議のturn保存は2回、
+  再生成は4回と経路ごとに粘り方が違い、同じ金額を払った結果を会議側だけ先に諦めていた。両方を
+  共通定数の4回にし、4回とも保存競合したら本文を破棄せず「退避: <質問>」という別会話へ書き出して、
+  通常のexport（JSON / ZIP）で取り出せるようにした。退避先には `rescued_from` に元の会話IDが入る。
+  退避自体に失敗した場合も、その旨をエラー文言で伝えて黙って失わない。利用者が明示的に削除した
+  会話は復活させない。
+- **履歴・ローカルメモの伏字化を画面上で明示するようにした（issue #22 / app）。** 過去の発言・回答と
+  メモに含まれるメールアドレス等を `⟪REDACTED⟫` へ置換してから再送信しているが、無言で行うため
+  「なぜ回答が文脈を外すのか」が利用者に見えなかった。置換自体は安全側の既定として続けたうえで、
+  伏字にした件数と種類をSSEの `meta` イベントと保存turnの `context_redaction` に記録し、該当ターンへ
+  注記チップとして表示する。記録には検出した生値を含めない。
+- **添付アップロードに失敗したとき、暗黙に作ったドラフト会話を後始末するようにした（issue #22 / app）。**
+  会話を選ばずに添付を選ぶと会話が暗黙に作られるが、アップロードが失敗しても消されず、本文も添付も
+  無い会話が残っていた。この操作で作った会話だけを、ターンが無いことを確認してから削除する。
 
 ### Security
 

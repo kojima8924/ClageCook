@@ -18,6 +18,9 @@ extension _DirectConference on DirectByokClient {
     final answers = <String, Map<String, dynamic>>{};
     Map<String, dynamic>? synthesis;
     DirectRunGuardLease? runGuardLease;
+    // 履歴・メモの伏せ字化は安全側の既定として続けるが、黙って文脈を壊さない
+    // よう「何を伏せたか」を集め、metaイベントと保存turnの両方へ運ぶ。
+    var contextRedaction = const <String, dynamic>{};
     final attachmentIds = attachments
         .map((attachment) => attachment.id)
         .toList(growable: false);
@@ -27,6 +30,15 @@ extension _DirectConference on DirectByokClient {
         operation: DirectRunOperation.conference,
       );
       state.startHeartbeat(_heartbeatInterval);
+      final attachmentContext = _attachmentContext(attachments);
+      final modelMessage = '$message$attachmentContext';
+      final redactedLabels = <String>[];
+      final prompt = _workerPrompt(
+        initialDocument.value,
+        modelMessage,
+        redactedLabels: redactedLabels,
+      );
+      contextRedaction = _contextRedactionJson(redactedLabels);
       state.emit('meta', {
         'request_id': state.requestId,
         'conversation_id': state.conversationId,
@@ -38,10 +50,8 @@ extension _DirectConference on DirectByokClient {
         'blind': blind,
         'web_search': webSearch,
         'synthesizer': _synthesizer?.name ?? '',
+        if (contextRedaction.isNotEmpty) 'context_redaction': contextRedaction,
       });
-      final attachmentContext = _attachmentContext(attachments);
-      final modelMessage = '$message$attachmentContext';
-      final prompt = _workerPrompt(initialDocument.value, modelMessage);
       final futures = <Future<void>>[];
       for (final provider in providers) {
         futures.add(
@@ -82,6 +92,7 @@ extension _DirectConference on DirectByokClient {
           },
           attachmentIds: attachmentIds,
           attachments: attachments,
+          contextRedaction: contextRedaction,
           status: 'interrupted',
           cancelled: true,
         );
@@ -203,6 +214,7 @@ extension _DirectConference on DirectByokClient {
         synthesis: synthesis,
         attachmentIds: attachmentIds,
         attachments: attachments,
+        contextRedaction: contextRedaction,
         status: state.cancelled ? 'interrupted' : 'completed',
         cancelled: state.cancelled,
       );
@@ -226,6 +238,7 @@ extension _DirectConference on DirectByokClient {
           synthesis: synthesis ?? const {'ok': false, 'skipped': true},
           attachmentIds: attachmentIds,
           attachments: attachments,
+          contextRedaction: contextRedaction,
           status: state.cancelled ? 'interrupted' : 'failed',
           cancelled: state.cancelled,
         );

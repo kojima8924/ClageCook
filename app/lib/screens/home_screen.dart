@@ -929,12 +929,19 @@ class _HomeScreenState extends State<HomeScreen> {
       _uploadingAttachment = true;
       _error = '';
     });
+    // 添付のためだけに作った暗黙のドラフト会話。アップロードが失敗したり
+    // 添付を現在の会話へ渡せなかった場合、本文も添付も無い会話が残るので
+    // この操作で作った分だけを後始末する。
+    String? implicitDraftId;
     try {
       var conversation = startingConversation;
       if (selectedId != null && conversation?.id != selectedId) {
         conversation = await client.conversation(selectedId);
       }
-      conversation ??= await client.createDraftConversation();
+      if (conversation == null) {
+        conversation = await client.createDraftConversation();
+        implicitDraftId = conversation.id;
+      }
       final uploaded = <AttachmentRecord>[];
       for (final file in picked.files) {
         final bytes = file.bytes;
@@ -950,13 +957,19 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       }
       final summaries = await client.conversations();
-      if (!mounted) return;
+      if (!mounted) {
+        await _discardImplicitDraft(client, implicitDraftId);
+        return;
+      }
       if (!identical(_client, client) || !_selection.isCurrent(token)) {
+        await _discardImplicitDraft(client, implicitDraftId);
+        if (!mounted) return;
         setState(() {
           _error = '会話または接続先が変更されたため、アップロード済み添付を現在の会話には追加しませんでした。';
         });
         return;
       }
+      implicitDraftId = null;
       setState(() {
         _selection.commit(
           token,
@@ -967,6 +980,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _pendingAttachments.addAll(uploaded);
       });
     } catch (error) {
+      await _discardImplicitDraft(client, implicitDraftId);
       if (!mounted) return;
       setState(() {
         _selection.finish(token);
@@ -974,6 +988,24 @@ class _HomeScreenState extends State<HomeScreen> {
       });
     } finally {
       if (mounted) setState(() => _uploadingAttachment = false);
+    }
+  }
+
+  /// 添付のためだけに作られ、結局使われなかったドラフト会話を消す。
+  ///
+  /// 空の会話が黙って積み上がるのを防ぐのが目的なので、ターンが入っている
+  /// 会話には触れない。後始末の失敗でアップロード失敗の通知を覆い隠さない。
+  Future<void> _discardImplicitDraft(
+    ClageApiClient client,
+    String? conversationId,
+  ) async {
+    if (conversationId == null || conversationId.isEmpty) return;
+    try {
+      final record = await client.conversation(conversationId);
+      if (record.turns.isNotEmpty) return;
+      await client.deleteConversation(conversationId);
+    } catch (_) {
+      // 会話が既に無い・接続先が変わったなどは、この後始末の失敗として無視する。
     }
   }
 
@@ -1452,6 +1484,12 @@ class _HomeScreenState extends State<HomeScreen> {
             live.providers
               ..clear()
               ..addAll(backends.map((item) => item.toString()));
+          }
+          final redaction = event.data['context_redaction'];
+          if (redaction is Map) {
+            live.contextRedaction = ContextRedaction.fromJson(
+              Map<String, dynamic>.from(redaction),
+            );
           }
           live.phase = '各AIが回答しています';
           break;

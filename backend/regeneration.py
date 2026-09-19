@@ -145,6 +145,7 @@ def build_plan(
                     source,
                     model,
                     reasoning_mode,
+                    tier=tier,
                     mock=mode != "live",
                 ).public_dict(),
             }
@@ -162,6 +163,7 @@ def build_plan(
                 "synthesizer",
                 "mock",
                 reasoning_mode,
+                tier=tier,
                 mock=True,
             ).public_dict(),
         }
@@ -210,6 +212,7 @@ def build_plan(
                 synth_name,
                 model,
                 reasoning_mode,
+                tier=tier,
                 mock=mode != "live",
             ).public_dict(),
         }

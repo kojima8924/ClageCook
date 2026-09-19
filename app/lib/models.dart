@@ -1339,6 +1339,26 @@ class AttachmentRecord {
   final bool truncated;
 }
 
+/// 履歴・ローカルメモをProviderへ渡す前に伏せ字化した事実の要約。
+///
+/// 置換は安全側の既定だが、黙って行うと「文脈が壊れた理由」が利用者から
+/// 見えない。件数と種類ラベルだけを保持し、生の検出値は持たない。
+class ContextRedaction {
+  const ContextRedaction({this.count = 0, this.labels = const []});
+
+  factory ContextRedaction.fromJson(Map<String, dynamic> json) =>
+      ContextRedaction(
+        count: _asInt(json['count']),
+        labels: _stringList(json['labels']),
+      );
+
+  final int count;
+  final List<String> labels;
+
+  bool get isEmpty => count <= 0;
+  bool get isNotEmpty => !isEmpty;
+}
+
 class TurnRecord {
   const TurnRecord({
     required this.requestId,
@@ -1356,6 +1376,7 @@ class TurnRecord {
     this.activeAttempts = const {},
     this.synthesisStale = false,
     this.attachments = const [],
+    this.contextRedaction = const ContextRedaction(),
   });
 
   factory TurnRecord.fromJson(Map<String, dynamic> json) {
@@ -1399,6 +1420,11 @@ class TurnRecord {
           const {},
       synthesisStale: json['synthesis_stale'] == true,
       attachments: _mapList(json['attachments'], AttachmentRecord.fromJson),
+      contextRedaction: json['context_redaction'] is Map
+          ? ContextRedaction.fromJson(
+              Map<String, dynamic>.from(json['context_redaction'] as Map),
+            )
+          : const ContextRedaction(),
     );
   }
 
@@ -1422,6 +1448,9 @@ class TurnRecord {
   final List<RegenerationAttempt> attempts;
   final Map<String, String> activeAttempts;
   final bool synthesisStale;
+
+  /// 履歴・メモの伏字化要約。空なら何も置換していない。
+  final ContextRedaction contextRedaction;
   final List<AttachmentRecord> attachments;
 
   List<String> get providers => _stringList(options['providers']);
@@ -1531,6 +1560,9 @@ class LiveTurn {
   Map<String, dynamic>? insights;
   String error = '';
   String lastEventId = '';
+
+  /// metaイベントで受け取る「履歴・メモを伏字にした」要約。
+  ContextRedaction contextRedaction = const ContextRedaction();
 }
 
 List<String> _stringList(dynamic value) => value is List

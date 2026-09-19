@@ -180,6 +180,13 @@ immutable recordを使います。recordを書いてからmanifestをcommitし�
 - 1会話16 MiB、memory 20,000文字の上限
 - title/memory/question/answer/synthesisの端末内全文検索
 
+課金済み結果の保存(会議turn / 再生成)は、どちらも同じ回数(4回)だけ競合retryします。4回とも競合した場合は
+本文を捨てず、`退避: <質問>` という別会話(`rescued_from` に元の会話ID)へ書き出し、通常のexportで取り出せる
+ようにしてからエラーを返します。利用者が削除した会話は退避対象にしません。
+
+履歴・ローカルメモをProviderへ再送する前の `⟪REDACTED⟫` 置換は続けますが、伏字にした件数と種類を
+SSE `meta` と保存turnの `context_redaction` に記録し、該当ターンへ注記として表示します(生の検出値は残しません)。
+
 会話JSONはapplication-level暗号化をしていません。Direct ZIPは `conversation.json` と `README.txt` を含み、
 API key、添付bytes、Markdown版は含みません。
 

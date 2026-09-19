@@ -197,6 +197,9 @@ async def _lifespan(_app: FastAPI):
                 "purged %s expired attachment(s) during startup",
                 purged_attachments,
             )
+        # 完了stateの回収をアクセス契機だけに任せない。無アクセスのまま
+        # 放置されてもretention後に必ず解放されるようにする(issue #22)。
+        _registry.start_sweeper()
         yield
     finally:
         drained = await _registry.shutdown()
@@ -969,8 +972,20 @@ async def _execute_run(state: RunState, req: ChatRequest) -> None:
                 conversation = await _blocking_call(store.load, state.conversation_id)
                 saved = store.find_turn_by_request_id(conversation, state.request_id)
                 if saved is not None:
+                    # 会話lockを取るまでの間に別実行が同じturnを保存していた場合の
+                    # 再生経路。ここでProviderは一度も呼んでいないため、endpoint側で
+                    # 確保済みの予約を必ず解放してから戻る。解放し忘れると予約が
+                    # "reserved" のまま日次予算を食い続け、次回起動のrecoverまで
+                    # 戻らない(issue #22)。既にsettle済みなら解放はno-op。
                     for event, data in _events_from_saved_turn(conversation, saved):
                         await state.publish(event, data)
+                    await _complete_critical(
+                        _finalize_budget_after_abort(
+                            state.request_id,
+                            dispatch_started=False,
+                        )
+                    )
+                    budget_finalized = True
                     return
 
                 attachment_context, attachment_refs = await _blocking_call(

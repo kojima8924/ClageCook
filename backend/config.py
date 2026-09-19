@@ -258,6 +258,22 @@ _AUTO_REASONING_POLICIES = {
         (("grok-",), "medium"),
     ),
 }
+# AUTOがhigh相当を選ぶときに、本文用として最低限欲しい生成上限(トークン)。
+# thinking付きmodelではeffortを上げるほど推論が max_tokens 枠を食い、本文が
+# max_tokens で切れた partial になりやすい。tier=low の既定は4,096なので、
+# claude+AUTOはこの組合せで途中終了しやすかった(issue #21-2)。
+#
+# 対処は「lowのceilingを上げる」のではなく「AUTOのeffortを下げる」を選んだ。
+# tier=low は利用者が明示的に選んだコスト/レイテンシの上限であり、こちらの
+# 都合で黙って引き上げると見積り(plan)と実課金が利用者の意図から離れるため。
+# 逆にAUTOのeffortは利用者が指定した値ではなくこちらの推奨値なので、枠に合わせて
+# 調整してよい。利用者が明示的にhighを指定した場合(mode != "auto")は尊重する。
+_AUTO_EFFORT_MIN_OUTPUT_TOKENS = 8_192
+# 生成枠が足りないときにAUTOが落とす先。
+_AUTO_EFFORT_FALLBACK = "medium"
+# 生成枠を圧迫する側のeffort(これ未満なら落とす必要がない)。
+_HEAVY_EFFORTS = frozenset({"high", "xhigh", "max"})
+
 MAX_OUTPUT_TOKENS = {
     provider: {
         tier: _env_int(
@@ -452,14 +468,35 @@ def max_output_tokens_for(name: str, tier: str) -> int:
         raise ValueError(f"不明なプロバイダ: {name}") from exc
 
 
+def _auto_effort_for_budget(name: str, tier: str, effort: str) -> tuple[str, bool]:
+    """AUTOが選んだeffortを、そのtierの生成枠に収まる範囲へ落とす。
+
+    戻り値は (effort, 調整したか)。生成枠が引けないprovider名では調整しない。
+    """
+    if effort not in _HEAVY_EFFORTS:
+        return effort, False
+    try:
+        ceiling = max_output_tokens_for(name, tier)
+    except ValueError:
+        return effort, False
+    if ceiling >= _AUTO_EFFORT_MIN_OUTPUT_TOKENS:
+        return effort, False
+    return _AUTO_EFFORT_FALLBACK, True
+
+
 def resolve_reasoning(
     name: str,
     model: str,
     requested: str,
     *,
+    tier: str,
     mock: bool = False,
 ) -> ReasoningResolution:
-    """UIのreasoning modeを、外部APIへ渡す固定effortへ解決する。"""
+    """UIのreasoning modeを、外部APIへ渡す固定effortへ解決する。
+
+    ``tier`` は必須。AUTOのeffortはそのtierの生成上限に依存するため、呼び出し側が
+    tierを渡し忘れると plan と実送信が食い違う(issue #21-2)。
+    """
     mode = normalized_reasoning_mode(requested)
     if mock or name == "synthesizer":
         return ReasoningResolution(mode, "none", None, "mock", True)
@@ -480,14 +517,13 @@ def resolve_reasoning(
                 "model_unsupported",
                 True,
             )
-        effort = auto_effort if mode == "auto" else mode
-        return ReasoningResolution(
-            mode,
-            effort,
-            effort,
-            "model_policy" if mode == "auto" else "explicit",
-            True,
-        )
+        if mode == "auto":
+            effort, capped = _auto_effort_for_budget(name, tier, auto_effort)
+            source = "model_policy_output_capped" if capped else "model_policy"
+        else:
+            effort = mode
+            source = "explicit"
+        return ReasoningResolution(mode, effort, effort, source, True)
     # runtime設定では任意の安全なmodel IDを許可するため、未知modelへ未確認の
     # reasoning fieldを送らない。planへ警告可能なunpinned状態として公開する。
     return ReasoningResolution(

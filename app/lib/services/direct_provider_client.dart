@@ -5,6 +5,25 @@ import 'package:http/http.dart' as http;
 
 import 'direct_settings_store.dart';
 
+/// Provider応答のusageキーから、台帳で使う正準名への対応表。
+/// 正規化(単一応答)と合算(debate)の両方がこの1か所だけを見る。
+const _usageAliases = <String, String>{
+  'input_tokens': 'input_tokens',
+  'prompt_tokens': 'input_tokens',
+  'total_input_tokens': 'input_tokens',
+  'output_tokens': 'output_tokens',
+  'completion_tokens': 'output_tokens',
+  'total_output_tokens': 'output_tokens',
+  'total_tokens': 'total_tokens',
+  'cache_creation_input_tokens': 'cache_creation_input_tokens',
+  'cache_read_input_tokens': 'cached_input_tokens',
+  'total_cached_tokens': 'cached_input_tokens',
+  'total_thought_tokens': 'reasoning_tokens',
+  'total_tool_use_tokens': 'tool_tokens',
+  'num_sources_used': 'sources_used',
+  'num_server_side_tools_used': 'server_side_tools_used',
+};
+
 /// Direct BYOKで1社へ送る、1回だけの生成要求。
 /// 同一要求の自動再送は二重課金になり得るため、この層では再試行しない。
 class DirectProviderRequest {
@@ -574,26 +593,60 @@ class DirectProviderClient {
     return reason.isEmpty ? null : reason;
   }
 
+  /// debateの2巡目usageを1巡目へ足し込み、1回の回答ぶんの実測合計にする。
+  ///
+  /// 全キーを素朴に足すと台帳の表示が二重計上に見える経路が2つある。
+  /// (1) 同じ量を指す別名キー(`prompt_tokens` と `input_tokens` など)が
+  ///     同居すると、同一の実測値を2回足してしまう。
+  /// (2) `total_tokens` は他キーの合計という派生値なので、片方の巡にしか
+  ///     無いと合計だけ取りこぼし、Input+Output と食い違う。
+  /// そこでキーを正準名へ寄せてから、各巡の「実効合計」(報告値があればそれ、
+  /// 無ければ input+output)をちょうど1回ずつ足す。
+  static Map<String, int> mergeUsage(dynamic first, dynamic second) {
+    final result = <String, int>{};
+    var total = 0;
+    var hasTotal = false;
+    for (final raw in [first, second]) {
+      final usage = _canonicalUsage(raw);
+      if (usage.isEmpty) continue;
+      for (final entry in usage.entries) {
+        if (entry.key == 'total_tokens') continue;
+        result[entry.key] = (result[entry.key] ?? 0) + entry.value;
+      }
+      final input = usage['input_tokens'] ?? 0;
+      final output = usage['output_tokens'] ?? 0;
+      final reported = usage['total_tokens'];
+      if (reported != null || input > 0 || output > 0) {
+        hasTotal = true;
+        total += reported ?? (input + output);
+      }
+    }
+    if (hasTotal) result['total_tokens'] = total;
+    return result;
+  }
+
+  /// 別名キーを正準名へ寄せる。正準名そのものが来ている場合、別名側は同じ
+  /// 実測値の言い換えとみなして捨てる(合算しない)。
+  static Map<String, int> _canonicalUsage(dynamic raw) {
+    if (raw is! Map) return const {};
+    final source = <String, int>{};
+    for (final entry in raw.entries) {
+      final value = entry.value;
+      if (value is int && value >= 0) source[entry.key.toString()] = value;
+    }
+    final result = <String, int>{};
+    for (final entry in source.entries) {
+      final canonical = _usageAliases[entry.key] ?? entry.key;
+      if (canonical != entry.key && source.containsKey(canonical)) continue;
+      result.putIfAbsent(canonical, () => entry.value);
+    }
+    return result;
+  }
+
   static Map<String, int> _normalizedUsage(dynamic raw) {
     if (raw is! Map) return const {};
-    const aliases = <String, String>{
-      'input_tokens': 'input_tokens',
-      'prompt_tokens': 'input_tokens',
-      'total_input_tokens': 'input_tokens',
-      'output_tokens': 'output_tokens',
-      'completion_tokens': 'output_tokens',
-      'total_output_tokens': 'output_tokens',
-      'total_tokens': 'total_tokens',
-      'cache_creation_input_tokens': 'cache_creation_input_tokens',
-      'cache_read_input_tokens': 'cached_input_tokens',
-      'total_cached_tokens': 'cached_input_tokens',
-      'total_thought_tokens': 'reasoning_tokens',
-      'total_tool_use_tokens': 'tool_tokens',
-      'num_sources_used': 'sources_used',
-      'num_server_side_tools_used': 'server_side_tools_used',
-    };
     final result = <String, int>{};
-    for (final entry in aliases.entries) {
+    for (final entry in _usageAliases.entries) {
       final value = raw[entry.key];
       if (value is int && value >= 0) result[entry.value] = value;
     }

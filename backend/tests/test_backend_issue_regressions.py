@@ -1343,3 +1343,199 @@ async def test_run_registry_caps_completed_states_without_access():
     assert len(registry._runs) == 3
     assert await registry.lookup("request-0") is None
     assert await registry.lookup("request-5") is not None
+
+
+def test_unrecognized_vendor_completion_status_is_not_a_failure():
+    """issue #21-3: 未知のstatus値を返されても正常本文を失敗扱いにしない。"""
+    import orchestrator
+    from providers.base import completion_metadata
+
+    metadata = completion_metadata("mostly_done", "本文")
+
+    assert metadata["completion_status"] == "unknown"
+    assert metadata["completion_unverified"] is True
+    # 未知statusは「途中で切れた」証拠ではないのでpartialへ倒さない。
+    assert metadata["partial"] is False
+
+    answer = {"text": "本文", **metadata}
+    ok = orchestrator._mark_answer_ok(answer, empty_text_error="empty")
+
+    assert ok is True
+    assert answer["ok"] is True
+    assert "error" not in answer
+    assert answer["warning"]
+
+
+def test_unrecognized_status_without_text_is_still_a_failure():
+    """未知statusでも本文が無ければokにしない(空回答の握り潰し防止)。"""
+    import orchestrator
+    from providers.base import completion_metadata
+
+    answer = {"text": "  ", **completion_metadata("mostly_done", "  ")}
+    ok = orchestrator._mark_answer_ok(answer, empty_text_error="empty")
+
+    assert ok is False
+    assert answer["error"] == "empty"
+    assert "warning" not in answer
+
+
+def test_truncated_answer_is_still_excluded_from_critique_and_synthesis():
+    """途中終了(incomplete)の除外は従来どおり維持する。"""
+    import orchestrator
+    from providers.base import completion_metadata
+
+    answer = {
+        "text": "途中まで",
+        **completion_metadata("incomplete", "途中まで", "max_output_tokens"),
+    }
+    ok = orchestrator._mark_answer_ok(answer, empty_text_error="empty")
+
+    assert ok is False
+    assert answer["partial"] is True
+
+
+@pytest.mark.asyncio
+async def test_saved_turn_replay_releases_the_budget_reservation(
+    tmp_path,
+    monkeypatch,
+):
+    """issue #22: saved-turn早期returnが予約を未清算のまま残さない。"""
+    _reset(tmp_path, monkeypatch)
+    budget = _FakeBudget()
+    monkeypatch.setattr(main, "budget_guard", budget)
+    conversation = _completed_conversation()
+
+    state = main.RunState(
+        request_id="original-turn",
+        conversation_id=conversation["id"],
+        request_fingerprint="original-fingerprint",
+    )
+    req = main.ChatRequest(
+        message="question",
+        conversation_id=conversation["id"],
+    )
+
+    await main._execute_run(state, req)
+
+    assert budget.released == ["original-turn"]
+    assert budget.settled == []
+    # 保存済みturnの再生自体は従来どおり行われる
+    assert any(event == "done" for event, _ in state.events)
+
+
+@pytest.mark.asyncio
+async def test_run_registry_sweeper_releases_expired_states_without_access():
+    """issue #22: 無アクセスでもretention後に完了stateが解放される。"""
+    import runs as runs_module
+
+    now = 1_000.0
+
+    def clock():
+        return now
+
+    registry = runs_module.RunRegistry(
+        retention_sec=0.01,
+        max_completed=512,
+        clock=clock,
+    )
+    state, _ = await registry.claim(
+        "request-sweep",
+        lambda: runs_module.RunState(
+            request_id="request-sweep",
+            conversation_id="conversation-1",
+            request_fingerprint="fingerprint-1",
+            clock=clock,
+        ),
+    )
+    await state.finish("completed")
+    now += 10.0
+
+    # 誰もclaim/lookupしないままでも、sweeperが回収する。
+    registry.start_sweeper(interval_sec=0.01)
+    try:
+        for _ in range(200):
+            if not registry._runs:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await registry.shutdown()
+
+    assert registry._runs == {}
+    assert registry._sweeper is None
+
+
+@pytest.mark.asyncio
+async def test_run_registry_sweeper_keeps_states_inside_retention():
+    """retention内の完了stateはsweeperでも消さない(結果の再取得を壊さない)。"""
+    import runs as runs_module
+
+    registry = runs_module.RunRegistry(retention_sec=3_600.0, max_completed=512)
+    state, _ = await registry.claim(
+        "request-keep",
+        lambda: runs_module.RunState(
+            request_id="request-keep",
+            conversation_id="conversation-1",
+            request_fingerprint="fingerprint-1",
+        ),
+    )
+    await state.finish("completed")
+
+    registry.start_sweeper(interval_sec=0.01)
+    try:
+        await asyncio.sleep(0.05)
+    finally:
+        await registry.shutdown()
+
+    assert "request-keep" in registry._runs
+
+
+def test_missing_plan_output_limit_blocks_under_the_default_unknown_policy(tmp_path):
+    """issue #22: 過小見積りのまま予算を消費しない(既定policyで止まる)。"""
+    import json
+
+    import finance
+
+    price_path = tmp_path / "price.json"
+    price_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": "test-v1",
+                "currency": "USD",
+                "models": {
+                    "claude": {
+                        "claude-test": {
+                            "input_per_million_usd": "1.00",
+                            "output_per_million_usd": "2.00",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    catalog = finance.PriceCatalog(str(price_path))
+    plan = {
+        "billable": True,
+        "options": {"debate_effective": False},
+        "providers": [
+            {
+                "name": "claude",
+                "model": "claude-test",
+                "billable": True,
+                "max_calls": 1,
+            }
+        ],
+        "synthesizer": {"billable": False},
+        "input_envelope": {"answer_per_call": 2, "debate_per_call": 0},
+        "retry_envelope": {"configured_retries_per_live_call": 0},
+    }
+
+    estimate = finance.estimate_plan_cost(plan, catalog)
+    reserved = finance._reservation_amount(estimate)
+
+    # 拘束額は known subtotal へ落ちるため過小になり得る。だからこそ
+    # 既定の unknown policy(block)で止まることを固定する。
+    assert estimate["total_micros"] is None
+    assert reserved == estimate["known_subtotal_micros"]
+    assert "plan_max_output_tokens" in estimate["missing"]

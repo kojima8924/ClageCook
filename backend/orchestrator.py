@@ -248,17 +248,40 @@ def _safe_outbound_text(text: str, *, redact_confirm: bool = False) -> str:
     return scan["redacted_text"] if should_redact else text
 
 
+def _mark_answer_ok(data: dict[str, Any], *, empty_text_error: str) -> bool:
+    """回答dictへ ok 判定と、必要なら error / warning を書き込む。
+
+    途中回答(partial)は利用者へ表示・保存するが、相互批評や統合の根拠へは
+    混ぜない。欠けた文章を完了回答として扱うと、統合役が欠落を事実と誤認し得る。
+
+    一方 completion_status が "unknown"(=ベンダーが我々の列挙に無いstatus値を
+    返した)場合は、本文が欠けている証拠がない。ここで失敗へ倒すと、ベンダーが
+    status値を増やしただけで「全AI失敗」になり、課金済みの正常な回答を捨てる
+    ことになる。本文が実際に取れていれば ok としつつ、完了確認が取れていない
+    ことは warning として残す(issue #21-3)。
+    """
+    has_text = bool(str(data.get("text") or "").strip())
+    status = data.get("completion_status")
+    unverified = status == "unknown" or data.get("completion_unverified") is True
+    ok = has_text and (status == "completed" or unverified)
+    data["ok"] = ok
+    if not has_text:
+        data["error"] = empty_text_error
+    elif ok and unverified:
+        data["warning"] = (
+            "プロバイダが未知の完了状態を返したため、回答が最後まで"
+            "生成されたかを確認できませんでした"
+        )
+    return ok
+
+
 def _public_answer(result: Any, source: str, round_number: int) -> dict[str, Any]:
     data = result.public_dict()
-    has_text = bool(str(data.get("text") or "").strip())
-    completed = data.get("completion_status") == "completed"
-    # 途中回答は利用者へ表示・保存するが、相互批評や統合の根拠へ混ぜない。
-    # 欠けた文章を完了回答として扱うと、統合役が欠落を事実と誤認し得る。
-    data.update(
-        {"source": source, "ok": has_text and completed, "round": round_number}
+    data.update({"source": source, "round": round_number})
+    _mark_answer_ok(
+        data,
+        empty_text_error="プロバイダは表示可能な回答本文を返しませんでした",
     )
-    if not has_text:
-        data["error"] = "プロバイダは表示可能な回答本文を返しませんでした"
     data.pop("provider", None)
     return data
 
@@ -357,6 +380,7 @@ async def _run_provider(
             source,
             provider.model,
             reasoning_mode,
+            tier=tier,
             mock=provider.is_mock,
         )
         result = await provider.complete(
@@ -484,6 +508,7 @@ async def _run_synthesis(
             generation_name,
             provider.model,
             reasoning_mode,
+            tier=tier,
             mock=provider.is_mock or generation_name == "synthesizer",
         )
         max_output_tokens = config.max_output_tokens_for(generation_name, tier)
@@ -505,19 +530,13 @@ async def _run_synthesis(
             )
         )
         data = result.public_dict()
-        has_text = bool(str(data.get("text") or "").strip())
-        completed = data.get("completion_status") == "completed"
-        data.update(
-            {
-                "source": result.provider,
-                "ok": has_text and completed,
-                "skipped": False,
-            }
-        )
+        data.update({"source": result.provider, "skipped": False})
         data["reasoning"] = reasoning.public_dict()
         data["max_output_tokens"] = max_output_tokens
-        if not has_text:
-            data["error"] = "統合プロバイダは表示可能な回答本文を返しませんでした"
+        _mark_answer_ok(
+            data,
+            empty_text_error="統合プロバイダは表示可能な回答本文を返しませんでした",
+        )
         data.pop("provider", None)
         return data
     except asyncio.CancelledError:

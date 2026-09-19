@@ -33,6 +33,7 @@ def _provider_descriptor(
         name,
         model,
         reasoning_mode,
+        tier=tier,
         mock=mode != "live",
     )
     return {
@@ -66,6 +67,7 @@ def _synthesizer_descriptor(
         name,
         model,
         reasoning_mode,
+        tier=tier,
         mock=mode == "mock",
     )
     return {

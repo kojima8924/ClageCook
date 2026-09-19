@@ -389,6 +389,63 @@ void main() {
       );
     }
   });
+
+  testWidgets('履歴・メモを伏字にしたことをターン上で明示する', (tester) async {
+    final turn = TurnRecord.fromJson({
+      'request_id': 'redaction-turn',
+      'message': '続きを教えて',
+      'clean_message': '続きを教えて',
+      'options': {
+        'providers': ['chatgpt'],
+      },
+      'status': 'completed',
+      'answers': {
+        'chatgpt': {'source': 'chatgpt', 'ok': true, 'text': '回答'},
+      },
+      'context_redaction': {
+        'count': 2,
+        'labels': ['メールアドレスらしい文字列'],
+      },
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: SavedTurnView(turn: turn)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('履歴・メモの2箇所'),
+      findsOneWidget,
+      reason: '無断で伏字にした事実が利用者から見えない',
+    );
+    expect(find.textContaining('メールアドレスらしい文字列'), findsOneWidget);
+  });
+
+  testWidgets('伏字が無いターンには注記を出さない', (tester) async {
+    final turn = TurnRecord.fromJson({
+      'request_id': 'plain-turn',
+      'message': '質問',
+      'clean_message': '質問',
+      'options': {
+        'providers': ['chatgpt'],
+      },
+      'status': 'completed',
+      'answers': {
+        'chatgpt': {'source': 'chatgpt', 'ok': true, 'text': '回答'},
+      },
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: SavedTurnView(turn: turn)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('伏字'), findsNothing);
+  });
 }
 
 double _contrast(Color first, Color second) {

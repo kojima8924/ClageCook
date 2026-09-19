@@ -183,6 +183,16 @@ Map<String, dynamic> _failureAnswer(
   'round': round,
 };
 
+/// 伏せ字化したラベル列を、保存・表示用の要約へまとめる。
+/// 生の検出値は持たず、件数と種類ラベル(重複なし)だけを残す。
+Map<String, dynamic> _contextRedactionJson(List<String> labels) {
+  if (labels.isEmpty) return const {};
+  return {
+    'count': labels.length,
+    'labels': labels.toSet().toList(growable: false),
+  };
+}
+
 String _safeRunError(Object error) {
   if (error is DirectProviderException ||
       error is DirectRunGuardStartException ||
@@ -193,19 +203,10 @@ String _safeRunError(Object error) {
   return 'Direct BYOKの処理に失敗しました。';
 }
 
-Map<String, int> _mergeUsage(dynamic first, dynamic second) {
-  final result = <String, int>{};
-  for (final raw in [first, second]) {
-    if (raw is! Map) continue;
-    for (final entry in raw.entries) {
-      if (entry.value is int) {
-        result[entry.key.toString()] =
-            (result[entry.key.toString()] ?? 0) + entry.value as int;
-      }
-    }
-  }
-  return result;
-}
+/// debateの1巡目と2巡目のusageを、回答1件ぶんの実測合計へまとめる。
+/// 合算規則そのものは正規化と同じ場所([DirectProviderClient.mergeUsage])に置く。
+Map<String, int> _mergeUsage(dynamic first, dynamic second) =>
+    DirectProviderClient.mergeUsage(first, second);
 
 List<Map<String, dynamic>> _mapList(dynamic value) => value is List
     ? value

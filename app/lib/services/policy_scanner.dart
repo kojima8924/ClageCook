@@ -221,11 +221,22 @@ Map<String, dynamic> scanPolicyText(String text) {
 }
 
 /// 履歴・メモをProviderへ渡す前に伏せ字化する。allowならそのまま返す。
-String redactPolicySecrets(String text) {
+///
+/// 置換は安全側の既定だが、黙ってやると文脈が壊れた理由が利用者に見えない。
+/// [redactedLabels] を渡すと、何を伏せたかのラベルを呼び出し側へ積み上げる
+/// (生値は含めない)。UIはこれを使って「伏字にした」ことを明示する。
+String redactPolicySecrets(String text, {List<String>? redactedLabels}) {
   final scan = scanPolicyText(text);
-  return scan['action'] == 'allow'
-      ? text
-      : scan['redacted_text']?.toString() ?? '';
+  if (scan['action'] == 'allow') return text;
+  if (redactedLabels != null) {
+    for (final finding in scan['findings'] as List? ?? const []) {
+      if (finding is Map) {
+        final label = finding['label']?.toString() ?? '';
+        if (label.isNotEmpty) redactedLabels.add(label);
+      }
+    }
+  }
+  return scan['redacted_text']?.toString() ?? '';
 }
 
 /// 一致範囲を求める。[secretGroup] が0以外なら、末尾のgroupだけを対象にする。

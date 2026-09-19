@@ -135,6 +135,29 @@ void main() {
     await tester.pumpAndSettle();
   });
 
+  testWidgets('添付uploadが失敗したら暗黙のドラフト会話を残さない', (tester) async {
+    final backend = _HomeBackend()..failAttachmentUpload = true;
+    final result = FilePickerResult([
+      PlatformFile(
+        name: 'note.txt',
+        size: 3,
+        bytes: Uint8List.fromList(utf8.encode('abc')),
+      ),
+    ]);
+    // 会話を選ばないまま添付すると、添付のためだけの会話が暗黙に作られる。
+    await _pumpHome(tester, backend, attachmentPicker: () async => result);
+    await tester.tap(find.byIcon(Icons.attach_file));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('添付をアップロードできませんでした'), findsOneWidget);
+    expect(backend.routes, contains('POST /api/conversations'));
+    expect(
+      backend.routes,
+      contains('DELETE /api/conversations/draft-1'),
+      reason: '空のドラフト会話がサーバに残っている',
+    );
+  });
+
   testWidgets('preflight失敗は実エラー詳細を画面に表示する', (tester) async {
     final backend = _HomeBackend()..failPlan = true;
     await _pumpHome(tester, backend);
@@ -188,6 +211,7 @@ class _HomeBackend {
   bool delaySecondConversationA = false;
   bool delayConversationB = false;
   bool delayAttachmentUpload = false;
+  bool failAttachmentUpload = false;
   bool failPlan = false;
   int _conversationALoads = 0;
   final delayedConversationStarted = Completer<void>();
@@ -197,10 +221,38 @@ class _HomeBackend {
   final attachmentUploadStarted = Completer<void>();
   final releaseAttachmentUpload = Completer<void>();
   final paths = <String>[];
+  final routes = <String>[];
   final uploadConversationIds = <String>[];
 
   Future<http.Response> _handle(http.Request request) async {
     paths.add(request.url.path);
+    final route = '${request.method} ${request.url.path}';
+    routes.add(route);
+    switch (route) {
+      case 'POST /api/conversations':
+        return _jsonResponse(_draftConversation());
+      case 'GET /api/conversations/draft-1':
+        return _jsonResponse(_draftConversation());
+      case 'DELETE /api/conversations/draft-1':
+        return _jsonResponse(const {'ok': true});
+      case 'POST /api/conversations/draft-1/attachments':
+        uploadConversationIds.add('draft-1');
+        if (failAttachmentUpload) {
+          return http.Response.bytes(
+            utf8.encode(jsonEncode({'detail': 'upload failed'})),
+            500,
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return _jsonResponse({
+          'id': 'attachment-1',
+          'conversation_id': 'draft-1',
+          'name': 'note.txt',
+          'mime_type': 'text/plain',
+          'kind': 'text',
+          'size_bytes': 3,
+        });
+    }
     switch (request.url.path) {
       case '/api/health':
         return _jsonResponse({
@@ -281,6 +333,13 @@ class _HomeBackend {
     }
   }
 }
+
+Map<String, Object> _draftConversation() => {
+  'id': 'draft-1',
+  'title': '新しい会話',
+  'turns': <Object>[],
+  'memory': {'revision': 0, 'text': '', 'updated_at': ''},
+};
 
 Map<String, Object> _summary(String id, String title) => {
   'id': id,
